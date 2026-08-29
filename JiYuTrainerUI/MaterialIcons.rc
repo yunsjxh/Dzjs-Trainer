@@ -1,0 +1,3 @@
+#include "winres.h"
+
+153 RCDATA "res\\MaterialIcons-Regular.ttf"

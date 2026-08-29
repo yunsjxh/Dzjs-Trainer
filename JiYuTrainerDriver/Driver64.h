@@ -1,0 +1,54 @@
+#pragma once
+
+#include <ntifs.h>
+#include <wdmsec.h>
+
+#include "IoCtl.h"
+#include "IoStructs.h"
+
+#define JDRV_DEVICE_NAME L"\\Device\\JKRK"
+#define JDRV_SYMBOLIC_LINK_NAME L"\\DosDevices\\JKRK"
+
+#define JDRV_PROCESS_TERMINATE 0x0001UL
+#define JDRV_PROCESS_CREATE_THREAD 0x0002UL
+#define JDRV_PROCESS_VM_OPERATION 0x0008UL
+#define JDRV_PROCESS_VM_READ 0x0010UL
+#define JDRV_PROCESS_VM_WRITE 0x0020UL
+#define JDRV_PROCESS_DUP_HANDLE 0x0040UL
+#define JDRV_PROCESS_SET_QUOTA 0x0100UL
+#define JDRV_PROCESS_SET_INFORMATION 0x0200UL
+#define JDRV_PROCESS_SUSPEND_RESUME 0x0800UL
+#define JDRV_PROCESS_SET_LIMITED_INFORMATION 0x2000UL
+
+#define JDRV_THREAD_TERMINATE 0x0001UL
+#define JDRV_THREAD_SUSPEND_RESUME 0x0002UL
+#define JDRV_THREAD_GET_CONTEXT 0x0008UL
+#define JDRV_THREAD_SET_CONTEXT 0x0010UL
+#define JDRV_THREAD_SET_INFORMATION 0x0020UL
+#define JDRV_THREAD_DIRECT_IMPERSONATION 0x0200UL
+#define JDRV_THREAD_SET_LIMITED_INFORMATION 0x0400UL
+
+typedef struct _JDRV_DEVICE_EXTENSION {
+    IO_REMOVE_LOCK RemoveLock;
+} JDRV_DEVICE_EXTENSION, *PJDRV_DEVICE_EXTENSION;
+
+DRIVER_INITIALIZE DriverEntry;
+DRIVER_UNLOAD JdrvDriverUnload;
+
+// Queues a kernel event record for the user-mode event stream. Shared with
+// the protection and driver-guard modules.
+VOID
+JdrvQueueEvent(
+    _In_ const JDRV_EVENT_RECORD* Event
+    );
+
+_Dispatch_type_(IRP_MJ_CREATE)
+DRIVER_DISPATCH JdrvDispatchCreateClose;
+
+_Dispatch_type_(IRP_MJ_CLOSE)
+DRIVER_DISPATCH JdrvDispatchCreateClose;
+
+_Dispatch_type_(IRP_MJ_DEVICE_CONTROL)
+DRIVER_DISPATCH JdrvDispatchDeviceControl;
+
+DRIVER_DISPATCH JdrvDispatchUnsupported;

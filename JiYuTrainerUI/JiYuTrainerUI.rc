@@ -1,0 +1,301 @@
+// Microsoft Visual C++ generated resource script.
+//
+#include "resource.h"
+
+#define APSTUDIO_READONLY_SYMBOLS
+/////////////////////////////////////////////////////////////////////////////
+//
+// Generated from the TEXTINCLUDE 2 resource.
+//
+#include "winres.h"
+
+/////////////////////////////////////////////////////////////////////////////
+#undef APSTUDIO_READONLY_SYMBOLS
+
+/////////////////////////////////////////////////////////////////////////////
+// 中文(简体，中国) resources
+
+#if !defined(AFX_RESOURCE_DLL) || defined(AFX_TARG_CHS)
+LANGUAGE LANG_CHINESE, SUBLANG_CHINESE_SIMPLIFIED
+
+#ifdef APSTUDIO_INVOKED
+/////////////////////////////////////////////////////////////////////////////
+//
+// TEXTINCLUDE
+//
+
+1 TEXTINCLUDE 
+BEGIN
+    "resource.h\0"
+END
+
+2 TEXTINCLUDE 
+BEGIN
+    "#include ""winres.h""\r\n"
+    "\0"
+END
+
+3 TEXTINCLUDE 
+BEGIN
+    "\r\n"
+    "\0"
+END
+
+#endif    // APSTUDIO_INVOKED
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// Icon
+//
+
+// Icon with lowest ID value placed first to ensure application icon
+// remains consistent on all systems.
+IDI_APP                 ICON                    "..\\JiYuTrainerLogo.ico"
+
+IDI_BUG                 ICON                    "..\\JiYuTrainerBug.ico"
+
+IDI_CLOSE               ICON                    "res\\close.ico"
+
+IDI_HELP                ICON                    "res\\help.ico"
+
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// PNG
+//
+
+BG-SHADOW               PNG                     "res\\bg-shadow.png"
+
+ICON-MAIN-SMALL         PNG                     "res\\icon-main-small.png"
+
+BTN-CLOSE               PNG                     "res\\btn-close.png"
+
+BTN-MIN                 PNG                     "res\\btn-min.png"
+
+BG-MAIN-STATE           PNG                     "res\\bg-main-state.png"
+
+STATES                  PNG                     "res\\states.png"
+
+BTN-FOOTERS             PNG                     "res\\btn-footers.png"
+
+LOGO128                 PNG                     "res\\logo128.png"
+
+FOOTER-MASK             PNG                     "res\\footer-mask.png"
+
+LOGO-TEXT               PNG                     "res\\logo-text.png"
+
+VERSION-TEXT            PNG                     "res\\version-text.png"
+
+UPDATE_BG               PNG                     "res\\update_bg.png"
+
+JIYUTRAINERHELP1        PNG                     "res\\JiYuTrainerHelp1.png"
+
+JIYUTRAINERHELP2        PNG                     "res\\JiYuTrainerHelp2.png"
+
+JIYUTRAINERHELP3        PNG                     "res\\JiYuTrainerHelp3.png"
+
+CHECKBOXS               PNG                     "res\\checkboxs.png"
+
+LINK-ICONS              PNG                     "res\\link-icons.png"
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// Menu
+//
+
+IDR_MAINMENU MENU
+BEGIN
+    POPUP "MAIN"
+    BEGIN
+        MENUITEM "显示/隐藏主界面",                    IDM_SHOWMAIN
+        MENUITEM "帮助",                          IDM_HELP
+        MENUITEM SEPARATOR
+        MENUITEM "退出软件",                        IDM_EXIT
+    END
+END
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// Dialog
+//
+
+IDD_SETTINGS DIALOGEX 0, 0, 369, 251
+STYLE DS_SETFONT | DS_FIXEDSYS | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+EXSTYLE WS_EX_APPWINDOW
+CAPTION "软件高级参数配置"
+FONT 8, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    DEFPUSHBUTTON   "取消",IDCANCEL,319,230,43,14
+    LTEXT           "注：部分配置只有重启软件才会生效\n提示：在启动本程序时按住“ALT”键，可以打开本配置对话框。",IDC_STATIC,7,225,220,19
+    PUSHBUTTON      "保存",IDC_SAVE,275,230,40,14
+    CONTROL         "",IDC_TAB_SETTINGS,"SysTabControl32",0x0,7,6,355,218
+END
+
+IDD_BUGREPORT DIALOGEX 0, 0, 311, 176
+STYLE DS_SETFONT | DS_SETFOREGROUND | DS_FIXEDSYS | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+EXSTYLE WS_EX_APPWINDOW
+CAPTION "很抱歉, Dzjs Trainer 崩溃了..."
+FONT 8, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    DEFPUSHBUTTON   "发送错误报告帮助我们改进软件",IDOK,124,155,124,14
+    PUSHBUTTON      "不发送",IDCANCEL,254,155,50,14
+    CONTROL         "重启本软件",IDC_REBOOT,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,11,156,56,10
+    LTEXT           "非常抱歉，Dzjs Trainer 遇到了问题需要关闭",IDC_STATIC,17,17,150,8
+    EDITTEXT        IDC_BUGREPORT_CONTENT,7,60,297,84,ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | WS_VSCROLL
+    LTEXT           "程序已经生成了一份关于此错误的详细报告（不包含您的个人信息），我们希望您能将此报告发送给我们，这有助于我们修复这些错误，并提高软件的稳定性。以下是错误报告的详细内容：",IDC_STATIC,17,30,267,26
+END
+
+IDD_SETTINGS_MORE DIALOGEX 0, 0, 350, 223
+STYLE DS_SETFONT | DS_FIXEDSYS | WS_CHILD | WS_SYSMENU
+FONT 8, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    CONTROL         "禁用软件内核驱动",IDC_CHECK_INI_11,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,14,23,80,10
+    CONTROL         "驱动层自我保护(32位系统有效)",IDC_CHECK_INI_12,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,14,38,125,10
+    CONTROL         "隐藏极域端控制输出窗口",IDC_CHECK_INI_15,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,179,132,104,10
+    GROUPBOX        "本软件驱动(仅在32位系统有效)",IDC_STATIC,7,7,160,74
+    CONTROL         "启用严格窗口控制模式",IDC_CHECK_INI_14,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,14,134,96,10
+    CONTROL         "不客气模式",IDC_CHECK_INI_13,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,14,94,56,10
+    LTEXT           "是否启用自动强制清除模式，勾选该模式会在操作失败时直接清除极域有关进程，不建议使用",IDC_STATIC,25,106,125,26,WS_DISABLED
+    LTEXT           "选择后，屏幕左上角的极域控制输出窗口将会隐藏",IDC_STATIC,187,145,125,19,WS_DISABLED
+    LTEXT           "驱动可能不适用于较新的系统\n如果出现蓝屏等故障，请在此禁用驱动",IDC_STATIC,23,55,139,18,WS_DISABLED
+    LTEXT           "勾选该选项可严格控制极域窗口，不仅仅是屏幕广播窗口和黑屏窗口，极域的其他窗口也会被控制",IDC_STATIC,25,146,125,28,WS_DISABLED
+    CONTROL         "隐藏本软件任务栏图标",IDC_CHECK_INI_17,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,179,97,96,10
+    LTEXT           "隐藏本软件任务栏图标后，您依然可以使用快捷键显示或隐藏主窗口",IDC_STATIC,189,109,125,18,WS_DISABLED
+    CONTROL         "",IDC_HOTKEY_FK,"msctls_hotkey32",WS_BORDER | WS_TABSTOP,242,21,80,14
+    CONTROL         "",IDC_HOTKEY_SHOWHIDE,"msctls_hotkey32",WS_BORDER | WS_TABSTOP,242,41,80,14
+    LTEXT           "紧急全屏快捷键",IDC_STATIC,182,24,57,8
+    RTEXT           "快速显示/隐藏窗口快捷键",IDC_STATIC,187,39,50,20
+    GROUPBOX        "快捷键",IDC_STATIC,172,7,171,74
+    GROUPBOX        "程序隐藏",IDC_STATIC,172,82,171,87
+    GROUPBOX        "极域附加控制",IDC_STATIC,7,81,160,96
+    LTEXT           "*修改快捷键重启软件后生效",IDC_STATIC,187,63,103,9,WS_DISABLED
+END
+
+IDD_SETTINGS_DEBUG DIALOGEX 0, 0, 351, 223
+STYLE DS_SETFONT | DS_FIXEDSYS | WS_CHILD | WS_SYSMENU
+FONT 8, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    CONTROL         "AlwaysCheckUpdate",IDC_CHECK_INI_21,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,18,108,81,10
+    CONTROL         "ForceInstallInCurrentDir",IDC_CHECK_INI_24,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,18,121,93,10
+    CONTROL         "ForceDisableWatchDog",IDC_CHECK_INI_25,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,18,134,90,10
+    CONTROL         "InjectMasterHelper",IDC_CHECK_INI_22,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,177,41,77,10
+    CONTROL         "InjectProcHelper64",IDC_CHECK_INI_23,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,177,55,77,10
+    COMBOBOX        IDC_COMBO_INJECT_MODE,217,21,81,64,CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "InjectMode",IDC_STATIC,175,24,37,8
+    CONTROL         "TerminateProcess (Weak)",IDC_KILLPROC_TP,"Button",BS_AUTORADIOBUTTON,15,21,98,10
+    CONTROL         "NtTerminateProcess (Default)",IDC_KILLPROC_NTP,"Button",BS_AUTORADIOBUTTON,15,34,111,10
+    CONTROL         "PspTerminateThreadByPointer Or\nAPC+PspExitThread in KernelMode",IDC_KILLPROC_PPTP_APC,
+                    "Button",BS_AUTORADIOBUTTON | BS_MULTILINE,15,49,129,17
+    EDITTEXT        IDC_CKINTERVAL,79,90,36,14,ES_AUTOHSCROLL
+    LTEXT           "CKInterval (ms) :",IDC_STATIC,19,93,55,9
+    GROUPBOX        "结束进程模式",IDC_STATIC,7,7,155,69
+    GROUPBOX        "病毒注入模式",IDC_STATIC,165,7,158,69
+    GROUPBOX        "高级程序配置",IDC_STATIC,7,80,155,71
+    CONTROL         "启用控制器",IDC_CHECK_INI_16,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,173,97,56,10
+    GROUPBOX        "自动控制器启停",IDC_STATIC,166,80,171,70
+    LTEXT           " （重要）\n控制器和检测器负责检查和控制极域，如果关闭将导致极域脱离控制或无法检测到极域的操作。不建议关闭，仅调试时使用",IDC_STATIC,183,110,148,36,WS_DISABLED
+END
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// DESIGNINFO
+//
+
+#ifdef APSTUDIO_INVOKED
+GUIDELINES DESIGNINFO
+BEGIN
+    IDD_SETTINGS, DIALOG
+    BEGIN
+        LEFTMARGIN, 7
+        RIGHTMARGIN, 362
+        TOPMARGIN, 6
+        BOTTOMMARGIN, 244
+    END
+
+    IDD_BUGREPORT, DIALOG
+    BEGIN
+        LEFTMARGIN, 7
+        RIGHTMARGIN, 304
+        TOPMARGIN, 7
+        BOTTOMMARGIN, 169
+    END
+
+    IDD_SETTINGS_MORE, DIALOG
+    BEGIN
+        LEFTMARGIN, 7
+        RIGHTMARGIN, 343
+        TOPMARGIN, 7
+        BOTTOMMARGIN, 216
+    END
+
+    IDD_SETTINGS_DEBUG, DIALOG
+    BEGIN
+        LEFTMARGIN, 7
+        RIGHTMARGIN, 344
+        TOPMARGIN, 7
+        BOTTOMMARGIN, 216
+    END
+END
+#endif    // APSTUDIO_INVOKED
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// AFX_DIALOG_LAYOUT
+//
+
+IDD_SETTINGS AFX_DIALOG_LAYOUT
+BEGIN
+    0
+END
+
+IDD_BUGREPORT AFX_DIALOG_LAYOUT
+BEGIN
+    0
+END
+
+IDD_DIALOG1 AFX_DIALOG_LAYOUT
+BEGIN
+    0
+END
+
+IDD_SETTINGS_MORE AFX_DIALOG_LAYOUT
+BEGIN
+    0
+END
+
+IDD_SETTINGS_DEBUG AFX_DIALOG_LAYOUT
+BEGIN
+    0
+END
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// Bitmap
+//
+
+IDB_CLOSE               BITMAP                  "res\\close-small.bmp"
+
+IDB_HELP                BITMAP                  "res\\help-small.bmp"
+
+#endif    // 中文(简体，中国) resources
+/////////////////////////////////////////////////////////////////////////////
+
+
+
+#ifndef APSTUDIO_INVOKED
+/////////////////////////////////////////////////////////////////////////////
+//
+// Generated from the TEXTINCLUDE 3 resource.
+//
+
+
+/////////////////////////////////////////////////////////////////////////////
+#endif    // not APSTUDIO_INVOKED
+

@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{F53C06B4-5DD9-437F-96AB-A0E7D450DE2B}</ProjectGuid>
+    <RootNamespace>JiYuTrainerDriver</RootNamespace>
+    <Keyword>Win32Proj</Keyword>
+    <WindowsTargetPlatformVersion>10.0.28000.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Driver</ConfigurationType>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <DriverType>WDM</DriverType>
+    <DriverTargetPlatform>Desktop</DriverTargetPlatform>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <SkipPackageVerification>true</SkipPackageVerification>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Driver</ConfigurationType>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <DriverType>WDM</DriverType>
+    <DriverTargetPlatform>Desktop</DriverTargetPlatform>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <SkipPackageVerification>true</SkipPackageVerification>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <OutDir>$(SolutionDir)$(Configuration)\</OutDir>
+    <IntDir>$(ProjectDir)obj\$(Platform)\$(Configuration)\</IntDir>
+    <Inf2CatUseLocalTime>true</Inf2CatUseLocalTime>
+  </PropertyGroup>
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="PropertySheets" />
+  <PropertyGroup Label="UserMacros">
+    <ApiValidator_ApiExtractorExePath>$(WindowsSdkDir)bin\$(WindowsTargetPlatformVersion)\x64</ApiValidator_ApiExtractorExePath>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <CompileAs>CompileAsC</CompileAs>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+      <PreprocessorDefinitions>JIYUDRIVER;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\km;$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalDependencies>wdmsec.lib;wdm.lib;cng.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(WindowsSdkDir)Lib\$(WindowsTargetPlatformVersion)\km\$(Platform);$(WindowsSdkDir)Lib\$(WindowsTargetPlatformVersion)\ucrt\$(Platform);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+    </Link>
+    <DriverSign><SignMode>Off</SignMode><FileDigestAlgorithm>sha256</FileDigestAlgorithm></DriverSign>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClInclude Include="Driver64.h" />
+    <ClInclude Include="DriverGuard64.h" />
+    <ClInclude Include="IoCtl.h" />
+    <ClInclude Include="IoStructs.h" />
+    <ClInclude Include="Protection64.h" />
+    <ClInclude Include="RegistryProtection64.h" />
+    <ClInclude Include="UnloadToken64.h" />
+    <ClInclude Include="UnlockPublicKey.h" />
+    <ClInclude Include="resource.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="Driver64.c" />
+    <ClCompile Include="DriverGuard64.c" />
+    <ClCompile Include="Protection64.c" />
+    <ClCompile Include="RegistryProtection64.c" />
+    <ClCompile Include="UnloadToken64.c" />
+  </ItemGroup>
+  <ItemGroup><ResourceCompile Include="JiYuTrainerDriver64.rc" /></ItemGroup>
+  <ItemGroup><Inf Include="JiYuTrainerDriver.inf" /></ItemGroup>
+  <ItemGroup><FilesToPackage Include="$(TargetPath)" /></ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <PropertyGroup>
+    <ApiValidator_ApiExtractorExePath>$(WindowsSdkDir)bin\$(WindowsTargetPlatformVersion)\x64</ApiValidator_ApiExtractorExePath>
+  </PropertyGroup>
+  <ImportGroup Label="ExtensionTargets" />
+</Project>
