@@ -190,6 +190,9 @@
     <ResourceCompile Include="JiYuTrainer.rc">
       <Filter>资源文件</Filter>
     </ResourceCompile>
+    <ResourceCompile Include="DzjsTrainerVersion.rc">
+      <Filter>资源文件</Filter>
+    </ResourceCompile>
   </ItemGroup>
   <ItemGroup>
     <Image Include="small.ico">

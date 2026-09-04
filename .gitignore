@@ -51,3 +51,9 @@ unlock-key-material/
 /sc1.png
 /*帮助.png
 /tools/Protect-DriverUnlockToken.ps1
+
+# Local versioned build staging directories
+/Release-v1.0.0/
+/JiYuAvRelease/
+/obj-v1.0.0/
+/JiYuTrainer/obj-v1.0.0-main/

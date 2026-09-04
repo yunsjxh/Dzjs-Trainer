@@ -253,6 +253,7 @@
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="JiYuTrainer.rc" />
+    <ResourceCompile Include="DzjsTrainerVersion.rc" />
     <ResourceCompile Include="AvResources.rc" />
     <ResourceCompile Include="..\JiYuTrainerUI\MaterialIcons.rc" />
   </ItemGroup>
