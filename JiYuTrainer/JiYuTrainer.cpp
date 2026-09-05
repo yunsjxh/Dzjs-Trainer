@@ -7,6 +7,7 @@
 #include <stdarg.h>
 #include <ShellAPI.h>
 #include <dbghelp.h>
+#include <exception>
 
 extern int RunHeartbeatWatchdogMode();
 
@@ -46,15 +47,20 @@ BOOL GenerateCrashInfo(PEXCEPTION_POINTERS pExInfo, LPCWSTR info_file_name, LPCW
 }
 LONG GenerateMiniDump(PEXCEPTION_POINTERS pExInfo)
 {
-	TCHAR dmp_path[MAX_PATH];
-	wcscpy_s(dmp_path, currentApp->GetCurrentDir());
+	TCHAR dmp_path[MAX_PATH] = {};
+	if (currentApp && currentApp->GetCurrentDir() && currentApp->GetCurrentDir()[0] != L'\0') {
+		wcsncpy_s(dmp_path, currentApp->GetCurrentDir(), _TRUNCATE);
+	}
+	else if (GetTempPathW(_countof(dmp_path), dmp_path) == 0) {
+		wcscpy_s(dmp_path, L".");
+	}
 
 	SYSTEMTIME tm;
 	GetLocalTime(&tm);//获取时间
-	TCHAR file_name[128];
+	TCHAR file_name[MAX_PATH * 2] = {};
 	swprintf_s(file_name, L"%s\\JiYuTrainerCrashDump%d%02d%02d-%02d%02d%02d.dmp", dmp_path,
 		tm.wYear, tm.wMonth, tm.wDay, tm.wHour, tm.wMinute, tm.wSecond);//设置dmp文件名称
-	TCHAR info_file_name[128];
+	TCHAR info_file_name[MAX_PATH * 2] = {};
 	swprintf_s(info_file_name, L"%s\\JiYuTrainerCrashInfo%d%02d%02d-%02d%02d%02d.txt", dmp_path,
 		tm.wYear, tm.wMonth, tm.wDay, tm.wHour, tm.wMinute, tm.wSecond);
 
@@ -100,7 +106,7 @@ LONG GenerateMiniDump(PEXCEPTION_POINTERS pExInfo)
 		swprintf_s(info, L"应用程序出现了一个错误，%s。\n%s", (hasCrashInfo && dumpWritten ? L"需要关闭，已生成关于此错误的报告" : L"并且未能完整生成错误转储文件"), expInfo);
 		MessageBoxTimeoutW(NULL, info, L"JiYuTrainer 应用程序错误", MB_ICONERROR | MB_SYSTEMMODAL, 0, 3600);
 
-		if (hasCrashInfo)
+		if (hasCrashInfo && currentApp && currentApp->GetFullPath())
 		{
 			WCHAR arg[320];
 			swprintf_s(arg, L"-bugreport -bugfile \"%s\"", info_file_name);
@@ -155,12 +161,28 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR 
 	currentLogger = new LoggerInternal();
 	currentLogger->SetLogOutPut(LogOutPutConsolne);
 	currentLogger->SetLogLevel(LogLevelText);
-	currentApp = new JTAppInternal(hInstance);
-	currentApp->Run(nCmdShow);
-	int rs = currentApp->GetResult();
-	ShowAppStartupFail(rs);
-	delete currentApp;
-	delete currentLogger;
-
+	int rs = APP_FAIL_INSTALL;
+	try {
+		currentApp = new JTAppInternal(hInstance);
+		currentApp->Run(nCmdShow);
+		rs = currentApp->GetResult();
+		ShowAppStartupFail(rs);
+	}
+	catch (const std::exception& error) {
+		if (currentLogger) currentLogger->LogError(L"Unhandled C++ exception at application boundary: %hs", error.what());
+		MessageBoxW(nullptr, L"程序遇到异常，已停止当前操作。请查看日志后重试。", L"Dzjs Trainer", MB_ICONERROR | MB_OK);
+	}
+	catch (...) {
+		if (currentLogger) currentLogger->LogError(L"Unhandled non-standard exception at application boundary");
+		MessageBoxW(nullptr, L"程序遇到未知异常，已停止当前操作。请查看日志后重试。", L"Dzjs Trainer", MB_ICONERROR | MB_OK);
+	}
+	if (currentApp) {
+		delete currentApp;
+		currentApp = nullptr;
+	}
+	if (currentLogger) {
+		delete currentLogger;
+		currentLogger = nullptr;
+	}
 	return rs;
 }

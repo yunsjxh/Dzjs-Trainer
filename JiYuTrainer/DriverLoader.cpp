@@ -260,14 +260,13 @@ static DWORD WINAPI DriverHeartbeatThread(LPVOID)
 					returned,
 					response.version,
 					response.protocolVersion);
-			if (hDriverWatchdogStop != NULL) {
-				ExitProcess(ERROR_REVISION_MISMATCH);
-			}
-			if (RestartMainAfterHeartbeatFailure()) {
-				if (currentLogger)
-					currentLogger->LogWarn(L"Heartbeat recovery instance started");
-				ExitProcess(ERROR_REVISION_MISMATCH);
-			}
+						// A transient driver communication failure must not terminate the UI.
+			// Stop the separate watchdog so it does not create a duplicate recovery
+			// instance, then leave driver-backed commands in their normal failed state.
+			if (hDriverWatchdogStop != NULL)
+				SetEvent(hDriverWatchdogStop);
+			if (currentLogger)
+				currentLogger->LogWarn(L"Driver heartbeat stopped; application remains available and driver features will retry on their next use");
 			break;
 		}
 		if (hDriverHeartbeatPulse) SetEvent(hDriverHeartbeatPulse);

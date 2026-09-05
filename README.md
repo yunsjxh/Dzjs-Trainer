@@ -1,6 +1,6 @@
 # Dzjs Trainer
 
-当前版本：`v1.0.0`
+当前版本：`v1.0.1`
 
 Dzjs Trainer 是基于 JiYu Trainer 翻新和持续维护的 Windows 桌面项目，面向经授权的教学机房、设备维护与兼容性研究场景。
 

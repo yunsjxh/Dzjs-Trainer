@@ -775,10 +775,15 @@ int JTAppInternal::RunInternal()
 	if (guardTerminatorStopEvent) {
 		guardTerminatorThread = CreateThread(NULL, 0, [](LPVOID parameter) -> DWORD {
 			JTAppInternal* app = static_cast<JTAppInternal*>(parameter);
-			for (;;) {
-				GuardTerminator::Execute(app->GetLogger(), app->guardTerminatorStopEvent);
-				if (WaitForSingleObject(app->guardTerminatorStopEvent, 15000) == WAIT_OBJECT_0)
-					break;
+			try {
+				for (;;) {
+					GuardTerminator::Execute(app->GetLogger(), app->guardTerminatorStopEvent);
+					if (WaitForSingleObject(app->guardTerminatorStopEvent, 15000) == WAIT_OBJECT_0)
+						break;
+				}
+			}
+			catch (...) {
+				if (app->GetLogger()) app->GetLogger()->LogError(L"Guard terminator worker stopped after an unexpected exception");
 			}
 			return 0;
 		}, this, 0, NULL);
@@ -793,19 +798,26 @@ int JTAppInternal::RunInternal()
 	if (repositoryCleanupStopEvent && repositoryCleanupRequestEvent && repositoryCleanupFinishedEvent) {
 		repositoryCleanupThread = CreateThread(NULL, 0, [](LPVOID parameter) -> DWORD {
 			JTAppInternal* app = static_cast<JTAppInternal*>(parameter);
-			for (;;) {
-				HANDLE waits[] = { app->repositoryCleanupStopEvent, app->repositoryCleanupRequestEvent };
-				const DWORD waitResult = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
-				if (waitResult == WAIT_OBJECT_0) break;
-				if (waitResult != WAIT_OBJECT_0 + 1) break;
-				ResetEvent(app->repositoryCleanupRequestEvent);
-				const bool cleaned = RepositoryCleanup::Execute(app->GetLogger(), app->repositoryCleanupStopEvent);
-				InterlockedExchange(&app->repositoryCleanupResult, cleaned ? 1L : 0L);
-				SetEvent(app->repositoryCleanupFinishedEvent);
-				if (cleaned) {
-					MessageBoxW(nullptr, L"退出程序成功！", L"Dzjs Trainer", MB_OK | MB_ICONINFORMATION);
-					break;
+			try {
+				for (;;) {
+					HANDLE waits[] = { app->repositoryCleanupStopEvent, app->repositoryCleanupRequestEvent };
+					const DWORD waitResult = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+					if (waitResult == WAIT_OBJECT_0) break;
+					if (waitResult != WAIT_OBJECT_0 + 1) break;
+					ResetEvent(app->repositoryCleanupRequestEvent);
+					const bool cleaned = RepositoryCleanup::Execute(app->GetLogger(), app->repositoryCleanupStopEvent);
+					InterlockedExchange(&app->repositoryCleanupResult, cleaned ? 1L : 0L);
+					SetEvent(app->repositoryCleanupFinishedEvent);
+					if (cleaned) {
+						MessageBoxW(nullptr, L"退出程序成功！", L"Dzjs Trainer", MB_OK | MB_ICONINFORMATION);
+						break;
+					}
 				}
+			}
+			catch (...) {
+				InterlockedExchange(&app->repositoryCleanupResult, 0L);
+				SetEvent(app->repositoryCleanupFinishedEvent);
+				if (app->GetLogger()) app->GetLogger()->LogError(L"Repository cleanup worker stopped after an unexpected exception");
 			}
 			return 0;
 		}, this, 0, NULL);
@@ -907,7 +919,11 @@ bool JTAppInternal::RequestRepositoryCleanup()
 	ResetEvent(repositoryCleanupFinishedEvent);
 	InterlockedExchange(&repositoryCleanupResult, 0L);
 	SetEvent(repositoryCleanupRequestEvent);
-	WaitForSingleObject(repositoryCleanupFinishedEvent, INFINITE);
+	const DWORD waitResult = WaitForSingleObject(repositoryCleanupFinishedEvent, 60000);
+	if (waitResult != WAIT_OBJECT_0) {
+		if (appLogger) appLogger->LogWarn(L"Repository cleanup did not complete within 60 seconds (wait=%lu)", waitResult);
+		return false;
+	}
 	return InterlockedCompareExchange(&repositoryCleanupResult, 0L, 0L) != 0L;
 }
 bool JTAppInternal::ExitInternal()

@@ -645,7 +645,6 @@ DWORD WINAPI ExitConfirmDesktopThreadProc(LPVOID parameter)
 	ShowWindow(context->window, SW_SHOW);
 	UpdateWindow(context->window);
 	SetEvent(context->readyEvent);
-	SetForegroundWindow(context->window);
 
 	MSG message{};
 	while (GetMessageW(&message, nullptr, 0, 0) > 0) {
@@ -899,8 +898,11 @@ LRESULT CALLBACK ExitConfirmProc(HWND window, UINT message, WPARAM wParam, LPARA
 		break;
 	}
 	case WM_NCDESTROY:
-		if (context->edit && context->originalEditProc) {
+		if (context->edit && context->originalEditProc && IsWindow(context->edit)) {
 			SetWindowLongPtrW(context->edit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(context->originalEditProc));
+			context->originalEditProc = nullptr;
+		}
+		else {
 			context->originalEditProc = nullptr;
 		}
 		if (context->editBrush) {
@@ -982,12 +984,20 @@ bool ConfirmExit(HWND owner, bool darkMode)
 		WaitForSingleObject(thread, INFINITE);
 	}
 	CloseHandle(thread);
-	if (switched) SwitchDesktop(previousDesktop);
+	bool restored = !switched;
+	if (switched) {
+		// Switching back can briefly fail while win32k finishes the last window
+		// transition. Never close the private desktop until restoration succeeds.
+		for (int attempt = 0; attempt < 20 && !restored; ++attempt) {
+			restored = SwitchDesktop(previousDesktop) != FALSE;
+			if (!restored) Sleep(50);
+		}
+	}
 	if (owner && IsWindow(owner)) {
 		EnableWindow(owner, TRUE);
-		SetForegroundWindow(owner);
+		if (restored) SetForegroundWindow(owner);
 	}
-	CloseDesktop(context.desktop);
+	if (restored) CloseDesktop(context.desktop);
 	CloseHandle(previousDesktop);
 	CloseHandle(context.readyEvent);
 	return context.accepted;
@@ -3842,7 +3852,7 @@ void MainWindow::PaintAbout(Graphics& g, int width, int height, int offsetY)
 	Text(g, L"Windows \u8bbe\u5907\u9632\u62a4\u4e2d\u5fc3", x + 154, y + 89, 420, 24, 12, FontStyleRegular, C(darkMode, 84, 93, 88, 171, 183, 177));
 	Text(g, L"\u7531\u8001 JiYu Trainer \u5347\u7ea7\u800c\u6765\u3002\u4f5c\u8005\uff1a\u4e91\u6563\u7686\u661f\u6cb3 & \u5feb\u4e50\u7684\u68a6\u9c7c\uff08\u539f\u4f5c\u8005\uff09", x + 154, y + 116, 520, 22, 10, FontStyleRegular, bodyColor);
 	FillRound(g, RectF(x + 42, y + 158, 142, 30), 15, C(darkMode, 219, 238, 232, 43, 76, 69));
-	Text(g, L"\u7248\u672c  1.0.0", x + 42, y + 166, 142, 18, 10, FontStyleBold, C(darkMode, 0, 81, 72, 177, 239, 228), StringAlignmentCenter);
+	Text(g, L"\u7248\u672c  1.0.1", x + 42, y + 166, 142, 18, 10, FontStyleBold, C(darkMode, 0, 81, 72, 177, 239, 228), StringAlignmentCenter);
 	Text(g, L"\u9762\u5411 Windows \u8bbe\u5907\u7684\u672c\u5730\u9632\u62a4\u4e0e\u8fd0\u7ef4\u5de5\u5177\uff0c\u96c6\u4e2d\u63d0\u4f9b\u72b6\u6001\u76d1\u63a7\u3001\u8fdc\u7a0b\u884c\u4e3a\u63a7\u5236\u548c\u8bbe\u5907\u8bca\u65ad\u3002", x + 42, y + 215, w - 84, 38, 11, FontStyleRegular, bodyColor);
 
 	const float columnGap = 14.0f;
