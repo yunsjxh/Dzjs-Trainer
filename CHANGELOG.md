@@ -2,6 +2,24 @@
 
 All notable changes to Dzjs Trainer are documented in this file.
 
+## [1.0.2] - 2026-09-06
+
+### Added
+
+- Added a dedicated homepage/header action for super topmost.
+- Added runtime UIAccess relaunch and token verification based on the `D:\\原桌面\\class` implementation.
+
+### Changed
+
+- The super-topmost header button now displays `超级置顶：已开启` or `超级置顶：未开启` from the effective UIAccess and topmost window state.
+- Updated the application version to `1.0.2` and Windows file/product version to `1.0.2.0`.
+
+### Release Package
+
+- `DzjsTrainer-v1.0.2-win32.zip` contains the Win32 main executable only.
+- The package includes the embedded signed primary driver.
+- A SHA-256 checksum file is published alongside the archive.
+
 ## [1.0.1] - 2026-09-05
 
 ### Fixed

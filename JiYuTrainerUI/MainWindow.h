@@ -41,7 +41,7 @@ public:
 
 private:
 	struct TeacherBackend;
-	enum class Page { Overview, Protection, Antivirus, Advanced, Help, Network, Diagnostics, Logs, About };
+	enum class Page { Overview, Protection, Replacement, Antivirus, Advanced, Help, Network, Diagnostics, Logs, About };
 
 	struct LogEntry {
 		std::wstring text;
@@ -177,7 +177,7 @@ private:
 	bool setDoNotShowTrayIcon = false;
 	int autoShutSec = 0;
 
-	std::array<RECT, 9> navRects{};
+	std::array<RECT, 10> navRects{};
 	std::array<RECT, 5> actionRects{};
 	std::array<RECT, 9> toggleRects{};
 	RECT temporaryVideoEnableRect{};
@@ -188,6 +188,7 @@ private:
 	RECT temporaryVideoLoopRect{};
 	RECT temporaryVideoPreviewRect{};
 	RECT themeRect{};
+	RECT superTopMostRect{};
 	RECT exportLogRect{};
 	RECT saveSettingsRect{};
 	RECT advancedSettingsRect{};
@@ -254,6 +255,7 @@ private:
 	void PaintToast(Gdiplus::Graphics& g, int width);
 	void UpdateHover(POINT point);
 	void HandleClick(POINT point);
+	void RequestSuperTopmost();
 	void SelectPage(Page target);
 	void StartAvProcessScan();
 	void StopAvProcessScan();

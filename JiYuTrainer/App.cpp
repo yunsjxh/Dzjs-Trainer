@@ -690,10 +690,13 @@ int JTAppInternal::Run(int nCmdShow)
 }
 int JTAppInternal::RunCheckRunningApp()//如果程序已经有一个在运行，则返回true
 {
+	// The UIAccess relaunch is intentional: let the elevated helper instance
+	// start while the original instance is still shutting down.
+	const bool uiAccessRestart = wcsstr(GetCommandLineW(), L"--uiaccess-restarted") != nullptr;
 	wchar_t modulePath[MAX_PATH]{};
 	GetModuleFileNameW(nullptr, modulePath, _countof(modulePath));
 	const bool nativePreviewBuild = wcsstr(modulePath, L"JiYuTrainer-TeacherNative") != nullptr;
-	if (!nativePreviewBuild) {
+	if (!nativePreviewBuild && !uiAccessRestart) {
 		HWND oldWindow = FindWindow(MAIN_WND_CLS_NAME, MAIN_WND_NAME);
 		if (oldWindow != NULL) {
 			if (!IsWindowVisible(oldWindow)) ShowWindow(oldWindow, SW_SHOW);
@@ -702,7 +705,7 @@ int JTAppInternal::RunCheckRunningApp()//如果程序已经有一个在运行，
 			return -1;
 		}
 	}
-	HANDLE hMutex = CreateMutex(NULL, FALSE, nativePreviewBuild ? L"JYTMutex-TeacherNative" : L"JYTMutex");
+	HANDLE hMutex = CreateMutex(NULL, FALSE, nativePreviewBuild ? L"JYTMutex-TeacherNative" : (uiAccessRestart ? L"JYTMutex-UIAccess" : L"JYTMutex"));
 	if (hMutex && (GetLastError() == ERROR_ALREADY_EXISTS))
 	{
 		CloseHandle(hMutex);

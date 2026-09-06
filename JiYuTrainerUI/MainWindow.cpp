@@ -60,6 +60,7 @@ int screenWidth = 0;
 int screenHeight = 0;
 
 namespace {
+constexpr wchar_t kUiAccessRestartArgument[] = L"--uiaccess-restarted";
 constexpr UINT WM_NATIVE_REFRESH = WM_APP + 41;
 constexpr UINT WM_BLOCKED_INJECTED_INPUT = WM_APP + 42;
 constexpr UINT WM_AV_SCAN_FINISHED = WM_APP + 43;
@@ -75,6 +76,228 @@ bool IsCurrentProcessUiAccessEnabled()
 	DWORD returned = 0;
 	const bool result = GetTokenInformation(token, TokenUIAccess, &enabled, sizeof(enabled), &returned) != FALSE && enabled != 0;
 	CloseHandle(token);
+	return result;
+}
+
+bool IsWindowActuallyTopmost(HWND window)
+{
+	return window != nullptr &&
+		(GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+}
+
+struct UiAccessLaunchResult {
+	bool success{};
+	DWORD error{ ERROR_SUCCESS };
+	std::wstring step;
+};
+
+bool EnableUiPrivilege(HANDLE token, LPCWSTR name, DWORD* errorCode = nullptr)
+{
+	if (errorCode) *errorCode = ERROR_SUCCESS;
+	LUID luid{};
+	if (!LookupPrivilegeValueW(nullptr, name, &luid)) {
+		if (errorCode) *errorCode = GetLastError();
+		return false;
+	}
+	TOKEN_PRIVILEGES privileges{};
+	privileges.PrivilegeCount = 1;
+	privileges.Privileges[0].Luid = luid;
+	privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+	SetLastError(ERROR_SUCCESS);
+	if (!AdjustTokenPrivileges(token, FALSE, &privileges, 0, nullptr, nullptr) ||
+		GetLastError() != ERROR_SUCCESS) {
+		if (errorCode) *errorCode = GetLastError();
+		return false;
+	}
+	return true;
+}
+
+bool TokenBelongsToLocalSystem(HANDLE token)
+{
+	DWORD required = 0;
+	GetTokenInformation(token, TokenUser, nullptr, 0, &required);
+	if (required == 0) return false;
+	std::vector<BYTE> buffer(required);
+	if (!GetTokenInformation(token, TokenUser, buffer.data(), required, &required)) return false;
+	BYTE systemSid[SECURITY_MAX_SID_SIZE]{};
+	DWORD sidSize = sizeof(systemSid);
+	if (!CreateWellKnownSid(WinLocalSystemSid, nullptr, systemSid, &sidSize)) return false;
+	const auto* tokenUser = reinterpret_cast<const TOKEN_USER*>(buffer.data());
+	return EqualSid(tokenUser->User.Sid, systemSid) != FALSE;
+}
+
+DWORD FindSystemTokenSourceProcess(DWORD currentSessionId)
+{
+	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snapshot == INVALID_HANDLE_VALUE) return 0;
+	DWORD bestPid = 0;
+	int bestRank = 0;
+	PROCESSENTRY32W entry{};
+	entry.dwSize = sizeof(entry);
+	if (Process32FirstW(snapshot, &entry)) {
+		do {
+			DWORD sessionId = 0;
+			ProcessIdToSessionId(entry.th32ProcessID, &sessionId);
+			int rank = 0;
+			if (_wcsicmp(entry.szExeFile, L"winlogon.exe") == 0)
+				rank = sessionId == currentSessionId ? 40 : 30;
+			else if (_wcsicmp(entry.szExeFile, L"services.exe") == 0)
+				rank = sessionId == currentSessionId ? 20 : 10;
+			if (rank > bestRank) {
+				bestRank = rank;
+				bestPid = entry.th32ProcessID;
+			}
+		} while (Process32NextW(snapshot, &entry));
+	}
+	CloseHandle(snapshot);
+	return bestPid;
+}
+
+std::wstring QuoteCommandLineArgument(const std::wstring& argument)
+{
+	std::wstring quoted = L"\"";
+	size_t backslashes = 0;
+	for (wchar_t ch : argument) {
+		if (ch == L'\\') {
+			++backslashes;
+			continue;
+		}
+		if (ch == L'\"') {
+			quoted.append(backslashes * 2 + 1, L'\\');
+			quoted.push_back(ch);
+		}
+		else {
+			quoted.append(backslashes, L'\\');
+			quoted.push_back(ch);
+		}
+		backslashes = 0;
+	}
+	quoted.append(backslashes * 2, L'\\');
+	quoted.push_back(L'\"');
+	return quoted;
+}
+
+UiAccessLaunchResult RelaunchWithUiAccess()
+{
+	UiAccessLaunchResult result;
+	HANDLE currentToken = nullptr;
+	HANDLE sourceProcess = nullptr;
+	HANDLE sourceToken = nullptr;
+	HANDLE systemImpersonationToken = nullptr;
+	HANDLE uiAccessToken = nullptr;
+	bool impersonating = false;
+	auto fail = [&](LPCWSTR step, DWORD error = GetLastError()) {
+		result.step = step;
+		result.error = error;
+	};
+
+	do {
+		if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ADJUST_PRIVILEGES, &currentToken)) {
+			fail(L"OpenProcessToken(current)");
+			break;
+		}
+		DWORD privilegeError = ERROR_SUCCESS;
+		if (!EnableUiPrivilege(currentToken, SE_DEBUG_NAME, &privilegeError)) {
+			fail(L"Enable SeDebugPrivilege", privilegeError);
+			break;
+		}
+		DWORD sessionId = 0;
+		if (!ProcessIdToSessionId(GetCurrentProcessId(), &sessionId)) {
+			fail(L"ProcessIdToSessionId");
+			break;
+		}
+		const DWORD sourcePid = FindSystemTokenSourceProcess(sessionId);
+		if (sourcePid == 0) {
+			fail(L"Find SYSTEM token source", ERROR_NOT_FOUND);
+			break;
+		}
+		sourceProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, sourcePid);
+		if (!sourceProcess) {
+			fail(L"OpenProcess(SYSTEM source)");
+			break;
+		}
+		if (!OpenProcessToken(sourceProcess, TOKEN_QUERY | TOKEN_DUPLICATE, &sourceToken)) {
+			fail(L"OpenProcessToken(SYSTEM source)");
+			break;
+		}
+		if (!TokenBelongsToLocalSystem(sourceToken)) {
+			fail(L"Verify LocalSystem token", ERROR_INVALID_OWNER);
+			break;
+		}
+		SECURITY_ATTRIBUTES attributes{};
+		attributes.nLength = sizeof(attributes);
+		if (!DuplicateTokenEx(sourceToken, MAXIMUM_ALLOWED, &attributes, SecurityImpersonation, TokenImpersonation, &systemImpersonationToken)) {
+			fail(L"DuplicateTokenEx(SYSTEM impersonation)");
+			break;
+		}
+		if (!ImpersonateLoggedOnUser(systemImpersonationToken)) {
+			fail(L"ImpersonateLoggedOnUser(SYSTEM)");
+			break;
+		}
+		impersonating = true;
+		EnableUiPrivilege(systemImpersonationToken, SE_ASSIGNPRIMARYTOKEN_NAME);
+		EnableUiPrivilege(systemImpersonationToken, SE_INCREASE_QUOTA_NAME);
+		EnableUiPrivilege(systemImpersonationToken, SE_TCB_NAME);
+		if (!DuplicateTokenEx(currentToken, MAXIMUM_ALLOWED, &attributes, SecurityImpersonation, TokenPrimary, &uiAccessToken)) {
+			fail(L"DuplicateTokenEx(current primary)");
+			break;
+		}
+		DWORD uiAccess = 1;
+		if (!SetTokenInformation(uiAccessToken, TokenUIAccess, &uiAccess, sizeof(uiAccess))) {
+			fail(L"SetTokenInformation(TokenUIAccess)");
+			break;
+		}
+		DWORD verifiedUiAccess = 0;
+		DWORD returned = 0;
+		if (!GetTokenInformation(uiAccessToken, TokenUIAccess, &verifiedUiAccess, sizeof(verifiedUiAccess), &returned) || verifiedUiAccess == 0) {
+			fail(L"Verify TokenUIAccess");
+			break;
+		}
+		wchar_t path[32768]{};
+		DWORD pathLength = GetModuleFileNameW(nullptr, path, ARRAYSIZE(path));
+		if (pathLength == 0 || pathLength >= ARRAYSIZE(path)) {
+			fail(L"GetModuleFileNameW");
+			break;
+		}
+		std::wstring executable(path, pathLength);
+		std::wstring commandLine = QuoteCommandLineArgument(executable) + L" " + kUiAccessRestartArgument;
+		STARTUPINFOW startup{};
+		startup.cb = sizeof(startup);
+		wchar_t desktop[] = L"winsta0\\default";
+		startup.lpDesktop = desktop;
+		PROCESS_INFORMATION process{};
+		if (!CreateProcessAsUserW(uiAccessToken, executable.c_str(), commandLine.data(), nullptr, nullptr, FALSE,
+			CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_PROCESS_GROUP, nullptr, nullptr, &startup, &process)) {
+			fail(L"CreateProcessAsUserW(UIAccess)");
+			break;
+		}
+		HANDLE launchedToken = nullptr;
+		DWORD launchedUiAccess = 0;
+		DWORD launchedReturned = 0;
+		const bool openedLaunchedToken = OpenProcessToken(process.hProcess, TOKEN_QUERY, &launchedToken) != FALSE;
+		const bool queriedLaunchedToken = openedLaunchedToken && GetTokenInformation(launchedToken, TokenUIAccess,
+			&launchedUiAccess, sizeof(launchedUiAccess), &launchedReturned) != FALSE;
+		const bool launchedWithUiAccess = queriedLaunchedToken && launchedUiAccess != 0;
+		const DWORD verificationError = launchedWithUiAccess ? ERROR_SUCCESS :
+			(queriedLaunchedToken ? ERROR_PRIVILEGE_NOT_HELD : GetLastError());
+		if (launchedToken) CloseHandle(launchedToken);
+		if (!launchedWithUiAccess) {
+			TerminateProcess(process.hProcess, 1);
+			CloseHandle(process.hThread);
+			CloseHandle(process.hProcess);
+			fail(L"Verify launched process TokenUIAccess", verificationError);
+			break;
+		}
+		CloseHandle(process.hThread);
+		CloseHandle(process.hProcess);
+		result.success = true;
+	} while (false);
+	if (impersonating) RevertToSelf();
+	if (uiAccessToken) CloseHandle(uiAccessToken);
+	if (systemImpersonationToken) CloseHandle(systemImpersonationToken);
+	if (sourceToken) CloseHandle(sourceToken);
+	if (sourceProcess) CloseHandle(sourceProcess);
+	if (currentToken) CloseHandle(currentToken);
 	return result;
 }
 
@@ -278,10 +501,10 @@ void DrawNativeButton(const DRAWITEMSTRUCT* item, HFONT font, bool dark)
 }
 
 const wchar_t* kNavLabels[] = {
-	L"\u72b6\u6001\u603b\u89c8", L"\u9632\u62a4\u7b56\u7565", L"\u7279\u5f81\u626b\u63cf", L"\u9ad8\u7ea7\u914d\u7f6e", L"\u4f7f\u7528\u5e2e\u52a9", L"\u7f51\u7edc\u5de5\u5177", L"\u8bbe\u5907\u8bca\u65ad", L"\u8fd0\u884c\u65e5\u5fd7", L"\u5173\u4e8e\u8f6f\u4ef6"
+	L"\u72b6\u6001\u603b\u89c8", L"\u9632\u62a4\u7b56\u7565", L"\u66ff\u6362\u753b\u9762", L"\u7279\u5f81\u626b\u63cf", L"\u9ad8\u7ea7\u914d\u7f6e", L"\u4f7f\u7528\u5e2e\u52a9", L"\u7f51\u7edc\u5de5\u5177", L"\u8bbe\u5907\u8bca\u65ad", L"\u8fd0\u884c\u65e5\u5fd7", L"\u5173\u4e8e\u8f6f\u4ef6"
 };
 const wchar_t* kPageTitles[] = {
-	L"\u72b6\u6001\u603b\u89c8", L"\u9632\u62a4\u7b56\u7565", L"\u7279\u5f81\u7801\u626b\u63cf", L"\u9ad8\u7ea7\u914d\u7f6e", L"\u4f7f\u7528\u5e2e\u52a9", L"\u7f51\u7edc\u5de5\u5177", L"\u8bbe\u5907\u8bca\u65ad", L"\u8fd0\u884c\u65e5\u5fd7", L"\u5173\u4e8e Dzjs Trainer"
+	L"\u72b6\u6001\u603b\u89c8", L"\u9632\u62a4\u7b56\u7565", L"\u66ff\u6362\u753b\u9762", L"\u7279\u5f81\u7801\u626b\u63cf", L"\u9ad8\u7ea7\u914d\u7f6e", L"\u4f7f\u7528\u5e2e\u52a9", L"\u7f51\u7edc\u5de5\u5177", L"\u8bbe\u5907\u8bca\u65ad", L"\u8fd0\u884c\u65e5\u5fd7", L"\u5173\u4e8e Dzjs Trainer"
 };
 const wchar_t* kToggleLabels[] = {
 	L"\u62e6\u622a\u8fdc\u7a0b\u8fd0\u884c\u7a0b\u5e8f", L"\u76f4\u63a5\u62d2\u7edd\u8fdc\u7a0b\u547d\u4ee4", L"\u5141\u8bb8\u5e7f\u64ad\u7a97\u53e3\u7f6e\u9876", L"\u963b\u6b62\u8fdc\u7a0b\u7ed3\u675f\u8fdb\u7a0b",
@@ -2772,6 +2995,7 @@ void MainWindow::Paint()
 	switch (page) {
 	case Page::Overview: PaintOverview(g, width, height, offset); break;
 	case Page::Protection: PaintProtection(g, width, height, offset); break;
+	case Page::Replacement: PaintProtection(g, width, height, offset); break;
 	case Page::Antivirus: PaintAntivirus(g, width, height, offset); break;
 	case Page::Advanced: PaintAdvanced(g, width, height, offset); break;
 	case Page::Help: PaintHelp(g, width, height, offset); break;
@@ -2798,21 +3022,21 @@ void MainWindow::PaintNavigation(Graphics& g, int height)
 	Text(g, L"\u8bbe\u5907\u9632\u62a4\u4e2d\u5fc3", 76, 44, 128, 18, 10, FontStyleRegular, C(d, 67, 72, 70, 191, 200, 196));
 	Text(g, L"\u5de5\u4f5c\u533a", 24, 94, 150, 18, 10, FontStyleBold, C(d, 91, 97, 94, 164, 174, 169));
 
-	const int navIcons[] = { 0, 1, 5, 6, 3, 0, 2, 3, 6 };
-	for (int i = 0; i < 9; ++i) {
-		const float y = 116.0f + i * 50.0f;
-		navRects[i] = { 12, static_cast<LONG>(y), 208, static_cast<LONG>(y + 44) };
+	const int navIcons[] = { 0, 1, 5, 5, 6, 3, 0, 2, 3, 6 };
+	for (int i = 0; i < 10; ++i) {
+		const float y = 110.0f + i * 45.0f;
+		navRects[i] = { 12, static_cast<LONG>(y), 208, static_cast<LONG>(y + 40) };
 		const bool active = static_cast<int>(page) == i;
 		if (active) {
-			FillRound(g, RectF(12, y, 196, 44), 22, C(d, 183, 232, 222, 42, 79, 72));
+			FillRound(g, RectF(12, y, 196, 40), 20, C(d, 183, 232, 222, 42, 79, 72));
 		}
 		else if (hoverProgress[i] > 0.002f) {
-			FillRound(g, RectF(12, y, 196, 44), 22,
+			FillRound(g, RectF(12, y, 196, 40), 20,
 				Blend(C(d, 235, 241, 238, 27, 33, 31), C(d, 220, 229, 225, 39, 47, 44), hoverProgress[i]));
 		}
 		const Color navColor = active ? C(d, 0, 81, 72, 156, 240, 225) : C(d, 58, 64, 61, 197, 207, 202);
-		DrawIcon(g, navIcons[i], 30, y + 12, navColor, 20);
-		Text(g, kNavLabels[i], 66, y + 11, 126, 24, 11, active ? FontStyleBold : FontStyleRegular, navColor);
+		DrawIcon(g, navIcons[i], 30, y + 10, navColor, 18);
+		Text(g, kNavLabels[i], 66, y + 9, 126, 22, 10, active ? FontStyleBold : FontStyleRegular, navColor);
 	}
 
 	FillRound(g, RectF(16, static_cast<float>(height - 82), 188, 62), 8, C(d, 221, 231, 226, 34, 42, 39));
@@ -2825,14 +3049,51 @@ void MainWindow::PaintNavigation(Graphics& g, int height)
 void MainWindow::PaintHeader(Graphics& g, int width)
 {
 	const int pageIndex = static_cast<int>(page);
+	const bool superTopMostEnabled = IsCurrentProcessUiAccessEnabled() && IsWindowActuallyTopmost(_hWnd);
 	Text(g, kPageTitles[pageIndex], 248, 22, 430, 34, 23, FontStyleBold, C(darkMode, 28, 32, 30, 227, 233, 230));
 	Text(g, page == Page::Overview ? L"\u5f53\u524d\u8bbe\u5907\u7684\u8fd0\u884c\u4e0e\u9632\u62a4\u72b6\u6001" : L"Dzjs Trainer  \u00b7  \u672c\u673a", 248, 55, 440, 18, 10,
 		FontStyleRegular, C(darkMode, 86, 92, 89, 174, 184, 179));
 
+	superTopMostRect = { width - 214, 20, width - 88, 68 };
+	const float superX = static_cast<float>(width - 208);
+	const bool superHover = hoverTarget == 80;
+	FillRound(g, RectF(superX, 26, 118, 36), 18,
+		superTopMostEnabled ? C(darkMode, 185, 226, 217, 43, 76, 69) :
+			(superHover ? C(darkMode, 220, 237, 231, 49, 63, 58) : C(darkMode, 237, 242, 239, 31, 37, 34)));
+	Text(g, superTopMostEnabled ? L"\u8d85\u7ea7\u7f6e\u9876\uff1a\u5df2\u5f00\u542f" : L"\u8d85\u7ea7\u7f6e\u9876\uff1a\u672a\u5f00\u542f", superX, 36, 118, 18, 10, FontStyleBold,
+		superTopMostEnabled ? C(darkMode, 0, 81, 72, 155, 239, 224) : C(darkMode, 42, 48, 45, 220, 229, 225), StringAlignmentCenter);
 	themeRect = { width - 76, 20, width - 28, 68 };
 	const bool themeHover = hoverTarget == 41;
 	if (themeHover) FillRound(g, RectF(static_cast<float>(width - 76), 20, 48, 48), 24, C(darkMode, 226, 233, 229, 39, 47, 44));
 	DrawIcon(g, darkMode ? 8 : 9, static_cast<float>(width - 62), 34, C(darkMode, 52, 59, 56, 205, 215, 210), 20);
+}
+
+void MainWindow::RequestSuperTopmost()
+{
+	if (IsCurrentProcessUiAccessEnabled()) {
+		bool bandApplied = false;
+		if (!ApplyHighestPermittedTopmost(_hWnd, true, &bandApplied)) {
+			ShowFastTip(L"\u8d85\u7ea7\u7f6e\u9876\u5207\u6362\u5931\u8d25");
+			return;
+		}
+		setTopMost = true;
+		topMostUiAccessBand = bandApplied;
+		SaveSettings();
+		ShowFastTip(bandApplied ? L"\u5df2\u542f\u7528\u8d85\u7ea7\u7f6e\u9876" : L"\u5df2\u542f\u7528\u6807\u51c6\u7f6e\u9876");
+		InvalidateRect(_hWnd, nullptr, FALSE);
+		return;
+	}
+	const UiAccessLaunchResult launch = RelaunchWithUiAccess();
+	if (launch.success) {
+		JTAppGetSettingsDirect()->SetSettingBool(L"TopMost", true);
+		isUserCancel = true;
+		DestroyWindow(_hWnd);
+		return;
+	}
+	const std::wstring detail = launch.step + L" \u5931\u8d25\uff0c\u9519\u8bef\u7801: " + std::to_wstring(launch.error);
+	ShowFastTip(L"\u8d85\u7ea7\u7f6e\u9876\u542f\u52a8\u5931\u8d25");
+	if (currentLogger) currentLogger->LogError(L"\u8d85\u7ea7\u7f6e\u9876\u542f\u52a8\u5931\u8d25: %s", detail.c_str());
+	MessageBoxW(_hWnd, detail.c_str(), L"\u8d85\u7ea7\u7f6e\u9876\u542f\u52a8\u5931\u8d25", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
 }
 
 void MainWindow::PaintOverview(Graphics& g, int width, int height, int offsetY)
@@ -2899,7 +3160,9 @@ void MainWindow::PaintProtection(Graphics& g, int width, int height, int offsetY
 	const float x = 248.0f;
 	const float y = 94.0f + offsetY;
 	const float w = static_cast<float>(width - 276);
+	const bool replacementPage = page == Page::Replacement;
 	FillRound(g, RectF(x, y, w, static_cast<float>(height) - y - 20), 8, C(darkMode, 237, 242, 239, 31, 37, 34));
+	if (!replacementPage) {
 	Text(g, L"\u884c\u4e3a\u63a7\u5236", x + 24, y + 20, 200, 28, 16, FontStyleBold, C(darkMode, 32, 38, 35, 223, 231, 227));
 	Text(g, L"\u9009\u62e9\u5141\u8bb8\u7684\u8fdc\u7a0b\u884c\u4e3a\uff0c\u66f4\u6539\u5c06\u7acb\u5373\u5e94\u7528", x + 24, y + 50, 440, 20, 10, FontStyleRegular, C(darkMode, 91, 99, 95, 166, 177, 171));
 	bool values[] = { !setAllowAllRunOp, setBandAllRunOp, setAllowGbTop, setProhibitKillProcess, setAllowMonitor, setProhibitCloseWindow, setAllowControl, setAutoUpdate };
@@ -2920,13 +3183,36 @@ void MainWindow::PaintProtection(Graphics& g, int width, int height, int offsetY
 	toggleRects[8] = {};
 	driverLoadRect = {};
 	driverUnloadRect = {};
-	saveSettingsRect = {};
+		saveSettingsRect = {};
+	}
+	else {
+		for (RECT& rect : toggleRects) rect = {};
+		driverLoadRect = {};
+		saveSettingsRect = {};
+	}
+	if (!replacementPage) {
+		const float buttonX = x + w - 150;
+		const float buttonY = y + 20;
+		driverUnloadRect = { static_cast<LONG>(buttonX), static_cast<LONG>(buttonY), static_cast<LONG>(buttonX + 126), static_cast<LONG>(buttonY + 36) };
+		FillRound(g, RectF(buttonX, buttonY, 126, 36), 18, C(darkMode, 246, 221, 214, 52, 50, 48));
+		Text(g, L"\u5378\u8f7d\u4e3b\u9a71\u52a8", buttonX, buttonY + 10, 126, 18, 9, FontStyleBold, C(darkMode, 145, 45, 35, 230, 155, 140), StringAlignmentCenter);
+		temporaryVideoEnableRect = {};
+		temporaryVideoImageModeRect = {};
+		temporaryVideoFileModeRect = {};
+		temporaryVideoImagePickerRect = {};
+		temporaryVideoFilePickerRect = {};
+		temporaryVideoLoopRect = {};
+		temporaryVideoPreviewRect = {};
+		return;
+	}
 
-	const float panelY = y + 404;
+	const float panelY = replacementPage ? y + 18 : y + 404;
 	const float panelH = (std::max)(154.0f, static_cast<float>(height) - panelY - 34.0f);
 	FillRound(g, RectF(x + 24, panelY, w - 48, panelH), 8, C(darkMode, 255, 255, 255, 38, 45, 42));
-	Text(g, L"\u4fe1\u606f\u6d41\u4fdd\u62a4", x + 42, panelY + 14, 150, 23, 13, FontStyleBold, C(darkMode, 32, 38, 35, 223, 231, 227));
-	Text(g, L"\u4ec5\u5728\u5f53\u524d\u8fd0\u884c\u671f\u95f4\u751f\u6548", x + 42, panelY + 37, 190, 17, 9, FontStyleRegular, C(darkMode, 91, 99, 95, 166, 177, 171));
+	Text(g, page == Page::Replacement ? L"\u66ff\u6362\u753b\u9762" : L"\u4fe1\u606f\u6d41\u4fdd\u62a4", x + 42, panelY + 14, 150, 23, 13, FontStyleBold, C(darkMode, 32, 38, 35, 223, 231, 227));
+	Text(g, L"\u4fe1\u606f\u6d41\u4fdd\u62a4\uff08\u4ec5\u5728\u5f53\u524d\u8fd0\u884c\u671f\u95f4\u751f\u6548\uff09", x + 42, panelY + 37, 270, 17, 9, FontStyleRegular, C(darkMode, 91, 99, 95, 166, 177, 171));
+	// Keep the main-driver action visible on the same protection surface.
+	driverUnloadRect = {};
 
 	temporaryVideoEnableRect = { static_cast<LONG>(x + w - 134), static_cast<LONG>(panelY + 14), static_cast<LONG>(x + w - 42), static_cast<LONG>(panelY + 48) };
 	FillRound(g, RectF(x + w - 134, panelY + 14, 92, 34), 17,
@@ -4224,9 +4510,10 @@ void MainWindow::UnloadAvDriver()
 void MainWindow::UpdateHover(POINT point)
 {
 	int target = -1;
-	for (int i = 0; i < 9; ++i) if (Hit(navRects[i], point)) target = i;
+	for (int i = 0; i < 10; ++i) if (Hit(navRects[i], point)) target = i;
 	if (page == Page::Overview) for (int i = 0; i < 5; ++i) if (Hit(actionRects[i], point)) target = 10 + i;
-	if (page == Page::Protection) {
+	if (Hit(superTopMostRect, point)) target = 80;
+	if (page == Page::Protection || page == Page::Replacement) {
 		for (int i = 0; i < 8; ++i) if (Hit(toggleRects[i], point)) target = 20 + i;
 		if (Hit(temporaryVideoEnableRect, point)) target = 74;
 		if (Hit(temporaryVideoImageModeRect, point)) target = 75;
@@ -4265,6 +4552,10 @@ void MainWindow::UpdateHover(POINT point)
 
 void MainWindow::HandleClick(POINT point)
 {
+	if (Hit(superTopMostRect, point)) {
+		RequestSuperTopmost();
+		return;
+	}
 	if (Hit(themeRect, point)) {
 		darkMode = !darkMode;
 		if (controlSurfaceBrush) DeleteObject(controlSurfaceBrush);
@@ -4273,7 +4564,7 @@ void MainWindow::HandleClick(POINT point)
 		InvalidateRect(_hWnd, nullptr, FALSE);
 		return;
 	}
-	for (int i = 0; i < 9; ++i) if (Hit(navRects[i], point)) { SelectPage(static_cast<Page>(i)); return; }
+	for (int i = 0; i < 10; ++i) if (Hit(navRects[i], point)) { SelectPage(static_cast<Page>(i)); return; }
 	if (page == Page::About && Hit(aboutExitRect, point)) {
 		OnWmCommand(CMD_POWER_EXIT);
 		return;
@@ -4285,6 +4576,7 @@ void MainWindow::HandleClick(POINT point)
 			case 1:
 			{
 				const bool target = !setTopMost;
+				if (target && !IsCurrentProcessUiAccessEnabled()) { RequestSuperTopmost(); return; }
 				bool uiAccessBandApplied = false;
 				if (!ApplyHighestPermittedTopmost(_hWnd, target, &uiAccessBandApplied)) {
 					ShowFastTip(L"\u7a97\u53e3\u7f6e\u9876\u5207\u6362\u5931\u8d25");
@@ -4302,7 +4594,7 @@ void MainWindow::HandleClick(POINT point)
 			return;
 		}
 	}
-	if (page == Page::Protection) {
+	if (page == Page::Protection || page == Page::Replacement) {
 		if (Hit(temporaryVideoEnableRect, point)) {
 			temporaryVideoProtection = !temporaryVideoProtection;
 			ApplyTemporaryVideoProtection();
