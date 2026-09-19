@@ -2,6 +2,26 @@
 
 All notable changes to Dzjs Trainer are documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- The update flow now lives entirely in the standalone `DzjsTrainerUpdater.exe`. The main program no longer downloads, verifies, or applies anything; the update entry on the About page extracts the embedded updater next to the main program and starts it.
+- The updater checks the published version itself, downloads the package, verifies its SHA-256, and then asks the user to close the main program before replacing it. It polls until the file is no longer locked instead of waiting on a parent process id.
+- The updater now runs from the install directory instead of `%TEMP%`, and requests elevation itself so a declined prompt is reported instead of being treated as success.
+- Certificate validation is enabled on the update channel.
+
+### Fixed
+
+- The download URL from the manifest is decoded as UTF-8 and its host is converted to punycode before use. Decoding it with the ANSI code page corrupted the host, so every download failed with a connection error.
+- `CompareVersions` treats a missing component as zero, so `1.0.5` and `1.0.5.0` no longer compare as different.
+- The updater's version comparison reads the installed program's file version rather than the updater's own build-time constant.
+
+### Removed
+
+- The in-app download window, its progress reporting, and the payload/parent-pid helper path.
+- The `AutoUpdate` setting and the startup update timer. The new flow requires the user to close the main program, so an unattended check cannot work.
+
 ## [1.0.2] - 2026-09-06
 
 ### Added

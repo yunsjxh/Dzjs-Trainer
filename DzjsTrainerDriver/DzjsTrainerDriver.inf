@@ -1,0 +1,41 @@
+; DzjsTrainer x64 non-PnP control driver package.
+
+[Version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGuid={4D36E97D-E325-11CE-BFC1-08002BE10318}
+Provider=%ManufacturerName%
+CatalogFile=DzjsTrainerDriver.cat
+DriverVer=
+PnpLockDown=1
+
+[DestinationDirs]
+DefaultDestDir=13
+DriverCopyFiles=13
+
+[SourceDisksNames]
+1=%DiskName%,,,
+
+[SourceDisksFiles]
+DzjsTrainerDriver.sys=1,,
+
+[DefaultInstall.NTamd64]
+CopyFiles=DriverCopyFiles
+
+[DefaultInstall.NTamd64.Services]
+AddService=DzjsTrainerDriver,0x00000002,DzjsTrainerDriver_Service
+
+[DriverCopyFiles]
+DzjsTrainerDriver.sys
+
+[DzjsTrainerDriver_Service]
+DisplayName=%ServiceDescription%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%13%\DzjsTrainerDriver.sys
+
+[Strings]
+ManufacturerName="DzjsTrainer"
+DiskName="DzjsTrainer Driver Installation Disk"
+ServiceDescription="DzjsTrainer x64 Kernel Driver"

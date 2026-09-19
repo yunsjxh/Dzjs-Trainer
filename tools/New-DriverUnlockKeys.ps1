@@ -16,7 +16,7 @@ $ecdsa = [System.Security.Cryptography.ECDsa]::Create(
     [System.Security.Cryptography.ECCurve]::CreateFromFriendlyName('nistP256'))
 try {
     $privatePath = Join-Path $OutputDirectory 'driver-unload-private.pk8'
-    $publicHeaderPath = Join-Path $PSScriptRoot '..\JiYuTrainerDriver\UnlockPublicKey.h'
+    $publicHeaderPath = Join-Path $PSScriptRoot '..\DzjsTrainerDriver\UnlockPublicKey.h'
     $privateBytes = $ecdsa.ExportPkcs8PrivateKey()
     [System.IO.File]::WriteAllBytes($privatePath, $privateBytes)
 

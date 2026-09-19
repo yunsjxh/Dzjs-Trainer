@@ -8,10 +8,10 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $solutionRoot = Split-Path $PSScriptRoot -Parent
-$driverBuildRoot = Join-Path $solutionRoot 'JiYuTrainerDriver\Release'
-$defaultDriverOutput = Join-Path $driverBuildRoot 'JiYuTrainerDriver.sys'
-$fallbackDriverOutput = Join-Path $driverBuildRoot 'JiYuTrainerDriver\JiYuTrainerDriver.sys'
-$packagedDriverOutput = Join-Path $solutionRoot 'Release\JiYuTrainerDriver\JiYuTrainerDriver.sys'
+$driverBuildRoot = Join-Path $solutionRoot 'DzjsTrainerDriver\Release'
+$defaultDriverOutput = Join-Path $driverBuildRoot 'DzjsTrainerDriver.sys'
+$fallbackDriverOutput = Join-Path $driverBuildRoot 'DzjsTrainerDriver\DzjsTrainerDriver.sys'
+$packagedDriverOutput = Join-Path $solutionRoot 'Release\DzjsTrainerDriver\DzjsTrainerDriver.sys'
 if ($DriverPath) {
     $driverOutput = [IO.Path]::GetFullPath($DriverPath)
 }
@@ -25,10 +25,10 @@ else {
     $driverOutput = $fallbackDriverOutput
 }
 $driverPackage = Split-Path $driverOutput -Parent
-$resourcePackage = Join-Path $solutionRoot 'Release\JiYuTrainerDriver'
-$unlockTokenSource = Join-Path $solutionRoot 'JiYuTrainerDriver.unlock.enc.sample'
-$unlockTokenDestination = Join-Path $resourcePackage 'JiYuTrainerDriver.unlock.enc'
-$mainProject = Join-Path $solutionRoot 'JiYuTrainer\DzjsTrainer.vcxproj'
+$resourcePackage = Join-Path $solutionRoot 'Release\DzjsTrainerDriver'
+$unlockTokenSource = Join-Path $solutionRoot 'DzjsTrainerDriver.unlock.enc.sample'
+$unlockTokenDestination = Join-Path $resourcePackage 'DzjsTrainerDriver.unlock.enc'
+$mainProject = Join-Path $solutionRoot 'DzjsTrainer\DzjsTrainer.vcxproj'
 $mainExecutable = Join-Path $solutionRoot 'Release\DzjsTrainer.exe'
 
 foreach ($path in @($driverOutput, $mainProject)) {
@@ -54,7 +54,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "Inf2Cat failed with exit code $LASTEXITCODE"
 }
 
-$catalog = Join-Path $driverPackage 'jiyutrainerdriver.cat'
+$catalog = Join-Path $driverPackage 'dzjstrainerdriver.cat'
 if (-not (Test-Path -LiteralPath $catalog)) {
     throw "Inf2Cat did not create the catalog: $catalog"
 }
@@ -73,10 +73,10 @@ if ($CertificateThumbprint) {
 
 foreach ($destination in @($resourcePackage)) {
     New-Item -ItemType Directory -Force -Path $destination | Out-Null
-    $driverDestination = Join-Path $destination 'JiYuTrainerDriver.sys'
-    $infSource = Join-Path $driverPackage 'JiYuTrainerDriver.inf'
-    $infDestination = Join-Path $destination 'JiYuTrainerDriver.inf'
-    $catalogDestination = Join-Path $destination 'jiyutrainerdriver.cat'
+    $driverDestination = Join-Path $destination 'DzjsTrainerDriver.sys'
+    $infSource = Join-Path $driverPackage 'DzjsTrainerDriver.inf'
+    $infDestination = Join-Path $destination 'DzjsTrainerDriver.inf'
+    $catalogDestination = Join-Path $destination 'dzjstrainerdriver.cat'
     foreach ($copy in @(
         @{ Source = $driverOutput; Destination = $driverDestination },
         @{ Source = $infSource; Destination = $infDestination },

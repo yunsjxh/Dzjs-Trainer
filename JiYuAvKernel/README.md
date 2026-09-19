@@ -1,6 +1,6 @@
 # JiYu AV Kernel
 
-这是一个独立的 x64 WDM 防病毒内核原型，不依赖 `JiYuTrainerDriver`。
+这是一个独立的 x64 WDM 防病毒内核原型，不依赖 `DzjsTrainerDriver`。
 
 ## 已实现
 

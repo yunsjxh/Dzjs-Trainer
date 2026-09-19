@@ -1,0 +1,91 @@
+#define NOMINMAX
+#include <windows.h>
+#include <objidl.h>
+#include <gdiplus.h>
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <cstdio>
+#pragma comment(lib, "gdiplus.lib")
+using namespace Gdiplus;
+bool materialIconFontUsable = false;
+std::array<bool, 10> materialIconGlyphs{};
+std::map<int, std::unique_ptr<Font>> materialIconFonts;
+std::unique_ptr<FontFamily> materialIconFamily;
+std::unique_ptr<StringFormat> materialIconFormat;
+/* SOURCE_HELPERS */
+class MainWindow {
+public:
+  enum class Page { Overview, Protection, Antivirus, Advanced, Help, Network, Diagnostics, Logs, About };
+  Page page = Page::Overview;
+  bool darkMode = false, studentRunning = false, currentControlled = false, topMostUiAccessBand = false;
+  DWORD studentPid = 0;
+  std::wstring statusTitle = L"\u7b49\u5f85\u5b66\u751f\u7aef\u8fde\u63a5";
+  std::wstring statusDetail = L"\u5f53\u524d\u672a\u68c0\u6d4b\u5230\u5b66\u751f\u7aef\u8fdb\u7a0b";
+  std::wstring studentPath = L"Not detected";
+  std::mutex stateMutex;
+  int hoverTarget = -1;
+  std::array<float, 80> hoverProgress{};
+  RECT navRects[9]{}, actionRects[5]{}, themeRect{}, toggleRects[9]{};
+  bool setAllowAllRunOp = true, setBandAllRunOp = false, setAllowGbTop = false, setProhibitKillProcess = true;
+  bool setAllowMonitor = true, setProhibitCloseWindow = true, setAllowControl = false, setAutoUpdate = true;
+  bool temporaryVideoProtection = false, temporaryVideoLoop = true;
+  std::wstring temporaryVideoMode = L"image", temporaryVideoImagePath, temporaryVideoFilePath;
+  std::unique_ptr<Bitmap> temporaryVideoPreview;
+  RECT driverLoadRect{}, driverUnloadRect{}, saveSettingsRect{}, temporaryVideoEnableRect{};
+  RECT temporaryVideoImageModeRect{}, temporaryVideoFileModeRect{}, temporaryVideoImagePickerRect{}, temporaryVideoFilePickerRect{};
+  RECT temporaryVideoLoopRect{}, temporaryVideoPreviewRect{}, advancedSettingsRect{};
+  void PaintNavigation(Graphics&, int);
+  void PaintHeader(Graphics&, int);
+  void PaintOverview(Graphics&, int, int, int);
+  void PaintProtection(Graphics&, int, int, int);
+};
+/* SOURCE_METHODS */
+int wmain() {
+  ULONG_PTR token;
+  GdiplusStartupInput input;
+  if (GdiplusStartup(&token, &input, nullptr) != Ok) return 1;
+  int result = 0;
+  {
+    PrivateFontCollection fonts;
+    fonts.AddFontFile(L"../DzjsTrainerUI/res/MaterialIcons-Regular.ttf");
+    materialIconFamily = std::make_unique<FontFamily>();
+    INT count = 0;
+    fonts.GetFamilies(1, materialIconFamily.get(), &count);
+    materialIconFormat = std::make_unique<StringFormat>();
+    materialIconFormat->SetFormatFlags(StringFormatFlagsNoClip);
+    materialIconGlyphs.fill(true);
+    materialIconFontUsable = count == 1;
+    CLSID png;
+    CLSIDFromString(L"{557cf406-1a04-11d3-9a73-0000f81ef32e}", &png);
+    for (int i = 0; i < 4; i++) {
+      MainWindow window;
+      window.darkMode = (i % 2) == 1;
+      window.page = i >= 2 ? MainWindow::Page::Protection : MainWindow::Page::Overview;
+      Bitmap bitmap(2240, 1520, PixelFormat32bppARGB);
+      {
+        Graphics g(&bitmap);
+        g.ScaleTransform(2, 2);
+        g.SetSmoothingMode(SmoothingModeAntiAlias);
+        g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+        g.Clear(C(window.darkMode, 246, 248, 246, 17, 20, 19));
+        window.PaintNavigation(g, 760);
+        window.PaintHeader(g, 1120);
+        if (i < 2) window.PaintOverview(g, 1120, 760, 0);
+        else window.PaintProtection(g, 1120, 760, 0);
+      }
+      const wchar_t* names[] = { L"assets/overview-light.png", L"assets/overview-dark.png", L"assets/protection-light.png", L"assets/protection-dark.png" };
+      if (bitmap.Save(names[i], &png) != Ok) result = 2;
+    }
+    materialIconFonts.clear();
+    materialIconFamily.reset();
+    materialIconFormat.reset();
+  }
+  GdiplusShutdown(token);
+  puts(result == 0 ? "RENDER_PASS: 4 current native UI images, 2240x1520" : "RENDER_FAIL");
+  return result;
+}

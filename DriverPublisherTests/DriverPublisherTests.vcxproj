@@ -30,6 +30,6 @@
     <Link><SubSystem>Console</SubSystem></Link>
   </ItemDefinitionGroup>
   <ItemGroup><ClCompile Include="DriverPublisherTests.cpp" /></ItemGroup>
-  <ItemGroup><ClInclude Include="..\JiYuTrainer\DriverPublisherAllowlist.h" /></ItemGroup>
+  <ItemGroup><ClInclude Include="..\DzjsTrainer\DriverPublisherAllowlist.h" /></ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

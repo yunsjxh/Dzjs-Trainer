@@ -2,7 +2,7 @@
 
 #include <iostream>
 
-#include "..\JiYuTrainer\DriverSignaturePolicy.h"
+#include "..\DzjsTrainer\DriverSignaturePolicy.h"
 
 int wmain(int argc, wchar_t** argv)
 {

@@ -35,11 +35,11 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="DriverSignaturePolicyProbe.cpp" />
-    <ClCompile Include="..\JiYuTrainer\DriverSignaturePolicy.cpp" />
+    <ClCompile Include="..\DzjsTrainer\DriverSignaturePolicy.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="..\JiYuTrainer\DriverPublisherAllowlist.h" />
-    <ClInclude Include="..\JiYuTrainer\DriverSignaturePolicy.h" />
+    <ClInclude Include="..\DzjsTrainer\DriverPublisherAllowlist.h" />
+    <ClInclude Include="..\DzjsTrainer\DriverSignaturePolicy.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

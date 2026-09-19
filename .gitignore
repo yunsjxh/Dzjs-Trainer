@@ -1,4 +1,4 @@
-/.vs/
+**/.vs/
 /Release/
 /Debug/
 /build/
@@ -10,6 +10,7 @@
 /x64/
 **/bin/
 **/obj/
+**/obj-*/
 **/x64/
 **/Release/
 *.exe
@@ -56,4 +57,15 @@ unlock-key-material/
 /Release-v1.0.0/
 /JiYuAvRelease/
 /obj-v1.0.0/
-/JiYuTrainer/obj-v1.0.0-main/
+/DzjsTrainer/obj-v1.0.0-main/
+
+# Local diagnostics, generated release staging, and agent workspace state
+/.workbuddy-ai/
+/artifacts/
+/dump-*/
+/dump-analysis*.txt
+/obj-*/
+/symbols/
+/test-media/
+/Release-v*/
+/mtest.txt

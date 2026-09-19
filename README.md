@@ -34,11 +34,11 @@ Dzjs Trainer 是基于 JiYu Trainer 翻新和持续维护的 Windows 桌面项�
 
 | 目录 | 说明 |
 | --- | --- |
-| `JiYuTrainer` | 主程序、驱动加载和资源嵌入逻辑 |
-| `JiYuTrainerUI` | 原生 Windows UI 与交互逻辑 |
-| `JiYuTrainerDriver` | x64 WDM 驱动源码 |
-| `JiYuTrainerHooks` | 兼容层与 Hook 模块源码 |
-| `JiYuTrainerUpdater` | 更新组件源码 |
+| `DzjsTrainer` | 主程序、驱动加载和资源嵌入逻辑 |
+| `DzjsTrainerUI` | 原生 Windows UI 与交互逻辑 |
+| `DzjsTrainerDriver` | x64 WDM 驱动源码 |
+| `DzjsTrainerHooks` | 兼容层与 Hook 模块源码 |
+| `DzjsTrainerUpdater` | 更新组件源码 |
 | `JiYuAvKernel` / `JiYuAvCtl` | 辅助驱动与控制工具 |
 | `tools` | 驱动构建、签名、令牌与验证脚本 |
 | `DzjsTrainer.sln` | 主解决方案 |
@@ -50,7 +50,7 @@ Dzjs Trainer 是基于 JiYu Trainer 翻新和持续维护的 Windows 桌面项�
 - Windows 10 或更高版本。
 - Visual Studio 2022，包含 C++ 桌面开发和 MSBuild。
 - Windows 10/11 SDK。
-- 构建 `JiYuTrainerDriver` 时需要安装与系统匹配的 WDK。
+- 构建 `DzjsTrainerDriver` 时需要安装与系统匹配的 WDK。
 
 ## 构建
 
@@ -65,20 +65,20 @@ MSBuild.exe DzjsTrainer.sln /t:Build /p:Configuration=Release /p:Platform=x86 /m
 驱动可单独构建：
 
 ```powershell
-MSBuild.exe JiYuTrainerDriver\JiYuTrainerDriver.vcxproj /t:Build /p:Configuration=Release /p:Platform=x64 /m
+MSBuild.exe DzjsTrainerDriver\DzjsTrainerDriver.vcxproj /t:Build /p:Configuration=Release /p:Platform=x64 /m
 ```
 
 构建产物会写入被 Git 忽略的 `Release` 目录，不应提交到源码仓库。
 
 ## 驱动签名与发布
 
-仓库不包含发布者的代码签名证书、私有解锁密钥或实际解锁令牌。`JiYuTrainerDriver.unlock.enc.sample` 是公开构建所需的占位资源。
+仓库不包含发布者的代码签名证书、私有解锁密钥或实际解锁令牌。`DzjsTrainerDriver.unlock.enc.sample` 是公开构建所需的占位资源。
 
 发布维护者需要自行完成以下工作：
 
 1. 使用自己的证书签名最终驱动文件。
 2. 运行 `tools\Complete-DriverSigning.ps1` 更新驱动包，并重新嵌入主程序资源。
-3. 使用 `tools\Build-JiYuTrainerRelease.ps1` 验证签名者、资源哈希与发布产物。
+3. 使用 `tools\Build-DzjsTrainerRelease.ps1` 验证签名者、资源哈希与发布产物。
 
 如需启用实际解锁令牌流程，请在本地使用 `tools\New-DriverUnlockKeys.ps1` 和 `tools\New-DriverUnlockToken.ps1` 生成自己的密钥与令牌；私有材料不得提交到仓库。
 

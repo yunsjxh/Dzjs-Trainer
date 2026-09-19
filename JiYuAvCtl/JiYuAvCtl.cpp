@@ -19,7 +19,7 @@ namespace {
 
 constexpr wchar_t kDevicePath[] = L"\\\\.\\JiYuAv";
 
-// Keep the controller's service identity in lockstep with JiYuTrainer's AV
+// Keep the controller's service identity in lockstep with DzjsTrainer's AV
 // service generator. The image filename is intentionally independent.
 std::wstring DateBasedServiceName()
 {

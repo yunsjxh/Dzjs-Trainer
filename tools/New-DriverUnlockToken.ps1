@@ -2,7 +2,7 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$PrivateKeyPath,
-    [string]$OutputPath = (Join-Path (Split-Path $PrivateKeyPath -Parent) 'JiYuTrainerDriver.sys.unlock')
+    [string]$OutputPath = (Join-Path (Split-Path $PrivateKeyPath -Parent) 'DzjsTrainerDriver.sys.unlock')
 )
 
 Set-StrictMode -Version Latest

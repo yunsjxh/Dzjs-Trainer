@@ -18,7 +18,7 @@ if not defined MSBUILD (
 )
 
  echo Using: %MSBUILD%
-"%MSBUILD%" "%ROOT%DzjsTrainer.sln" /m /t:JiYuTrainerHooks /p:Configuration=Release /p:Platform=x86 /v:minimal /fl /flp:"logfile=%ROOT%build-hooks.log;verbosity=normal"
+"%MSBUILD%" "%ROOT%DzjsTrainer.sln" /m /t:DzjsTrainerHooks /p:Configuration=Release /p:Platform=x86 /v:minimal /fl /flp:"logfile=%ROOT%build-hooks.log;verbosity=normal"
 set "RESULT=%ERRORLEVEL%"
 
 if not "%RESULT%"=="0" (
@@ -27,5 +27,5 @@ if not "%RESULT%"=="0" (
 )
 
 echo Build succeeded.
-echo DLL: "%ROOT%Release\JiYuTrainerHooks.dll"
+echo DLL: "%ROOT%Release\DzjsTrainerHooks.dll"
 exit /b 0

@@ -1,7 +1,7 @@
 #include <cwchar>
 #include <iostream>
 
-#include "..\JiYuTrainer\DriverPublisherAllowlist.h"
+#include "..\DzjsTrainer\DriverPublisherAllowlist.h"
 
 int main()
 {

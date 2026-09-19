@@ -1,11 +1,13 @@
 #include "SelfProtect.h"
 #include "Controller.h"
 
+/* PROCESS_DUP_HANDLE (0x0040) and THREAD_DIRECT_IMPERSONATION (0x0200)
+ * must remain available to CSRSS while the protected process creates a child. */
 #define AV_PROCESS_DENIED_ACCESS (0x0001UL | 0x0002UL | 0x0008UL | 0x0010UL | \
-    0x0020UL | 0x0040UL | 0x0100UL | 0x0200UL | 0x0800UL | 0x2000UL | \
+    0x0020UL | 0x0100UL | 0x0200UL | 0x0800UL | 0x2000UL | \
     WRITE_DAC | WRITE_OWNER)
 #define AV_THREAD_DENIED_ACCESS (0x0001UL | 0x0002UL | 0x0008UL | 0x0010UL | \
-    0x0020UL | 0x0200UL | 0x0400UL | WRITE_DAC | WRITE_OWNER)
+    0x0020UL | 0x0400UL | WRITE_DAC | WRITE_OWNER)
 
 static EX_PUSH_LOCK g_ProtectionLock;
 static PEPROCESS g_ProtectedProcess;

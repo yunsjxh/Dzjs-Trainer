@@ -6,7 +6,7 @@
 #include <vector>
 
 namespace {
-constexpr wchar_t kWindowClass[] = L"JiYuTrainerExitConfirm";
+constexpr wchar_t kWindowClass[] = L"DzjsTrainerExitConfirm";
 constexpr int kEditId = 46001;
 
 struct TestResult {
@@ -91,7 +91,7 @@ bool ResolveTarget(HWND* owner, HWND* edit)
 	*edit = FindExitEdit();
 	*owner = *edit ? GetAncestor(*edit, GA_ROOT) : nullptr;
 	if (!*edit || !*owner) {
-		std::wcerr << L"未找到 JiYuTrainer 确认退出窗口（class=" << kWindowClass << L"）。\n";
+		std::wcerr << L"未找到 DzjsTrainer 确认退出窗口（class=" << kWindowClass << L"）。\n";
 		std::wcerr << L"请先从托盘或关于软件页打开退出确认窗口。\n";
 		return false;
 	}
@@ -161,7 +161,7 @@ void RunMessageTest(int choice, const std::wstring& probe)
 
 void PrintMenu()
 {
-	std::wcout << L"\n=== JiYuTrainer 输入验证测试 ===\n"
+	std::wcout << L"\n=== DzjsTrainer 输入验证测试 ===\n"
 		<< L"1. WM_SETTEXT\n"
 		<< L"2. WM_CHAR\n"
 		<< L"3. WM_PASTE（剪贴板）\n"
@@ -176,8 +176,8 @@ void PrintMenu()
 int RunInteractive()
 {
 	const std::wstring probe = L"123456";
-	std::wcout << L"测试程序不会点击确认退出按钮，也不会结束 JiYuTrainer。\n"
-		<< L"请先打开 JiYuTrainer 的确认退出窗口。\n" << std::flush;
+	std::wcout << L"测试程序不会点击确认退出按钮，也不会结束 DzjsTrainer。\n"
+		<< L"请先打开 DzjsTrainer 的确认退出窗口。\n" << std::flush;
 	for (;;) {
 		PrintMenu();
 		std::wstring command;

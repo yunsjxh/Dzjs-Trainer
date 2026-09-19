@@ -1,0 +1,6 @@
+{
+  "version": "1.0.3",
+  "notes": "修复窗口识别并改进更新流程。",
+  "url": "releases/DzjsTrainerUpdater.exe",
+  "sha256": "replace-with-lowercase-sha256"
+}
