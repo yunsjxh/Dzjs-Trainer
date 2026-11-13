@@ -12,13 +12,21 @@ https://随机值.dzjstrainer.云散皆星河.cn/<admin.php 所在目录>/releas
 （例如 `/update-server/`）时会自动带上。不要把这一段写死 —— 下载地址指向的位置必须和
 `releases/` 实际被访问的位置一致，否则客户端会拿到 404。
 
-后台默认禁用。部署前必须通过 PHP 环境变量设置管理员密码：
+后台默认禁用 —— 没有配置口令时它不提供任何上传能力。口令有两种来源，取到即用：
+
+1. 环境变量 `UPDATE_ADMIN_PASSWORD`（优先级最高）；
+2. 同目录的 `admin-password.php`，内容为 `<?php return '你的口令';`。
+
+推荐第二种。原因不是口味问题：PHP-FPM 的 `env[]` 得写进 `php-fpm.conf`，而宝塔一改 PHP 参数就会重写那个文件，口令会静默消失、后台重新变成禁用；`admin-password.php` 落在站点目录里，没人会去动它，改口令也不需要重启 PHP。用 `.php` 而不是 `.txt` 也是刻意的：直接 GET 只会得到空响应，不会像静态文件那样被原样下载走。
+
+这个文件等价于「能上传更新包并改写清单」的权限，和服务端私钥同级，绝不能进版本库（见 `.gitignore`）。
 
 ```text
-UPDATE_ADMIN_PASSWORD=你的密码
 UPDATE_DOWNLOAD_DOMAIN=dzjstrainer.云散皆星河.cn
 UPDATE_DOWNLOAD_SCHEME=https
 ```
+
+早期版本把口令写死成 `ChangeMe-2026!` 兜底，而 `admin.php` 是公网可达的 —— 等于谁都能登录、上传自己的程序并让服务端签名。这个兜底已经删掉，且永远不会加回来：宁可后台不可用，也不能有一个公开的默认口令。
 
 泛域名解析需要将 `*.dzjstrainer.云散皆星河.cn` 指向同一台服务器，并在 Web 服务器证书中包含 `*.dzjstrainer.云散皆星河.cn`。客户端已内置更新接口地址，不需要在 `DzjsTrainer.ini` 中写入 `UpdateServer`。每次启动更新检查时会生成一个随机前缀并访问对应的泛域名，例如 `a1b2c3d4.dzjstrainer.云散皆星河.cn`。
 

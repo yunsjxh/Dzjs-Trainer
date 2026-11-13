@@ -6,6 +6,21 @@ $root = __DIR__;
 $manifestPath = $root . DIRECTORY_SEPARATOR . 'manifest.json';
 $releaseDir = $root . DIRECTORY_SEPARATOR . 'releases';
 $adminPassword = (string)(getenv('UPDATE_ADMIN_PASSWORD') ?: '');
+if ($adminPassword === '') {
+    // 环境变量缺失时退回同目录的 admin-password.php，与 ticket-sign.php 同一套做法。
+    // 用 PHP 文件而不是 .txt / .ini：直接 GET 只会拿到一个空响应，不会像静态文件
+    // 那样被原样下载走。宝塔改 PHP 参数会重写 php-fpm.conf，写在那里的 env 会丢，
+    // 这个文件不会被任何人碰。
+    $passwordFile = $root . DIRECTORY_SEPARATOR . 'admin-password.php';
+    if (is_file($passwordFile)) {
+        try {
+            $loaded = include $passwordFile;
+            if (is_string($loaded)) $adminPassword = trim($loaded);
+        } catch (Throwable $e) {
+            $adminPassword = '';
+        }
+    }
+}
 $downloadDomain = (string)(getenv('UPDATE_DOWNLOAD_DOMAIN') ?: 'dzjstrainer.xn--9kq396ceqaq4si9m.cn');
 $downloadScheme = strtolower((string)(getenv('UPDATE_DOWNLOAD_SCHEME') ?: 'https')) === 'http' ? 'http' : 'https';
 
@@ -75,7 +90,7 @@ $action = (string)($_POST['admin_action'] ?? '');
 
 if ($action === 'login') {
     if ($adminPassword === '') {
-        $error = '服务器未配置 UPDATE_ADMIN_PASSWORD，后台已禁用。';
+        $error = '服务器未配置管理口令，后台已禁用。请创建 admin-password.php（内容为 <?php return \'口令\';），或设置环境变量 UPDATE_ADMIN_PASSWORD。';
     } elseif (hash_equals($adminPassword, (string)($_POST['password'] ?? ''))) {
         session_regenerate_id(true);
         $_SESSION['update_admin'] = true;

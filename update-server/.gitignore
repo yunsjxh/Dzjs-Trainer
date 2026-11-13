@@ -21,3 +21,7 @@ ticket-sign.pub.pem
 
 # 示例材料是故意跟踪的，别被上面的规则或通配误伤。
 !ticket-sign.pem.example
+
+# 更新后台的管理口令（admin.php 在 UPDATE_ADMIN_PASSWORD 缺失时读它）。
+# 它等价于"能上传更新包并改写清单"的权限，与服务端私钥同一个级别，不进版本库。
+admin-password.php
