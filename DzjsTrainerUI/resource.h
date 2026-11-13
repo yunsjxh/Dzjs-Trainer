@@ -1,6 +1,6 @@
-//{{NO_DEPENDENCIES}}
-// Microsoft Visual C++ Éú³ÉµÄ°üº¬ÎÄ¼ş¡£
-// ¹© DzjsTrainerUI.rc Ê¹ÓÃ
+ï»¿//{{NO_DEPENDENCIES}}
+// Microsoft Visual C++ ç”Ÿæˆçš„åŒ…å«æ–‡ä»¶ã€‚
+// ä¾› DzjsTrainerUI.rc ä½¿ç”¨
 //
 #define IDI_APP                         101
 #define IDR_MAINMENU                    113

@@ -1,4 +1,4 @@
-// DzjsTrainerUpdater.exe - standalone update program.
+﻿// DzjsTrainerUpdater.exe - standalone update program.
 //
 // This executable owns the whole update path. It talks to the update endpoint
 // itself, downloads and verifies the package, then asks the user to close the
@@ -18,9 +18,15 @@
 //   --help                  usage
 
 #include <windows.h>
+#include <tlhelp32.h>
 #include <shellapi.h>
 #include <shlwapi.h>
 #include <wininet.h>
+#include <winhttp.h>
+#include <vector>
+#include "UpdaterIpc.h"
+#include "UpdaterTrust.h"
+#include "UpdaterTicket.h"
 #include <bcrypt.h>
 #include <io.h>
 #include <fcntl.h>
@@ -36,6 +42,7 @@
 #pragma comment(lib, "Shell32.lib")
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "Wininet.lib")
+#pragma comment(lib, "Winhttp.lib")
 #pragma comment(lib, "Bcrypt.lib")
 #pragma comment(lib, "Normaliz.lib")
 #pragma comment(lib, "Version.lib")
@@ -48,6 +55,9 @@ const wchar_t* const kTargetName = L"DzjsTrainer.exe";
 const int kReplaceTimeoutSeconds = 600;
 
 bool g_consoleOutput = false;
+// 完全静默模式：没有父控制台时不再 AllocConsole，输出丢进 NUL，
+// 需要确认的地方一律按"继续"处理。
+bool g_silentUpdate = false;
 
 struct Manifest {
 	std::string version;
@@ -308,81 +318,249 @@ std::wstring ResolveDownloadUrl(const std::string& url)
 
 // ------------------------------------------------------------------- HTTP
 
-bool HttpGetW(const std::wstring& url, std::string& body)
-{
-	body.clear();
-	HINTERNET session = InternetOpenW(L"DzjsTrainerUpdater/1.0", INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
-	if (!session) return false;
-	DWORD timeout = 8000;
-	InternetSetOptionW(session, INTERNET_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
-	InternetSetOptionW(session, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
-
-	// Certificate validation is intentionally left enabled: the endpoint serves a
-	// valid wildcard certificate and the package hash travels over this channel.
-	HINTERNET request = InternetOpenUrlW(session, url.c_str(), nullptr, 0,
-		INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_SECURE, 0);
-	bool ok = false;
-	if (request) {
-		char buffer[8192];
-		DWORD read = 0;
-		while (InternetReadFile(request, buffer, sizeof(buffer), &read) && read)
-			body.append(buffer, read);
-		DWORD status = 0, statusSize = sizeof(status);
-		ok = HttpQueryInfoW(request, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, &status, &statusSize, nullptr) != FALSE
-			&& status >= 200 && status < 300;
-		InternetCloseHandle(request);
+// 一次 WinHTTP GET 会话。析构时按 request -> connection -> session 顺序关句柄，
+// 中间任何一步失败都不会漏。
+struct WinHttpGetSession {
+	HINTERNET session = nullptr;
+	HINTERNET connection = nullptr;
+	HINTERNET request = nullptr;
+	~WinHttpGetSession()
+	{
+		if (request) WinHttpCloseHandle(request);
+		if (connection) WinHttpCloseHandle(connection);
+		if (session) WinHttpCloseHandle(session);
 	}
-	InternetCloseHandle(session);
-	if (!ok) body.clear();
-	return ok;
+};
+
+// 打开一个 GET 并收完响应头。返回 true 表示拿到 2xx，可以开始读正文。
+//
+// 地址白名单和“服务端公钥必须是我们的”这两道校验统一放在这里：
+// 调用方（取清单 / 下安装包）不必各写一遍，也就不会漏。
+bool WinHttpGetOpen(WinHttpGetSession& http, const std::wstring& url, DWORD timeoutMs,
+	std::wstring& error, DWORD& statusCode)
+{
+	statusCode = 0;
+	error.clear();
+	if (!JupUrlAllowed(url)) {
+		error = L"地址不被信任（只接受 https 和官方域名）";
+		return false;
+	}
+
+	URL_COMPONENTS parts{};
+	parts.dwStructSize = sizeof(parts);
+	WCHAR host[256] = {};
+	WCHAR path[2048] = {};
+	WCHAR extra[2048] = {};
+	parts.lpszHostName = host;
+	parts.dwHostNameLength = _countof(host);
+	parts.lpszUrlPath = path;
+	parts.dwUrlPathLength = _countof(path);
+	parts.lpszExtraInfo = extra;
+	parts.dwExtraInfoLength = _countof(extra);
+	if (!WinHttpCrackUrl(url.c_str(), static_cast<DWORD>(url.size()), 0, &parts)) {
+		error = L"地址格式错误";
+		return false;
+	}
+	// WinHttpOpenRequest 要的是“路径 + 查询串”，不带主机。
+	std::wstring target = path;
+	if (parts.dwExtraInfoLength) target += extra;
+
+	http.session = WinHttpOpen(L"DzjsTrainerUpdater/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+		WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+	if (!http.session) {
+		error = L"无法初始化网络会话";
+		return false;
+	}
+	WinHttpSetTimeouts(http.session, static_cast<int>(timeoutMs), static_cast<int>(timeoutMs),
+		static_cast<int>(timeoutMs), static_cast<int>(timeoutMs));
+
+	http.connection = WinHttpConnect(http.session, host, parts.nPort, 0);
+	if (!http.connection) {
+		error = L"无法连接服务器（错误码 " + std::to_wstring(GetLastError()) + L"）";
+		return false;
+	}
+	// 地址已经过 JupUrlAllowed 校验，必定是 https，直接要求加密，
+	// 不再拿 nScheme 和 INTERNET_SCHEME_HTTPS 比（见 UpdaterTrust.h 里的说明）。
+	http.request = WinHttpOpenRequest(http.connection, L"GET", target.c_str(), nullptr,
+		WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+	if (!http.request) {
+		error = L"无法建立请求（错误码 " + std::to_wstring(GetLastError()) + L"）";
+		return false;
+	}
+	if (!WinHttpSendRequest(http.request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+		WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
+		error = L"请求发送失败（错误码 " + std::to_wstring(GetLastError()) + L"）";
+		return false;
+	}
+	if (!WinHttpReceiveResponse(http.request, nullptr)) {
+		error = L"接收响应失败（错误码 " + std::to_wstring(GetLastError()) + L"）";
+		return false;
+	}
+
+	// 握手完成、正文一个字节都没读：此时看服务端证书最合适。
+	//
+	// 这里只做记录，不再作为放行条件。公钥钉死挡不住真正的冒名者（域名被
+	// 劫持后对方也能申请到任意 CA 的合法证书），却会把自己挡在更新之外：
+	// Let's Encrypt 每次续期都换钥匙，指纹一变，所有在用的旧客户端就再也
+	// 收不到补丁，而补丁恰恰是唯一的修复手段。
+	// 真正的身份判断交给随后校验的时效票据 —— 那个伪造不了（见 UpdaterTicket.h）。
+	{
+		std::string observed;
+		if (!JupCheckWinHttpCert(http.request, observed) && !observed.empty()) {
+			static bool reported = false;
+			if (!reported) {
+				reported = true;
+				PrintUtf8(L"提示：服务端证书公钥不在已知列表里，改由时效票据确认身份\n");
+			}
+		}
+	}
+
+	DWORD status = 0;
+	DWORD statusSize = sizeof(status);
+	if (!WinHttpQueryHeaders(http.request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+		WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize, WINHTTP_NO_HEADER_INDEX)) {
+		error = L"无法读取响应状态";
+		return false;
+	}
+	statusCode = status;
+	if (status < 200 || status >= 300) {
+		error = L"服务器返回 HTTP " + std::to_wstring(status);
+		return false;
+	}
+	return true;
 }
 
-bool DownloadToFileOnce(const std::wstring& url, const std::wstring& path, std::wstring& error)
+// 带时效票据的清单请求。
+//
+// 走法是一问一答：先把带签名的挑战发出去，服务端核对后回一段正文，并在
+// X-Dzjs-Ticket 里给出一张绑定"本轮 nonce + 正文哈希 + 有效期"的票据。
+// 三样都验过才认这段正文，缺一项都按失败处理（fail closed）。
+bool HttpGetManifest(const std::wstring& endpoint, std::string& body, std::wstring& error)
 {
 	error.clear();
-	HINTERNET session = InternetOpenW(L"DzjsTrainerUpdater/1.0", INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
-	if (!session) { error = L"无法初始化网络会话"; return false; }
-	DWORD timeout = 15000;
-	InternetSetOptionW(session, INTERNET_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
-	InternetSetOptionW(session, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
+	body.clear();
+	// "t1" 是票据协议代次，不是产品版本号。服务端可以据此拒掉太老的客户端，
+	// 排查时也能一眼看出这次请求来自哪一代。
+	const jup_ticket::Challenge challenge = jup_ticket::MakeChallenge("t1");
+	const std::wstring url = endpoint + L"?manifest=1" +
+		WideFromUtf8(jup_ticket::ChallengeQuery(challenge));
 
-	HINTERNET request = InternetOpenUrlW(session, url.c_str(), nullptr, 0,
-		INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_SECURE, 0);
-	if (!request) {
-		error = L"无法连接下载地址（错误码 " + std::to_wstring(GetLastError()) + L"）";
-		InternetCloseHandle(session);
+	WinHttpGetSession http;
+	DWORD status = 0;
+	if (!WinHttpGetOpen(http, url, 8000, error, status)) {
+		if (status == 403) {
+			error = L"服务器拒绝了本次请求的签名（客户端与服务端密钥不一致）";
+		}
 		return false;
 	}
-	DWORD status = 0, statusSize = sizeof(status);
-	if (!HttpQueryInfoW(request, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, &status, &statusSize, nullptr) ||
-		status < 200 || status >= 300) {
-		error = L"下载地址返回 HTTP " + std::to_wstring(status);
-		InternetCloseHandle(request);
-		InternetCloseHandle(session);
+
+	char buffer[8192];
+	for (;;) {
+		DWORD read = 0;
+		if (!WinHttpReadData(http.request, buffer, sizeof(buffer), &read)) {
+			error = L"读取清单失败（错误码 " + std::to_wstring(GetLastError()) + L"）";
+			return false;
+		}
+		if (read == 0) break;
+		body.append(buffer, read);
+	}
+	if (body.empty()) {
+		error = L"服务器返回的清单为空";
 		return false;
 	}
+
+	std::string ticket;
+	if (!jup_ticket::ReadTicketHeader(http.request, ticket)) {
+		error = L"服务器未提供时效票据，已拒绝该清单";
+		return false;
+	}
+	const jup_ticket::VerifyResult verdict = jup_ticket::Verify(ticket, challenge.nonce, body);
+	if (!verdict.Ok()) {
+		error = verdict.Text();
+		return false;
+	}
+	return true;
+}
+
+// 下载准入：先完整走一遍票据握手，验过才允许去取安装包。
+//
+// 为什么不能只靠"地址白名单 + TLS"：那两样只说明"连的是这个域名、通道是加密的"，
+// 说明不了"对面握着我们的密钥"。域名被劫持后对方能拿到任意 CA 的合法证书，
+// 也能伪造一份清单；而清单决定"下哪个包、包该是什么哈希"，后续的 SHA-256
+// 就变成了核对攻击者自己填的值。所以顺序固定为：先验身份，再取字节。
+//
+// 校验失败时一个字节都不落盘，宁可这次更新失败也不装来路不明的东西 ——
+// 更新失败用户可以重试，装错包不可逆。
+bool VerifyUpdateChannel(std::wstring& error)
+{
+	error.clear();
+	std::wstring lastError;
+	int index = 0;
+	for (const std::wstring& endpoint : UpdateEndpoints()) {
+		++index;
+		std::string body;
+		std::wstring detail;
+		if (HttpGetManifest(endpoint, body, detail)) {
+			PrintUtf8(L"更新通道校验通过（端点 " + std::to_wstring(index) + L"）\n");
+			return true;
+		}
+		if (lastError.empty()) lastError = detail;
+		PrintUtf8(L"更新通道校验失败：端点 " + std::to_wstring(index) + L" —— " + detail + L"\n");
+	}
+	error = lastError.empty() ? L"无法确认更新服务器身份" : lastError;
+	return false;
+}
+
+// 跨进程报进度：只能塞数值，指针在对面进程里没有意义。
+// total 为 0（没有 Content-Length）时对面画不确定态。
+void ReportDownloadProgress(HWND window, unsigned long long done, unsigned long long total,
+	int& lastPercent, unsigned long long& lastBytes)
+{
+	if (!window) return;
+	const int percent = total ? static_cast<int>(done * 100 / total) : -1;
+	// 百分比没变也不停：每 64 KB 补一帧，字节数才会跟着走。
+	if (percent == lastPercent && done < lastBytes + 65536) return;
+	lastPercent = percent;
+	lastBytes = done;
+	const unsigned long long cappedTotal = total > 0xFFFFFFFFull ? 0xFFFFFFFFull : total;
+	const unsigned long long cappedDone = done > 0x7FFFFFFFull ? 0x7FFFFFFFull : done;
+	PostMessageW(window, WM_JUP_DOWNLOAD_PROGRESS,
+		static_cast<WPARAM>(cappedTotal), static_cast<LPARAM>(cappedDone));
+}
+
+bool DownloadToFileOnce(const std::wstring& url, const std::wstring& path, std::wstring& error,
+	HWND notify)
+{
+	error.clear();
+	WinHttpGetSession http;
+	DWORD status = 0;
+	if (!WinHttpGetOpen(http, url, 15000, error, status)) return false;
+
 	unsigned long long total = 0;
 	{
-		wchar_t header[32] = {};
+		wchar_t header[64] = {};
 		DWORD headerSize = sizeof(header);
-		if (HttpQueryInfoW(request, HTTP_QUERY_CONTENT_LENGTH, header, &headerSize, nullptr))
+		if (WinHttpQueryHeaders(http.request, WINHTTP_QUERY_CONTENT_LENGTH,
+			WINHTTP_HEADER_NAME_BY_INDEX, header, &headerSize, WINHTTP_NO_HEADER_INDEX)) {
 			total = _wcstoui64(header, nullptr, 10);
+		}
 	}
 
-	HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+		FILE_ATTRIBUTE_NORMAL, nullptr);
 	if (file == INVALID_HANDLE_VALUE) {
 		error = L"无法写入 " + path;
-		InternetCloseHandle(request);
-		InternetCloseHandle(session);
 		return false;
 	}
 
 	bool ok = true;
 	unsigned long long written = 0;
+	int lastPercent = -100;
+	unsigned long long lastBytes = 0;
 	std::vector<char> buffer(64 * 1024);
 	for (;;) {
 		DWORD read = 0;
-		if (!InternetReadFile(request, buffer.data(), static_cast<DWORD>(buffer.size()), &read)) {
+		if (!WinHttpReadData(http.request, buffer.data(), static_cast<DWORD>(buffer.size()), &read)) {
 			error = L"读取下载数据失败（错误码 " + std::to_wstring(GetLastError()) + L"）";
 			ok = false;
 			break;
@@ -400,25 +578,30 @@ bool DownloadToFileOnce(const std::wstring& url, const std::wstring& path, std::
 		}
 		if (!ok) break;
 		written += read;
+		ReportDownloadProgress(notify, written, total, lastPercent, lastBytes);
 		std::wstring line = L"已下载 " + FormatBytes(written);
 		if (total) line += L" / " + FormatBytes(total) + L" (" + std::to_wstring(written * 100 / total) + L"%)";
 		PrintProgressLine(line);
 	}
-	InternetCloseHandle(request);
-	InternetCloseHandle(session);
 	CloseHandle(file);
 	EndProgressLine();
+	if (ok && notify) {
+		// 收尾补一帧：小文件可能一次都没跨过阈值，不补进度条会停在半路。
+		const unsigned long long finalTotal = total ? total : written;
+		PostMessageW(notify, WM_JUP_DOWNLOAD_PROGRESS,
+			static_cast<WPARAM>(finalTotal > 0xFFFFFFFFull ? 0xFFFFFFFFull : finalTotal),
+			static_cast<LPARAM>(written > 0x7FFFFFFFull ? 0x7FFFFFFFull : written));
+	}
 	if (ok) PrintUtf8(L"下载完成：" + FormatBytes(written) + L"\n");
 	if (!ok) DeleteFileW(path.c_str());
 	return ok;
 }
 
-// The package host is a wildcard subdomain, so a single transient failure is
-// expected; retry before giving up.
-bool DownloadToFile(const std::wstring& url, const std::wstring& path, std::wstring& error)
+bool DownloadToFile(const std::wstring& url, const std::wstring& path, std::wstring& error,
+	HWND notify = nullptr)
 {
 	for (int attempt = 1; attempt <= 3; ++attempt) {
-		if (DownloadToFileOnce(url, path, error)) return true;
+		if (DownloadToFileOnce(url, path, error, notify)) return true;
 		if (attempt < 3) {
 			PrintUtf8(L"下载中断：" + error + L"，正在重试...\n");
 			Sleep(1000);
@@ -487,32 +670,26 @@ bool JsonString(const std::string& json, const char* key, std::string& value)
 	return false;
 }
 
-bool HttpGetAny(const std::wstring& query, std::string& body)
-{
-	for (const std::wstring& endpoint : UpdateEndpoints()) {
-		if (HttpGetW(endpoint + query, body)) return true;
-	}
-	body.clear();
-	return false;
-}
-
+// 清单是唯一需要票据的接口：它决定"下哪个包、包的哈希是多少"。
+// 一旦清单能被换掉，后面比对的 SHA-256 只是在核对攻击者自己给的哈希，
+// 等于没校验。所以这一环必须验身份 + 验内容，纯文本回退接口（?getnewver
+// 那一组）既没有票据也无从绑定正文，一并停用。
 bool FetchManifest(Manifest& manifest)
 {
 	std::string body;
-	if (HttpGetAny(L"?manifest=1", body)) {
-		JsonString(body, "version", manifest.version);
-		JsonString(body, "notes", manifest.notes);
-		JsonString(body, "url", manifest.url);
-		JsonString(body, "sha256", manifest.sha256);
+	std::wstring error;
+	int index = 0;
+	for (const std::wstring& endpoint : UpdateEndpoints()) {
+		++index;
+		if (HttpGetManifest(endpoint, body, error)) {
+			JsonString(body, "version", manifest.version);
+			JsonString(body, "notes", manifest.notes);
+			JsonString(body, "url", manifest.url);
+			JsonString(body, "sha256", manifest.sha256);
+			break;
+		}
+		PrintUtf8(L"清单请求失败（端点 " + std::to_wstring(index) + L"）：" + error + L"\n");
 	}
-	// The plain-text query parameters remain available on the server, so keep
-	// supporting deployments that have not published a manifest yet.
-	if (manifest.version.empty() && HttpGetAny(L"?getnewver", body))
-		manifest.version = Trim(body);
-	if (manifest.notes.empty() && HttpGetAny(L"?getupdateinfo", body))
-		manifest.notes = Trim(body);
-	if (manifest.url.empty() && HttpGetAny(L"?getupdate", body))
-		manifest.url = Trim(body);
 	return !manifest.version.empty() && !manifest.url.empty();
 }
 
@@ -527,7 +704,7 @@ static bool WriteManifestFile(const std::wstring& path, const Manifest& manifest
 	text += "notes=";
 	for (char ch : manifest.notes) {
 		if (ch == '\r') continue;
-		if (ch == '\n') text += '\\n';
+		if (ch == '\n') text += "\\n";
 		else text.push_back(ch);
 	}
 	text += "\n";
@@ -695,6 +872,18 @@ struct Options {
 	// 主程序是 GUI 进程，实测在那里面调 WinINet 会 ERROR_INTERNET_CANNOT_CONNECT，
 	// 而更新器是控制台进程，同样的调用却正常。
 	std::wstring manifestPath;
+	// --apply <包路径>：只做替换。下载、校验、确认都由主程序负责，
+	// 这里等主程序退出后把包换上去再启动它。
+	std::wstring applyPath;
+	// --sha256 <hex>：替换前再核一次包，防半路被换掉。
+	std::wstring expectedSha;
+	// --download <保存路径> + --url <地址>：只下载。
+	// 主程序进程里做 TLS 会失败（Schannel 返回 SEC_E_SECPKG_NOT_FOUND），
+	// 所以清单和安装包都借这个子进程去取，主程序只负责校验和替换。
+	std::wstring downloadPath;
+	std::wstring downloadUrl;
+	// --notify <hwnd>：下载时把进度 PostMessage 到这个窗口（主程序界面）。
+	HWND notifyWindow = nullptr;
 	bool force = false;
 	bool repl = false;
 	bool status = false;
@@ -820,13 +1009,19 @@ int RunGuided(const Options& options)
 		PrintUtf8(L"\n更新说明:\n");
 		PrintUtf8(WideFromUtf8(manifest.notes) + L"\n");
 	}
-	PrintUtf8(L"\n发现新版本 " + available + L"，是否下载并安装？[Y/n] ");
-	std::string answer;
-	if (!std::getline(std::cin, answer)) return 0;
-	const std::wstring choice = NormalizeCommand(WideFromUtf8(answer));
-	if (!choice.empty() && choice != L"y" && choice != L"yes") {
-		PrintUtf8(L"已取消。\n");
-		return 0;
+	if (g_silentUpdate) {
+		// 静默模式（主程序拉起的兜底更新）：没人能回答提示，直接继续。
+		PrintUtf8(L"\n发现新版本 " + available + L"，静默模式直接安装。\n");
+	}
+	else {
+		PrintUtf8(L"\n发现新版本 " + available + L"，是否下载并安装？[Y/n] ");
+		std::string answer;
+		if (!std::getline(std::cin, answer)) return 0;
+		const std::wstring choice = NormalizeCommand(WideFromUtf8(answer));
+		if (!choice.empty() && choice != L"y" && choice != L"yes") {
+			PrintUtf8(L"已取消。\n");
+			return 0;
+		}
 	}
 
 	const std::wstring payload = PayloadPathFor(target);
@@ -902,17 +1097,38 @@ void ConfigureInteractiveConsole(bool redirectedInput)
 
 void PrepareConsole()
 {
+	// --manifest 是主程序用来"代取一次清单"的只读模式：它不该在屏幕上开窗口。
+	// 以前这里是 AttachConsole 失败 -> AllocConsole，于是主程序点"检查更新"就会
+	// 闪一个黑框。这个模式下把 stdio 直接接到 NUL，一句输出都不留。
+	if (wcsstr(GetCommandLineW(), L"--manifest") != nullptr) {
+		FILE* sink = nullptr;
+		_wfreopen_s(&sink, L"NUL", L"w", stdout);
+		_wfreopen_s(&sink, L"NUL", L"w", stderr);
+		FILE* source = nullptr;
+		_wfreopen_s(&source, L"NUL", L"r", stdin);
+		return;
+	}
 	// Capture redirection before AttachConsole: attaching can replace the
 	// inherited pipe handles with console handles.
 	const bool redirectedInput = HasRedirectedStandardInput();
-	const bool attached = redirectedInput ? false : (AttachConsole(ATTACH_PARENT_PROCESS) != FALSE);
-	if (!attached && !redirectedInput) {
-		AllocConsole();
-		FILE* input = nullptr;
-		FILE* output = nullptr;
-		_wfreopen_s(&input, L"CONIN$", L"r", stdin);
-		_wfreopen_s(&output, L"CONOUT$", L"w", stdout);
-	} else {
+	bool attached = false;
+	// 更新器是被主程序拉起的后台组件：没有父控制台时**绝不**再 AllocConsole。
+	// 以前这里开的就是用户看到的那个黑窗口。现在把 stdio 直接接到 NUL。
+	if (!redirectedInput) {
+		attached = AttachConsole(ATTACH_PARENT_PROCESS) != FALSE;
+		if (!attached) {
+			g_silentUpdate = true;
+			FILE* sink = nullptr;
+			_wfreopen_s(&sink, L"NUL", L"w", stdout);
+			_wfreopen_s(&sink, L"NUL", L"w", stderr);
+			FILE* source = nullptr;
+			_wfreopen_s(&source, L"NUL", L"r", stdin);
+			g_consoleOutput = false;
+			std::ios::sync_with_stdio(false);
+			return;
+		}
+	}
+	{
 		// GUI-subsystem processes do not initialize CRT stdio from inherited
 		// handles. Bind those handles explicitly so pipes and attached consoles
 		// both work.
@@ -1003,6 +1219,158 @@ int RunInteractive(const Options& options)
 	return 0;
 }
 
+// ---------------------------------------------------------------- apply only
+
+std::wstring FileNameOf(const std::wstring& path)
+{
+	const size_t slash = path.find_last_of(L"\\/");
+	return slash == std::wstring::npos ? path : path.substr(slash + 1);
+}
+
+// 按映像名枚举进程。主程序是提权 + 自保护的，从外面杀不掉，只能等它自己退；
+// 用 Toolhelp 快照轮询比 OpenProcess+WaitForSingleObject 可靠 —— 后者要先拿到句柄，
+// 而自保护恰好会拒绝。
+bool IsProcessRunning(const std::wstring& imageName)
+{
+	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snapshot == INVALID_HANDLE_VALUE) return false;
+	PROCESSENTRY32W entry = {};
+	entry.dwSize = sizeof(entry);
+	bool running = false;
+	if (Process32FirstW(snapshot, &entry)) {
+		do {
+			if (_wcsicmp(entry.szExeFile, imageName.c_str()) == 0) {
+				running = true;
+				break;
+			}
+		} while (Process32NextW(snapshot, &entry));
+	}
+	CloseHandle(snapshot);
+	return running;
+}
+
+// 只做替换：下载、校验、确认都由主程序完成，这边等它退出再把包换上去。
+// ---------------------------------------------------------------- download only
+
+// 只下载。主程序在自己的进程里做 TLS 会失败（Schannel 直接返回
+// SEC_E_SECPKG_NOT_FOUND），同一段代码在独立进程里正常 —— 所以清单和安装包
+// 都借这个子进程去取，主程序只做校验和替换。
+int RunDownloadOnly(const Options& options)
+{
+	if (options.downloadPath.empty() || options.downloadUrl.empty()) {
+		PrintUtf8(L"--download 需要配合 --url 和保存路径");
+		return 2;
+	}
+	// 校验值不是可选项。没有它就无法确认落盘的东西是不是我们发布的，
+	// 而"少一个判断就放行"正是这类链路最容易被利用的地方。
+	if (options.expectedSha.empty()) {
+		PrintUtf8(L"拒绝下载：未提供 --sha256，无法确认更新包完整性");
+		return 11;
+	}
+	// 服务器身份没过就不碰下载。顺序刻意放在下载之前：先验人、再取货。
+	std::wstring trustError;
+	if (!VerifyUpdateChannel(trustError)) {
+		PrintUtf8(L"拒绝下载：服务器身份校验未通过 —— " + trustError);
+		return 12;
+	}
+
+	DeleteFileW(options.downloadPath.c_str());
+	std::wstring error;
+	// 只下载模式：把进度同步给主程序窗口（没有 --notify 时为 nullptr，无副作用）。
+	if (!DownloadToFile(options.downloadUrl, options.downloadPath, error, options.notifyWindow)) {
+		PrintUtf8(L"下载失败：" + error);
+		DeleteFileW(options.downloadPath.c_str());
+		return 5;
+	}
+	{
+		std::string actual;
+		const std::string expected = Utf8FromWide(options.expectedSha);
+		if (!FileSha256(options.downloadPath, actual) ||
+			_stricmp(actual.c_str(), expected.c_str()) != 0) {
+			PrintUtf8(L"下载完成但 SHA-256 不匹配");
+			DeleteFileW(options.downloadPath.c_str());
+			return 6;
+		}
+	}
+	return 0;
+}
+
+int RunApplyOnly(const Options& options)
+{
+	const std::wstring target = options.target.empty() ? DefaultTarget() : options.target;
+	const std::wstring package = options.applyPath;
+	if (target.empty() || package.empty()) {
+		PrintUtf8(L"--apply 需要 --target 和更新包路径\n");
+		return 2;
+	}
+	if (!IsPeImage(package)) {
+		PrintUtf8(L"更新包不是有效的可执行文件\n");
+		DeleteFileW(package.c_str());
+		return 6;
+	}
+	// 替换是最终落盘的一步，比下载更不该妥协：没有校验值就直接拒绝，
+	// 不给"省略参数就能绕过校验"留口子。
+	if (options.expectedSha.empty()) {
+		PrintUtf8(L"拒绝替换：未提供 --sha256，无法确认更新包完整性\n");
+		DeleteFileW(package.c_str());
+		return 6;
+	}
+	{
+		std::string actual;
+		// expectedSha 是命令行给的宽字符串，走 UTF-8 转窄串；直接拿迭代器
+		// 构造会把 wchar_t 截成 char（C4244），而且在非 ASCII 上行为未定义。
+		const std::string expected = Utf8FromWide(options.expectedSha);
+		if (!FileSha256(package, actual) || _stricmp(actual.c_str(), expected.c_str()) != 0) {
+			PrintUtf8(L"更新包 SHA-256 校验失败\n");
+			DeleteFileW(package.c_str());
+			return 6;
+		}
+	}
+
+	const std::wstring imageName = FileNameOf(target);
+	const ULONGLONG deadline = GetTickCount64() + 120000;
+	while (IsProcessRunning(imageName)) {
+		if (GetTickCount64() > deadline) {
+			PrintUtf8(L"等待主程序退出超时\n");
+			return 7;
+		}
+		Sleep(200);
+	}
+
+	// 运行中的 exe 不能被覆盖，但可以改名让位。
+	const std::wstring backup = target + L".old";
+	DeleteFileW(backup.c_str());
+	if (!MoveFileExW(target.c_str(), backup.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+		PrintUtf8(L"无法重命名当前程序\n");
+		return 8;
+	}
+	if (!MoveFileExW(package.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+		MoveFileExW(backup.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING);
+		PrintUtf8(L"替换程序失败，已回滚\n");
+		return 9;
+	}
+
+	std::wstring command = L"\"" + target + L"\" --after-update";
+	std::vector<wchar_t> commandLine(command.begin(), command.end());
+	commandLine.push_back(0);
+	const std::wstring workingDir = DirectoryOf(target);
+	STARTUPINFOW startup = {};
+	startup.cb = sizeof(startup);
+	PROCESS_INFORMATION process = {};
+	if (!CreateProcessW(target.c_str(), commandLine.data(), nullptr, nullptr, FALSE, 0,
+		nullptr, workingDir.empty() ? nullptr : workingDir.c_str(), &startup, &process)) {
+		MoveFileExW(target.c_str(), package.c_str(), MOVEFILE_REPLACE_EXISTING);
+		MoveFileExW(backup.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING);
+		PrintUtf8(L"启动新版本失败，已回滚\n");
+		return 10;
+	}
+	CloseHandle(process.hThread);
+	CloseHandle(process.hProcess);
+	// 删不掉就留着，主程序启动时会清理 *.old。
+	DeleteFileW(backup.c_str());
+	return 0;
+}
+
 void PrintUsage()
 {
 	PrintUtf8(L"Dzjs Trainer 更新程序\n"
@@ -1010,6 +1378,11 @@ void PrintUsage()
 		L"  --target <路径> 指定要更新的主程序（默认本目录）\n"
 		L"  --source <路径> 同时刷新来源安装包\n"
 		L"  --force         即使版本不更新也重新安装\n"
+		L"  --manifest <文件> 只写清单不装：主程序探测用\n"
+		L"  --download <路径> 配合 --url 只下载安装包（需 --sha256，先验服务器身份）\n"
+		L"  --url <地址>    配合 --download 指定下载地址\n"
+		L"  --apply <包>    只替换：等主程序退出后换包并重启\n"
+		L"  --sha256 <hex>  下载与替换都必填：落盘前后各核一次\n"
 		L"  --status        只显示本地文件状态\n"
 		L"  --repl          进入交互命令模式\n"
 		L"  --no-elevate    不申请管理员权限\n"
@@ -1030,6 +1403,16 @@ Options ParseOptions(int argc, wchar_t** argv)
 		else if (arg == L"--repl") options.repl = true;
 		else if (arg == L"--status") options.status = true;
 		else if (arg == L"--manifest") value(options.manifestPath);
+		else if (arg == L"--apply") value(options.applyPath);
+		else if (arg == L"--sha256") value(options.expectedSha);
+		else if (arg == L"--download") value(options.downloadPath);
+		else if (arg == L"--url") value(options.downloadUrl);
+		else if (arg == L"--notify") {
+			std::wstring text;
+			value(text);
+			options.notifyWindow = reinterpret_cast<HWND>(
+				static_cast<ULONG_PTR>(_wcstoui64(text.c_str(), nullptr, 10)));
+		}
 		else if (arg == L"--help" || arg == L"-h" || arg == L"/?") options.help = true;
 		else if (arg == L"--no-elevate") options.noElevate = true;
 		else if (arg == L"--elevated") options.elevated = true;
@@ -1092,6 +1475,10 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
 	}
 
 	PrepareConsole();
+	// 只下载模式：主程序进程里 TLS 不通，网络抓取全交给这里。
+	if (!options.downloadPath.empty()) return RunDownloadOnly(options);
+	// 只替换模式：下载/校验/确认都在主程序那边做完了，这里只管换文件。
+	if (!options.applyPath.empty()) return RunApplyOnly(options);
 	if (options.repl) return RunInteractive(options);
 	return RunGuided(options);
 }

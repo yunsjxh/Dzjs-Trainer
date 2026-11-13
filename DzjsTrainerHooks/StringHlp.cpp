@@ -1,4 +1,4 @@
-#include "stdafx.h"
+ï»¿#include "stdafx.h"
 #include "StringHlp.h"
 
 std::string & FormatString(std::string & _str, const char * _Format, ...) {
@@ -209,13 +209,13 @@ wchar_t* StringHlp::AnsiToUnicode(const char* szStr)
 }
 wchar_t* StringHlp::Utf8ToUnicode(const char* szU8)
 {
-	//Ô¤×ª»»£¬µÃµ½ËùĞè¿Õ¼äµÄ´óĞ¡;
+	//é¢„è½¬æ¢ï¼Œå¾—åˆ°æ‰€éœ€ç©ºé—´çš„å¤§å°;
 	int wcsLen = ::MultiByteToWideChar(CP_UTF8, NULL,szU8, (int)strlen(szU8), NULL, 0);
-	//·ÖÅä¿Õ¼äÒª¸ø'\0'Áô¸ö¿Õ¼ä£¬MultiByteToWideChar²»»á¸ø'\0'¿Õ¼ä
+	//åˆ†é…ç©ºé—´è¦ç»™'\0'ç•™ä¸ªç©ºé—´ï¼ŒMultiByteToWideCharä¸ä¼šç»™'\0'ç©ºé—´
 	wchar_t* wszString = new wchar_t[wcsLen + 1];
-	//×ª»»
+	//è½¬æ¢
 	::MultiByteToWideChar(CP_UTF8, NULL, szU8, (int)strlen(szU8), wszString, wcsLen);
-	//×îºó¼ÓÉÏ'\0'
+	//æœ€ååŠ ä¸Š'\0'
 	wszString[wcsLen] = '\0';
 	return wszString;
 }

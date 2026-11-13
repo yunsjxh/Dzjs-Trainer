@@ -1,9 +1,9 @@
-#pragma once
+﻿#pragma once
 
 #include "stdafx.h"
 
 #define MAIN_WND_CLS_NAME L"DzjsTrainerNativeWindow"
-#define MAIN_WND_NAME L"Dzjs Trainer Main Window"
+#define MAIN_WND_NAME L"Dzjs Trainer \u00b7 \u8bbe\u5907\u9632\u62a4\u4e2d\u5fc3"
 
 #ifdef DZJSTRAINERUI_EXPORTS
 
@@ -78,6 +78,15 @@ private:
 	Gdiplus::Bitmap* backBuffer = nullptr;
 	int backBufferWidth = 0;
 	int backBufferHeight = 0;
+	// 后备缓冲改成 DIB 段：GDI+ 直接画进 DIB，最后用 BitBlt 推到窗口 DC。
+	// 实测 BitBlt 0.07 ms vs Graphics::DrawImage 3.20 ms（1120x760）。
+	HBITMAP backBufferDib = nullptr;
+	HDC backBufferDc = nullptr;
+	HGDIOBJ backBufferPreviousBitmap = nullptr;
+	void* backBufferBits = nullptr;
+	bool EnsureBackBuffer(int width, int height);
+	void ReleaseBackBuffer();
+	void LogPaintDuration(double milliseconds);
 	NOTIFYICONDATAW nid{};
 	bool trayIconRegistered = false;
 	HMENU hMenuTray = nullptr;
@@ -95,6 +104,9 @@ private:
 	TrainerWorker* currentWorker = nullptr;
 	HFONT controlFont = nullptr;
 	HBRUSH controlSurfaceBrush = nullptr;
+	// 高级配置页的输入框底色，必须和自绘的圆角输入框填充一致，
+	// 否则原生控件的方块背景会从圆角里露出来。
+	HBRUSH advancedFieldBrush = nullptr;
 	std::array<HWND, 15> networkControls{};
 	HWND teacherHostWindow = nullptr;
 	HWND teacherLaunchButton = nullptr;
@@ -118,13 +130,20 @@ private:
 	HANDLE avScanCancelEvent = nullptr;
 	volatile LONG avScanRunning = 0;
 	AV_PROCESS_SCAN_SUMMARY avScanSummary{};
-	std::wstring avScanStatus = L"Ready";
+	std::wstring avScanStatus = L"\u5c31\u7eea";
 	std::wstring avSignaturePath;
 	std::wstring avSignaturePattern;
 	ULONG avSignatureId = 0;
 	DWORD avSignatureSampleCount = 0;
 	DWORD avSignatureExactBytes = 0;
 	std::array<HWND, 3> advancedControls{};
+	// 快捷键框改成自绘：原生 HOTKEY 控件会自己画一圈直角黑边，和圆角卡片冲突。
+	// 值沿用 HOTKEY 控件的编码（HIBYTE = 修饰键位，LOBYTE = 虚拟键码），
+	// 这样 SysHlp::HotKeyCtlToKeyCode 不用改。
+	int hotkeyFakeFullValue = 1606;
+	int hotkeyShowHideValue = 1604;
+	int hotkeyCaptureIndex = -1;
+	std::array<RECT, 2> advancedHotkeyRect{};
 	int advancedTab = 0;
 	int advancedKillMode = 1;
 	int advancedInjectMode = 0;
@@ -145,9 +164,30 @@ private:
 
 	Page page = Page::Overview;
 	int hoverTarget = -1;
-	std::array<float, 80> hoverProgress{};
+	int pressTarget = -1;
+	// 交互元素比早期多得多（导航 10 + 页面按钮 + 诊断列表行），留够槽位。
+	// 原来 80 个槽，restoreTeacherView(81) 和 superTopMost(80) 已经越界。
+	std::array<float, 128> hoverProgress{};
+	// 开关滑块的插值位置（0=关，1=开）。防护策略 7 个、高级配置 6 个，
+	// 两页分槽（0-7 / 8-15），否则翻页时滑块会串味。
+	std::array<float, 24> toggleMotion{};
+	// 一帧的真实时长，让滑块动画按时间推进而不是按帧数（否则重绘频率一变速度就变）。
+	double frameDelta = 1.0 / 60.0;
+	ULONGLONG lastPaintTick = 0;
+	bool toggleAnimating = false;
+	// 键盘焦点。用 Tab 在可点区域之间移动，Enter/Space 触发，Esc 取消。
+	int focusTarget = -1;
+	enum class ButtonStyle { Primary, Tonal, Ghost, Danger };
+	void PaintButton(Gdiplus::Graphics& g, const Gdiplus::RectF& rect, LPCWSTR label,
+		int hoverId, ButtonStyle style, float radius = 10.0f, int icon = -1, bool enabled = true);
 	double pageMotion = 1.0;
+	// 侧栏选中指示器的浮点位置（单位＝条目序号）。翻页时在两条之间滑动，
+	// 直接跳到目标位置会让整个界面显得生硬。
+	float navIndicator = 0.0f;
 	double pulse = 0.0;
+	// 动画定时器按需启停：没有动画时不再每 16 ms 醒一次。
+	bool animationTimerRunning = false;
+	ULONGLONG lastAnimationTick = 0;
 	bool darkMode = false;
 	bool firstShow = true;
 	bool isUserCancel = false;
@@ -160,11 +200,13 @@ private:
 	bool currentControlled = false;
 	DWORD studentPid = 0;
 	TrainerStatus currentStatus = TrainerStatusNotFound;
-	std::wstring statusTitle = L"Initializing";
-	std::wstring statusDetail = L"Connecting to protection service";
-	std::wstring studentPath = L"Not detected";
+	// 状态文案在守护线程回报之前就会显示在概览页，默认值不能留英文。
+	std::wstring statusTitle = L"\u6b63\u5728\u521d\u59cb\u5316";
+	std::wstring statusDetail = L"\u6b63\u5728\u8fde\u63a5\u9632\u62a4\u670d\u52a1";
+	std::wstring studentPath = L"\u672a\u68c0\u6d4b\u5230";
 	std::wstring toastText;
 	ULONGLONG toastUntil = 0;
+	ULONGLONG toastStart = 0;
 
 	bool setAllowAllRunOp = true;
 	bool setAllowGbTop = false;
@@ -262,12 +304,60 @@ private:
 	void PaintAbout(Gdiplus::Graphics& g, int width, int height, int offsetY);
 	void PaintNavigation(Gdiplus::Graphics& g, int height);
 	void PaintHeader(Gdiplus::Graphics& g, int width);
-	void PaintToast(Gdiplus::Graphics& g, int width);
+	void PaintToast(Gdiplus::Graphics& g, int width, int height);
+	void EnsureAnimationTimer();
+	int HitTargetAt(POINT point);
+	// 焦点目标与 hover id 共用同一套编号，方便复用命中判断。
+	bool TargetRect(int target, RECT* rect) const;
+	std::vector<int> FocusableTargets() const;
+	void MoveFocus(bool backwards);
+	bool ActivateFocus();
+	float AnimateToggle(int index, bool on);
+	// 主色按钮的 hover / 按下态统一走这里，省得每处自己拼颜色。
+	void PaintPrimaryButton(Gdiplus::Graphics& g, const Gdiplus::RectF& rect, LPCWSTR label,
+		int hoverId, float radius = 20.0f);
 	void UpdateHover(POINT point);
 	void HandleClick(POINT point);
 	void CheckForUpdate(bool byUser);
+	// 内置更新：下载 + 校验 + 替换都在本进程里做，走独立线程，进度用消息回报。
+	static DWORD WINAPI UpdateDownloadThreadProc(LPVOID parameter);
+	void OnUpdateDownloadState(WPARAM wParam, LPARAM lParam);
+	// 子进程下载时回传的进度（total 在 wParam、done 在 lParam）。
+	void OnChildDownloadProgress(WPARAM wParam, LPARAM lParam);
 	// 探测结果回到 UI 线程后处理（比对版本、弹确认框、必要时启动更新器）。
 	void FinishUpdateProbe(const UpdateProbeContext& probe);
+	// 更新的确认 / 进度 / 失败都用窗口内的自绘卡片，不再弹 MessageBox。
+	// 系统消息框是直角白底，和这套圆角界面完全不搭，而且进度条画不上去。
+	enum class UpdateDialogMode { None, Confirm, Download, Done, Failed };
+	struct UpdateDialogState {
+		UpdateDialogMode mode = UpdateDialogMode::None;
+		std::wstring url;
+		std::wstring version;
+		std::wstring currentVersion;
+		std::wstring notes;
+		std::wstring sha256;
+		std::wstring status;
+		int percent = -1;
+		unsigned long long done = 0;
+		unsigned long long total = 0;
+		float appear = 0.0f;    // 入场：0→1
+		float progress = 0.0f;  // 进度条插值位置（0..1）
+		float sweep = 0.0f;     // 总长度未知时的走动相位
+	};
+	UpdateDialogState updateDialog;
+	RECT updateDialogPrimaryRect{};
+	RECT updateDialogSecondaryRect{};
+	bool UpdateDialogVisible() const { return updateDialog.mode != UpdateDialogMode::None; }
+	void PaintUpdateDialog(Gdiplus::Graphics& g, int width, int height);
+	void ShowUpdateConfirm(const UpdateProbeContext& probe, const std::wstring& currentVersion);
+	void StartUpdateDownload();
+	void CloseUpdateDialog();
+	void FailUpdateDialog(const std::wstring& reason);
+	bool HandleUpdateDialogClick(POINT point);
+	int HitUpdateDialogAt(POINT point) const;
+	// 原生子窗口（教师端宿主、输入框）由系统单独绘制，会盖在自绘弹窗上面，
+	// 弹窗期间要先把它们藏起来，关掉后再按页面状态恢复。
+	void ApplyDialogOcclusion();
 	void RequestSuperTopmost();
 	void SelectPage(Page target);
 	void StartAvProcessScan();
@@ -292,6 +382,8 @@ private:
 	void HandleTeacherCommand(int command);
 	void CreateAdvancedControls();
 	void LayoutAdvancedControls();
+	void SetHotkeyValue(int index, int value);
+	void HandleHotkeyKey(UINT virtualKey);
 	void LoadAdvancedSettings();
 	void SaveAdvancedSettings();
 	void HandleNetworkCommand(int command);

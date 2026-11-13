@@ -1,4 +1,5 @@
 ﻿#include "stdafx.h"
+#include "../DzjsTrainerUpdater/BuiltinUpdate.h"
 #include "resource.h"
 #include "DzjsTrainer.h"
 #include "App.h"
@@ -728,10 +729,13 @@ int JTAppInternal::RunCheckRunningApp()//如果程序已经有一个在运行，
 	// The UIAccess relaunch is intentional: let the elevated helper instance
 	// start while the original instance is still shutting down.
 	const bool uiAccessRestart = wcsstr(GetCommandLineW(), L"--uiaccess-restarted") != nullptr;
+	// 内置更新换完文件后会以 --after-update 重启自己；此时旧实例正在退出，
+	// 既不该把窗口拉起来（它已经在关了），也要等单实例互斥体释放。
+	const bool afterUpdate = wcsstr(GetCommandLineW(), L"--after-update") != nullptr;
 	wchar_t modulePath[MAX_PATH]{};
 	GetModuleFileNameW(nullptr, modulePath, _countof(modulePath));
 	const bool nativePreviewBuild = wcsstr(modulePath, L"DzjsTrainer-TeacherNative") != nullptr;
-	if (!nativePreviewBuild && !uiAccessRestart) {
+	if (!nativePreviewBuild && !uiAccessRestart && !afterUpdate) {
 		HWND oldWindow = FindWindow(MAIN_WND_CLS_NAME, MAIN_WND_NAME);
 		if (oldWindow != NULL) {
 			if (!IsWindowVisible(oldWindow)) ShowWindow(oldWindow, SW_SHOW);
@@ -741,12 +745,23 @@ int JTAppInternal::RunCheckRunningApp()//如果程序已经有一个在运行，
 		}
 	}
 	HANDLE hMutex = CreateMutex(NULL, FALSE, nativePreviewBuild ? L"JYTMutex-TeacherNative" : (uiAccessRestart ? L"JYTMutex-UIAccess" : L"JYTMutex"));
+	if (afterUpdate && hMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+		// 旧实例正在收尾（要卸驱动、落日志），最多等 20 秒。进程内换文件是
+		// "先起新版本、旧版本随后退出"，所以这段等待是常态而不是异常。
+		for (int attempt = 0; attempt < 80; ++attempt) {
+			Sleep(250);
+			CloseHandle(hMutex);
+			hMutex = CreateMutex(NULL, FALSE, L"JYTMutex");
+			if (!hMutex || GetLastError() != ERROR_ALREADY_EXISTS) break;
+		}
+	}
 	if (hMutex && (GetLastError() == ERROR_ALREADY_EXISTS))
 	{
 		CloseHandle(hMutex);
 		hMutex = NULL;
 		return 1;
 	}
+	JUpdater_CleanupOldImages();
 	return 0;
 }
 bool JTAppInternal::RunArgeementDialog()

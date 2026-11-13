@@ -41,7 +41,12 @@ UPEXPORT_CFUNC(BOOL) JUpdater_FetchManifest(JUpdaterManifestInfo* info)
 	ZeroMemory(info, sizeof(*info));
 
 	UpdaterManifest::Info manifest;
-	if (!UpdaterManifest::Fetch(manifest)) return FALSE;
+	const bool ok = UpdaterManifest::Fetch(manifest);
+	// 失败原因先落盘（写进跨模块缓冲），再决定返回值：
+	// 界面要拿它给用户看，只回 FALSE 等于把三种完全不同的失败混成一句
+	// "无法获取更新信息"。
+	wcsncpy_s(info->error, _countof(info->error), manifest.error.c_str(), _TRUNCATE);
+	if (!ok) return FALSE;
 
 	wcsncpy_s(info->version, _countof(info->version), manifest.version.c_str(), _TRUNCATE);
 	wcsncpy_s(info->notes, _countof(info->notes), manifest.notes.c_str(), _TRUNCATE);
@@ -140,6 +145,124 @@ static void LogThreadTokenState(Logger* logger, LPCWSTR stage)
 		static_cast<unsigned long>(tokenType), static_cast<unsigned long>(tokenLevel));
 }
 
+// 诊断辅助：确认启动子进程时受哪些令牌约束。
+//
+// 背景：CreateProcess 返回 1346(ERROR_BAD_IMPERSONATION_LEVEL)，但
+// LogThreadTokenState 显示线程上 OpenThreadToken 两种写法都是 1008(NO_TOKEN)，
+// 说明"线程在模拟"这个假设不成立。下面三项是之前缺的数据。
+static void LogLaunchEnvironment(Logger* logger, LPCWSTR targetPath)
+{
+	if (!logger) return;
+
+	// ---- 1) 线程主令牌 ----
+	// GetThreadInformation 直接读线程上的主令牌句柄，不需要 TOKEN_QUERY 权限，
+	// 因此能绕开 OpenThreadToken 的访问拒绝，区分"没有"与"有但打不开"。
+	// ThreadImpersonationToken(=5) 属于 THREADINFOCLASS，声明在 winternl.h；
+	// 本翻译单元不引 NT 内部头，直接用数值传递，避免多一个头文件依赖。
+	typedef BOOL(WINAPI* PFN_GetThreadInformation)(HANDLE, int, PVOID, DWORD);
+	const int kThreadImpersonationToken = 5;
+	HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+	PFN_GetThreadInformation getThreadInfo = kernel
+		? reinterpret_cast<PFN_GetThreadInformation>(
+			reinterpret_cast<void*>(GetProcAddress(kernel, "GetThreadInformation")))
+		: nullptr;
+	if (getThreadInfo) {
+		HANDLE threadPrimary = nullptr;
+		const BOOL got = getThreadInfo(GetCurrentThread(), kThreadImpersonationToken,
+			&threadPrimary, sizeof(threadPrimary));
+		DWORD primaryLevel = 0;
+		DWORD primaryType = 0;
+		DWORD cb = 0;
+		if (got && threadPrimary) {
+			GetTokenInformation(threadPrimary, TokenImpersonationLevel, &primaryLevel, sizeof(primaryLevel), &cb);
+			GetTokenInformation(threadPrimary, TokenType, &primaryType, sizeof(primaryType), &cb);
+			CloseHandle(threadPrimary);
+		}
+		logger->LogError2(L"线程主令牌 GetThreadInformation=%d token=%p type=%lu level=%lu",
+			static_cast<int>(got), threadPrimary,
+			static_cast<unsigned long>(primaryType), static_cast<unsigned long>(primaryLevel));
+	}
+	else {
+		logger->LogError2(L"线程主令牌 GetThreadInformation 不可用（系统版本过低）");
+	}
+
+	// ---- 2) 进程令牌：受限 / 完整性 / 会话 ----
+	HANDLE processToken = nullptr;
+	if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &processToken)) {
+		DWORD restricted = 0;
+		DWORD cb = 0;
+		const BOOL gotRestricted = GetTokenInformation(processToken, TokenIsRestricted,
+			&restricted, sizeof(restricted), &cb);
+
+		DWORD integrityRid = 0;
+		BYTE labelBuffer[256] = {};
+		if (GetTokenInformation(processToken, TokenIntegrityLevel,
+			labelBuffer, sizeof(labelBuffer), &cb)) {
+			TOKEN_MANDATORY_LABEL* label = reinterpret_cast<TOKEN_MANDATORY_LABEL*>(labelBuffer);
+			if (label->Label.Sid) {
+				const UCHAR* countPtr = GetSidSubAuthorityCount(label->Label.Sid);
+				if (countPtr && *countPtr > 0) {
+					const DWORD* last = GetSidSubAuthority(label->Label.Sid, *countPtr - 1);
+					if (last) integrityRid = *last;
+				}
+			}
+		}
+
+		DWORD sessionId = 0;
+		GetTokenInformation(processToken, TokenSessionId, &sessionId, sizeof(sessionId), &cb);
+		CloseHandle(processToken);
+
+		// restricted=1 表示令牌被 CreateRestrictedToken 收过权限，
+		// 这种令牌创建进程时会走不同分支，是 1346 的已知诱因之一。
+		logger->LogError2(L"进程令牌 restricted(got=%d)=%lu integrity=0x%lX session=%lu",
+			static_cast<int>(gotRestricted), static_cast<unsigned long>(restricted),
+			static_cast<unsigned long>(integrityRid), static_cast<unsigned long>(sessionId));
+	}
+	else {
+		logger->LogError2(L"进程令牌打开失败 err=%lu", static_cast<unsigned long>(GetLastError()));
+	}
+
+	// ---- 3) 目标清单的权限要求 ----
+	// requireAdministrator / uiAccess 决定 CreateProcess 是否要提升或重建令牌。
+	HMODULE module = LoadLibraryExW(targetPath, nullptr, LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+	if (!module) {
+		logger->LogError2(L"目标清单：无法装载文件 err=%lu", static_cast<unsigned long>(GetLastError()));
+		return;
+	}
+	HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(24));
+	if (!resource) {
+		logger->LogError2(L"目标清单：没有 RT_MANIFEST(24) 资源");
+		FreeLibrary(module);
+		return;
+	}
+	const DWORD size = SizeofResource(module, resource);
+	HGLOBAL loaded = LoadResource(module, resource);
+	const char* raw = loaded ? static_cast<const char*>(LockResource(loaded)) : nullptr;
+	if (!raw || size == 0) {
+		logger->LogError2(L"目标清单：资源为空");
+		FreeLibrary(module);
+		return;
+	}
+	const std::string manifest(raw, size);
+	const bool hasUiAccess = manifest.find("uiAccess=\"true\"") != std::string::npos;
+	std::string level = "(未声明)";
+	const size_t levelPos = manifest.find("requestedExecutionLevel");
+	if (levelPos != std::string::npos) {
+		const size_t attrPos = manifest.find("level=\"", levelPos);
+		if (attrPos != std::string::npos) {
+			const size_t begin = attrPos + 7;
+			const size_t end = manifest.find('"', begin);
+			if (end != std::string::npos) level.assign(manifest, begin, end - begin);
+		}
+	}
+	// 显式转宽再输出，不依赖 %hs 的格式化实现差异。
+	wchar_t levelWide[64] = {};
+	MultiByteToWideChar(CP_UTF8, 0, level.c_str(), -1, levelWide, _countof(levelWide));
+	logger->LogError2(L"目标清单 requestedExecutionLevel=%s uiAccess=%d",
+		levelWide, hasUiAccess ? 1 : 0);
+	FreeLibrary(module);
+}
+
 // 释放内嵌更新器、让它以 --manifest 取一次清单、再把结果读回来。
 //
 // 为什么绕这一圈：主程序是 GUI 进程，实测在里面调 WinINet 会直接
@@ -218,6 +341,7 @@ UPEXPORT_CFUNC(BOOL) JUpdater_ProbeManifest(JUpdaterManifestInfo* info)
 			static_cast<unsigned long>(launchError), updaterPath.c_str(),
 			static_cast<unsigned long>(fileAttributes));
 		LogThreadTokenState(logger, L"失败时");
+		LogLaunchEnvironment(logger, updaterPath.c_str());
 		HANDLE processToken = nullptr;
 		DWORD processType = 0;
 		DWORD processLevel = 0;
@@ -329,6 +453,128 @@ static bool ExtractBundledUpdater(LPCWSTR currentDir, std::wstring& updaterPath)
 	WCHAR tempRoot[MAX_PATH] = {};
 	if (!GetTempPathW(_countof(tempRoot), tempRoot)) return false;
 	return WriteUpdaterTo(std::wstring(tempRoot) + L"DzjsTrainerUpdater", data, size, updaterPath);
+}
+
+// 借子进程下载：主程序进程里 WinHTTP 的 TLS 会失败，这里的子进程是干净进程。
+UPEXPORT_CFUNC(BOOL) JUpdater_LaunchDownload(LPCWSTR url, LPCWSTR destPath,
+	LPCWSTR sha256Hex, DWORD timeoutMs, HWND notifyWindow)
+{
+	if (!url || url[0] == L'\0' || !destPath || destPath[0] == L'\0') return FALSE;
+	const LPCWSTR currentDir = JTAppGetCurrentDirDirect();
+	Logger* logger = JTAppGetLoggerDirect();
+
+	std::wstring updaterPath;
+	if (!ExtractBundledUpdater(currentDir, updaterPath)) {
+		if (logger) logger->LogError(L"释放独立更新程序失败（下载模式）");
+		return FALSE;
+	}
+
+	// 命令行里要带引号，但本文件不想掺进转义字符，用字符码拼。
+	// 第一段必须是更新器自己的路径：CreateProcess 的 lpCommandLine 会被子进程
+	// 当成完整命令行，它把第一个 token 当 argv[0]。少了这一段，子进程的
+	// "--download" 就变成了程序名，参数整体左移，最终掉进交互式安装流程卡死。
+	const WCHAR quote = static_cast<WCHAR>(34);
+	std::wstring command;
+	command.push_back(quote);
+	command += updaterPath;
+	command.push_back(quote);
+	command += L" --download ";
+	command.push_back(quote);
+	command += destPath;
+	command.push_back(quote);
+	command += L" --url ";
+	command.push_back(quote);
+	command += url;
+	command.push_back(quote);
+	if (sha256Hex && sha256Hex[0] != L'\0') {
+		command += L" --sha256 ";
+		command += sha256Hex;
+	}
+	// 把主窗口句柄交给子进程，它边下边把 (total, done) 发回来。
+	// 用十进制就够了，省得再操心十六进制解析。
+	if (notifyWindow) {
+		wchar_t handleText[32] = {};
+		swprintf_s(handleText, L"%llu",
+			static_cast<unsigned long long>(reinterpret_cast<ULONG_PTR>(notifyWindow)));
+		command += L" --notify ";
+		command += handleText;
+	}
+	command += L" --no-elevate";
+
+	std::vector<WCHAR> mutableCommand(command.begin(), command.end());
+	mutableCommand.push_back(static_cast<WCHAR>(0));
+
+	STARTUPINFOW startup{};
+	startup.cb = sizeof(startup);
+	PROCESS_INFORMATION process{};
+	if (!CreateProcessW(updaterPath.c_str(), mutableCommand.data(), nullptr, nullptr, FALSE,
+		CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
+		if (logger) logger->LogError(L"启动下载进程失败：%s (%d) %s",
+			PRINT_LAST_ERROR_STR, updaterPath.c_str());
+		return FALSE;
+	}
+	const DWORD waited = WaitForSingleObject(process.hProcess, timeoutMs ? timeoutMs : 300000);
+	DWORD exitCode = 1;
+	GetExitCodeProcess(process.hProcess, &exitCode);
+	CloseHandle(process.hThread);
+	CloseHandle(process.hProcess);
+	if (waited != WAIT_OBJECT_0) {
+		if (logger) logger->LogError(L"下载进程超时（%lu 毫秒）", static_cast<unsigned long>(timeoutMs));
+		return FALSE;
+	}
+	if (exitCode != 0) {
+		// 子进程是静默启动的（CREATE_NO_WINDOW），它的输出用户看不见，
+		// 所以把退出码翻成人话落进日志 —— 否则"更新失败"四个字等于没线索。
+		const wchar_t* reason = L"下载进程异常退出";
+		switch (exitCode) {
+		case 5: reason = L"下载失败或下载地址不被信任"; break;
+		case 6: reason = L"更新包 SHA-256 与清单不符"; break;
+		case 11: reason = L"缺少更新包校验值，已拒绝下载"; break;
+		case 12: reason = L"服务器身份校验未通过，已拒绝下载"; break;
+		default: break;
+		}
+		if (logger) logger->LogError(L"下载进程退出码 %lu（%s）",
+			static_cast<unsigned long>(exitCode), reason);
+		return FALSE;
+	}
+	return GetFileAttributesW(destPath) != INVALID_FILE_ATTRIBUTES ? TRUE : FALSE;
+}
+
+// 只替换模式：给出已下载好的包，让更新器等主程序退出后换上它。
+UPEXPORT_CFUNC(BOOL) JUpdater_LaunchApply(LPCWSTR packagePath, LPCWSTR sha256Hex)
+{
+	if (!packagePath || packagePath[0] == L'\0') return FALSE;
+	const LPCWSTR currentDir = JTAppGetCurrentDirDirect();
+	Logger* logger = JTAppGetLoggerDirect();
+
+	std::wstring updaterPath;
+	if (!ExtractBundledUpdater(currentDir, updaterPath)) {
+		if (logger) logger->LogError(L"释放独立更新程序失败（替换模式）");
+		return FALSE;
+	}
+
+	WCHAR targetPath[MAX_PATH] = {};
+	if (currentDir && currentDir[0] != L'\0') {
+		wcsncpy_s(targetPath, currentDir, _TRUNCATE);
+		wcsncat_s(targetPath, L"\\DzjsTrainer.exe", _TRUNCATE);
+	}
+
+	WCHAR args[2048] = {};
+	if (sha256Hex && sha256Hex[0] != L'\0') {
+		swprintf_s(args, _countof(args), L"--apply \"%s\" --target \"%s\" --sha256 %s",
+			packagePath, targetPath, sha256Hex);
+	}
+	else {
+		swprintf_s(args, _countof(args), L"--apply \"%s\" --target \"%s\"",
+			packagePath, targetPath);
+	}
+
+	if (!SysHlp::RunApplication(updaterPath.c_str(), args)) {
+		if (logger) logger->LogError(L"启动替换程序失败：%s (%d) %s",
+			PRINT_LAST_ERROR_STR, updaterPath.c_str());
+		return FALSE;
+	}
+	return TRUE;
 }
 
 UPEXPORT_CFUNC(BOOL) JUpdater_LaunchUpdater()

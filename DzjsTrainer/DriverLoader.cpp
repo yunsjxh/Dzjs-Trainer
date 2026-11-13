@@ -1,4 +1,4 @@
-#include "DriverLoader.h"
+ï»¿#include "DriverLoader.h"
 #include "stdafx.h"
 #include "DriverLoader.h"
 #include "DzjsTrainer.h"
@@ -564,7 +564,7 @@ static BOOL DriverSignaturePolicyAllows(LPCWSTR serviceName, LPCWSTR driverPath)
 }
 
 // ---------------------------------------------------------------------------
-// Ö÷Çı¶¯·şÎñÃûÓÉ App ²à¶ÀÁ¢ÈÕÆÚËã·¨Éú³É£¬²»´Ó .sys ÎÄ¼şÃûÅÉÉú¡£
+// ä¸»é©±åŠ¨æœåŠ¡åç”± App ä¾§ç‹¬ç«‹æ—¥æœŸç®—æ³•ç”Ÿæˆï¼Œä¸ä» .sys æ–‡ä»¶åæ´¾ç”Ÿã€‚
 // ---------------------------------------------------------------------------
 LPCWSTR XGetDriverServiceName()
 {
@@ -572,7 +572,7 @@ LPCWSTR XGetDriverServiceName()
 }
 
 // ---------------------------------------------------------------------------
-// AV ÄÚºËÇı¶¯·şÎñÃûÓÉ App ²à¶ÀÁ¢ÈÕÆÚËã·¨Éú³É£¨Ëã·¨ÓëÖ÷Çı¶¯²»Í¬£©¡£
+// AV å†…æ ¸é©±åŠ¨æœåŠ¡åç”± App ä¾§ç‹¬ç«‹æ—¥æœŸç®—æ³•ç”Ÿæˆï¼ˆç®—æ³•ä¸ä¸»é©±åŠ¨ä¸åŒï¼‰ã€‚
 // ---------------------------------------------------------------------------
 LPCWSTR XGetAvDriverServiceName()
 {
@@ -620,19 +620,19 @@ static void StopAndDeleteForeignDriverService(SC_HANDLE service, const wchar_t* 
 	}
 	if (!DeleteService(service)) {
 		if (currentLogger)
-			currentLogger->LogWarn(L"ÇåÉ¨ÒÅÁôÇı¶¯·şÎñ %s É¾³ıÊ§°Ü£º%d", serviceName, GetLastError());
+			currentLogger->LogWarn(L"æ¸…æ‰«é—ç•™é©±åŠ¨æœåŠ¡ %s åˆ é™¤å¤±è´¥ï¼š%d", serviceName, GetLastError());
 		return;
 	}
 	MRegForceDeleteServiceRegkey((LPWSTR)serviceName);
 	if (!WaitForServiceRemoval(serviceName, 5000)) {
 		if (currentLogger)
-			currentLogger->LogWarn(L"ÒÅÁôÇı¶¯·şÎñ %s ÈÔ´¦ÓÚ´ıÉ¾³ı×´Ì¬£»ÖØÆôºó×Ô¶¯Çå³ı", serviceName);
+			currentLogger->LogWarn(L"é—ç•™é©±åŠ¨æœåŠ¡ %s ä»å¤„äºå¾…åˆ é™¤çŠ¶æ€ï¼›é‡å¯åè‡ªåŠ¨æ¸…é™¤", serviceName);
 	}
 }
 
-// ÇåÉ¨¾µÏñÎ»ÓÚ±¾³ÌĞòÄ¿Â¼¡¢µ«²»ÊôÓÚµ±Ç°Ëæ»úÃû£¨Ö÷Çı¶¯/AV Çı¶¯£©µÄÄÚºËÇı¶¯·şÎñ£º
-//  - ¾É°æ¹Ì¶¨Ãû DzjsTrainerDriver / JiYuAvKernel£¨º¬ÕıÔÚÔËĞĞ¡¢ĞèĞ¶ÔØÊÚÈ¨µÄ×Ô±£»¤ÊµÀı£©
-//  - ¿çÌìËæ»úÃû±ä¸üºóÒÅÁôµÄ¹Â¶ù·şÎñ
+// æ¸…æ‰«é•œåƒä½äºæœ¬ç¨‹åºç›®å½•ã€ä½†ä¸å±äºå½“å‰éšæœºåï¼ˆä¸»é©±åŠ¨/AV é©±åŠ¨ï¼‰çš„å†…æ ¸é©±åŠ¨æœåŠ¡ï¼š
+//  - æ—§ç‰ˆå›ºå®šå DzjsTrainerDriver / JiYuAvKernelï¼ˆå«æ­£åœ¨è¿è¡Œã€éœ€å¸è½½æˆæƒçš„è‡ªä¿æŠ¤å®ä¾‹ï¼‰
+//  - è·¨å¤©éšæœºåå˜æ›´åé—ç•™çš„å­¤å„¿æœåŠ¡
 static void XRemoveForeignTrainerDriverServices()
 {
 	LPCWSTR driverPath = currentApp ? currentApp->GetPartFullPath(PART_DRIVER) : nullptr;
@@ -704,16 +704,16 @@ static void XRemoveForeignTrainerDriverServices()
 		return;
 	}
 
-	// ÕıÔÚÔËĞĞµÄ¾ÉÇı¶¯´ø×Ô±£»¤£¬SCM ÎŞ·¨Ö±½ÓÍ£Ö¹£»ÏÈ¾­Éè±¸¾ä±ú×öĞ¶ÔØÊÚÈ¨£¬
-	// ÔÙÓÉÏÂÃæµÄ ControlService Íê³ÉÕæÕıµÄĞ¶ÔØ¡£
+	// æ­£åœ¨è¿è¡Œçš„æ—§é©±åŠ¨å¸¦è‡ªä¿æŠ¤ï¼ŒSCM æ— æ³•ç›´æ¥åœæ­¢ï¼›å…ˆç»è®¾å¤‡å¥æŸ„åšå¸è½½æˆæƒï¼Œ
+	// å†ç”±ä¸‹é¢çš„ ControlService å®ŒæˆçœŸæ­£çš„å¸è½½ã€‚
 	if (foreignRunning && !XDriverLoaded() && XTestDriverCanUse()) {
 		if (XOpenDriver(FALSE)) {
 			KFBeforeUnInitDriver();
 			XCloseDriverHandle();
 		}
 	}
-	// Í¬Àí£ºÈÔÔÚÔËĞĞµÄ¾É AV ÄÚºËÇı¶¯£¨×òÈÕËæ»ú·şÎñÃû»ò¾É¹Ì¶¨Ãû£©Ò²ĞèÏÈ¾­
-	// ÆäÉè±¸¾ä±úÊÚÈ¨Ğ¶ÔØ£»½öµ±½ñÃû AV ·şÎñ²»ÊÇÔËĞĞÖĞµÄÊµÀıÊ±²ÅÊÚÈ¨¡£
+	// åŒç†ï¼šä»åœ¨è¿è¡Œçš„æ—§ AV å†…æ ¸é©±åŠ¨ï¼ˆæ˜¨æ—¥éšæœºæœåŠ¡åæˆ–æ—§å›ºå®šåï¼‰ä¹Ÿéœ€å…ˆç»
+	// å…¶è®¾å¤‡å¥æŸ„æˆæƒå¸è½½ï¼›ä»…å½“ä»Šå AV æœåŠ¡ä¸æ˜¯è¿è¡Œä¸­çš„å®ä¾‹æ—¶æ‰æˆæƒã€‚
 	if (foreignRunning) AvIntegratedArmLegacyDriverForUnload();
 
 	for (size_t index = 0; index < foreignNames.size(); ++index) {
@@ -721,35 +721,35 @@ static void XRemoveForeignTrainerDriverServices()
 			serviceManager, foreignNames[index].c_str(), SERVICE_ALL_ACCESS);
 		if (service == NULL) continue;
 		if (currentLogger)
-			currentLogger->LogInfo(L"ÇåÉ¨ÒÅÁôÇı¶¯·şÎñ£º%s", foreignNames[index].c_str());
+			currentLogger->LogInfo(L"æ¸…æ‰«é—ç•™é©±åŠ¨æœåŠ¡ï¼š%s", foreignNames[index].c_str());
 		StopAndDeleteForeignDriverService(service, foreignNames[index].c_str());
 		CloseServiceHandle(service);
 	}
 	CloseServiceHandle(serviceManager);
 }
 
-//¼ÓÔØÇı¶¯
-//    lpszDriverName£ºÇı¶¯µÄ·şÎñÃû
-//    driverPath£ºÇı¶¯µÄÍêÕûÂ·¾¶
-//    lpszDisplayName£ºnullptr
+//åŠ è½½é©±åŠ¨
+//    lpszDriverNameï¼šé©±åŠ¨çš„æœåŠ¡å
+//    driverPathï¼šé©±åŠ¨çš„å®Œæ•´è·¯å¾„
+//    lpszDisplayNameï¼šnullptr
 BOOL MLoadKernelDriver(const wchar_t* lpszDriverName, const wchar_t* driverPath, const wchar_t* lpszDisplayName)
 {
 	if (lpszDriverName == nullptr || lpszDriverName[0] == L'\0' ||
 		driverPath == nullptr || driverPath[0] == L'\0') {
-		if (currentLogger) currentLogger->LogError(L"¾Ü¾ø¼ÓÔØÇı¶¯£º·şÎñÃû»ò¾µÏñÂ·¾¶Îª¿Õ");
+		if (currentLogger) currentLogger->LogError(L"æ‹’ç»åŠ è½½é©±åŠ¨ï¼šæœåŠ¡åæˆ–é•œåƒè·¯å¾„ä¸ºç©º");
 		SetLastError(ERROR_INVALID_PARAMETER);
 		return FALSE;
 	}
 	const wchar_t* extension = PathFindExtensionW(driverPath);
 	if (extension == nullptr || _wcsicmp(extension, L".sys") != 0) {
 		if (currentLogger) currentLogger->LogError(
-			L"¾Ü¾ø¼ÓÔØ·ÇÄÚºËÇı¶¯¾µÏñ£ºservice=%s path=%s",
+			L"æ‹’ç»åŠ è½½éå†…æ ¸é©±åŠ¨é•œåƒï¼šservice=%s path=%s",
 			lpszDriverName,
 			driverPath);
 		SetLastError(ERROR_BAD_EXE_FORMAT);
 		return FALSE;
 	}
-	currentLogger->LogInfo(L"×¼±¸¼ÓÔØÄÚºËÇı¶¯·şÎñ %s£¬¾µÏñÂ·¾¶ %s", lpszDriverName, driverPath);
+	currentLogger->LogInfo(L"å‡†å¤‡åŠ è½½å†…æ ¸é©±åŠ¨æœåŠ¡ %sï¼Œé•œåƒè·¯å¾„ %s", lpszDriverName, driverPath);
 	if (!DriverSignaturePolicyAllows(lpszDriverName, driverPath)) return FALSE;
 	wchar_t sDriverName[32];
 	wcscpy_s(sDriverName, lpszDriverName);
@@ -887,15 +887,15 @@ BOOL MLoadKernelDriver(const wchar_t* lpszDriverName, const wchar_t* driverPath,
 			bRet = FALSE;
 		}
 	}
-	currentLogger->LogInfo(L"ÄÚºËÇı¶¯·şÎñ¼ÓÔØ½á¹û: %s", bRet ? L"RUNNING" : L"FAILED");
-	//Àë¿ªÇ°¹Ø±Õ¾ä±ú
+	currentLogger->LogInfo(L"å†…æ ¸é©±åŠ¨æœåŠ¡åŠ è½½ç»“æœ: %s", bRet ? L"RUNNING" : L"FAILED");
+	//ç¦»å¼€å‰å…³é—­å¥æŸ„
 BeforeLeave:
 	if (hServiceDDK) CloseServiceHandle(hServiceDDK);
 	if (hServiceMgr) CloseServiceHandle(hServiceMgr);
 	return bRet;
 }
-//Ğ¶ÔØÇı¶¯
-//    szSvrName£º·şÎñÃû
+//å¸è½½é©±åŠ¨
+//    szSvrNameï¼šæœåŠ¡å
 BOOL MUnLoadKernelDriver(const wchar_t* szSvrName)
 {
 	if (hKDrv && szSvrName != nullptr && wcscmp(szSvrName, XGetDriverServiceName()) == 0) {
@@ -916,21 +916,25 @@ BOOL MUnLoadKernelDriver(const wchar_t* szSvrName)
 	hServiceMgr = OpenSCManager(NULL, NULL, SC_MANAGER_ALL_ACCESS);
 	if (hServiceMgr == NULL)
 	{
-		currentLogger->LogError2(L"UnLoad driver error in OpenSCManager : %d", GetLastError());
+		const DWORD openMgrError = GetLastError();
+		currentLogger->LogError2(L"UnLoad driver error in OpenSCManager : %d", openMgrError);
+		SetLastError(openMgrError);
 		bRet = FALSE;
 		goto BeforeLeave;
 	}
-	//´ò¿ªÇı¶¯Ëù¶ÔÓ¦µÄ·şÎñ
+	//æ‰“å¼€é©±åŠ¨æ‰€å¯¹åº”çš„æœåŠ¡
 	hServiceDDK = OpenService(hServiceMgr, szSvrName, SERVICE_ALL_ACCESS);
 	if (hServiceDDK == NULL)
 	{
-		if (GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST)
+		const DWORD openServiceError = GetLastError();
+		if (openServiceError == ERROR_SERVICE_DOES_NOT_EXIST)
 			currentLogger->LogWarn(L"UnLoad driver error because driver not load.");
-		else currentLogger->LogError2(L"UnLoad driver error in OpenService : %d", GetLastError());
+		else currentLogger->LogError2(L"UnLoad driver error in OpenService : %d", openServiceError);
+		SetLastError(openServiceError);
 		bRet = FALSE;
 		goto BeforeLeave;
 	}
-	//Í£Ö¹Çı¶¯³ÌĞò£¬Èç¹ûÍ£Ö¹Ê§°Ü£¬Ö»ÓĞÖØĞÂÆô¶¯²ÅÄÜ£¬ÔÙ¶¯Ì¬¼ÓÔØ¡£ 
+	//åœæ­¢é©±åŠ¨ç¨‹åºï¼Œå¦‚æœåœæ­¢å¤±è´¥ï¼Œåªæœ‰é‡æ–°å¯åŠ¨æ‰èƒ½ï¼Œå†åŠ¨æ€åŠ è½½ã€‚ 
 	if (!ControlService(hServiceDDK, SERVICE_CONTROL_STOP, &SvrSta)) {
 		stopError = GetLastError();
 		if (stopError == ERROR_SERVICE_NOT_ACTIVE) {
@@ -940,7 +944,7 @@ BOOL MUnLoadKernelDriver(const wchar_t* szSvrName)
 			currentLogger->LogError2(L"UnLoad driver error in ControlService : %d", stopError);
 		}
 	}
-	//¶¯Ì¬Ğ¶ÔØÇı¶¯³ÌĞò¡£
+	//åŠ¨æ€å¸è½½é©±åŠ¨ç¨‹åºã€‚
 	// Keep reusable driver services registered. DeleteService is asynchronous
 	// and can leave the service name stuck in ERROR_SERVICE_MARKED_FOR_DELETE
 	// while another handle is alive; the next load can safely reuse a stopped
@@ -949,18 +953,22 @@ BOOL MUnLoadKernelDriver(const wchar_t* szSvrName)
 		(szSvrName != nullptr && wcscmp(szSvrName, XGetAvDriverServiceName()) == 0)) {
 		if (stopError == ERROR_SERVICE_MARKED_FOR_DELETE) {
 			currentLogger->LogWarn(L"Driver service %s is already marked for deletion; reboot is required to clear the stale SCM object", szSvrName);
+			SetLastError(stopError);
 			bRet = FALSE;
 			goto BeforeLeave;
 		}
 		if (stopError != ERROR_SUCCESS) {
 			currentLogger->LogError(L"Driver service %s did not accept stop control; verify the running driver matches this EXE and its unload protocol", szSvrName);
+			SetLastError(stopError);
 			bRet = FALSE;
 			goto BeforeLeave;
 		}
 		SERVICE_STATUS status = {};
 		for (int attempt = 0; attempt < 50; ++attempt) {
 			if (!QueryServiceStatus(hServiceDDK, &status)) {
-				currentLogger->LogError2(L"QueryServiceStatus after stop failed: %d", GetLastError());
+				const DWORD queryError = GetLastError();
+				currentLogger->LogError2(L"QueryServiceStatus after stop failed: %d", queryError);
+				SetLastError(queryError);
 				bRet = FALSE;
 				goto BeforeLeave;
 			}
@@ -968,7 +976,9 @@ BOOL MUnLoadKernelDriver(const wchar_t* szSvrName)
 			Sleep(100);
 		}
 		if (status.dwCurrentState != SERVICE_STOPPED) {
+			// æœåŠ¡åœ¨ 5 ç§’å†…æ²¡æœ‰åœä¸‹æ¥ï¼šè¿™æ˜¯è¶…æ—¶ï¼Œä¸æ˜¯ã€Œå·²å­˜åœ¨ã€ä¹‹ç±»çš„æ— å…³é”™è¯¯
 			currentLogger->LogError(L"Driver service %s did not reach STOPPED state after authorized unload", szSvrName);
+			SetLastError(ERROR_SERVICE_REQUEST_TIMEOUT);
 			bRet = FALSE;
 			goto BeforeLeave;
 		}
@@ -976,13 +986,15 @@ BOOL MUnLoadKernelDriver(const wchar_t* szSvrName)
 		goto BeforeLeave;
 	}
 	if (!DeleteService(hServiceDDK)) {
-		currentLogger->LogError2(L"UnLoad driver error in DeleteService : %d", GetLastError());
+		const DWORD deleteError = GetLastError();
+		currentLogger->LogError2(L"UnLoad driver error in DeleteService : %d", deleteError);
+		SetLastError(deleteError);
 		bRet = FALSE;
 	}
 	else bDeleted = TRUE;
 
 BeforeLeave:
-	//Àë¿ªÇ°¹Ø±Õ´ò¿ªµÄ¾ä±ú
+	//ç¦»å¼€å‰å…³é—­æ‰“å¼€çš„å¥æŸ„
 	if (hServiceDDK) CloseServiceHandle(hServiceDDK);
 	if (hServiceMgr) CloseServiceHandle(hServiceMgr);
 
@@ -1006,54 +1018,54 @@ BOOL MUnLoadDriverServiceWithMessage(const wchar_t* szSvrName)
 	if (hServiceMgr == NULL)
 	{
 		lastErr = GetLastError();
-		FAST_STR_BINDER(str, L"Ğ¶ÔØÇı¶¯´íÎó£¬´ò¿ªÇı¶¯¹ÜÀí´íÎó£º%s\nÇë³¢ÊÔÒÔ¹ÜÀíÔ±Éí·İÔËĞĞÈí¼ş¡£", 128, SysHlp::ConvertErrorCodeToString(lastErr));
-		MessageBox(NULL, str, L"DzjsTrainer - ´íÎó", MB_ICONERROR);
+		FAST_STR_BINDER(str, L"å¸è½½é©±åŠ¨é”™è¯¯ï¼Œæ‰“å¼€é©±åŠ¨ç®¡ç†é”™è¯¯ï¼š%s\nè¯·å°è¯•ä»¥ç®¡ç†å‘˜èº«ä»½è¿è¡Œè½¯ä»¶ã€‚", 128, SysHlp::ConvertErrorCodeToString(lastErr));
+		MessageBox(NULL, str, L"DzjsTrainer - é”™è¯¯", MB_ICONERROR);
 		bRet = FALSE;
 		goto BeforeLeave;
 	}
-	//´ò¿ªÇı¶¯Ëù¶ÔÓ¦µÄ·şÎñ
+	//æ‰“å¼€é©±åŠ¨æ‰€å¯¹åº”çš„æœåŠ¡
 	hServiceDDK = OpenService(hServiceMgr, szSvrName, SERVICE_ALL_ACCESS);
 	if (hServiceDDK == NULL)
 	{
 		lastErr = GetLastError();
 		if (lastErr == ERROR_SERVICE_DOES_NOT_EXIST) 
-			MessageBox(NULL, L"Çı¶¯ÒÑĞ¶ÔØ²¢É¾³ı£¬Çë²»ÒªÖØ¸´²Ù×÷", L"DzjsTrainer - ÌáÊ¾", MB_ICONEXCLAMATION);
+			MessageBox(NULL, L"é©±åŠ¨å·²å¸è½½å¹¶åˆ é™¤ï¼Œè¯·ä¸è¦é‡å¤æ“ä½œ", L"DzjsTrainer - æç¤º", MB_ICONEXCLAMATION);
 		else if ( lastErr == ERROR_SERVICE_MARKED_FOR_DELETE) 
-			MessageBox(NULL, L"Ã»ÓĞÔÚÕâÌ¨¼ÆËã»úÉÏÕÒµ½ÕÒµ½Çı¶¯£¬¿ÉÄÜÊÇÇı¶¯ÒÑ¾­±»Ğ¶ÔØÁË", L"DzjsTrainer - ÌáÊ¾", MB_ICONEXCLAMATION);
+			MessageBox(NULL, L"æ²¡æœ‰åœ¨è¿™å°è®¡ç®—æœºä¸Šæ‰¾åˆ°æ‰¾åˆ°é©±åŠ¨ï¼Œå¯èƒ½æ˜¯é©±åŠ¨å·²ç»è¢«å¸è½½äº†", L"DzjsTrainer - æç¤º", MB_ICONEXCLAMATION);
 		else {
-			FAST_STR_BINDER(str, L"Ğ¶ÔØÇı¶¯´íÎó£¬´ò¿ªÇı¶¯´íÎó£º%s", 128, SysHlp::ConvertErrorCodeToString(lastErr));
-			MessageBox(NULL, str, L"DzjsTrainer - ´íÎó", MB_ICONERROR);
+			FAST_STR_BINDER(str, L"å¸è½½é©±åŠ¨é”™è¯¯ï¼Œæ‰“å¼€é©±åŠ¨é”™è¯¯ï¼š%s", 128, SysHlp::ConvertErrorCodeToString(lastErr));
+			MessageBox(NULL, str, L"DzjsTrainer - é”™è¯¯", MB_ICONERROR);
 		}
 		bRet = FALSE;
 		goto BeforeLeave;
 	}
-	//Í£Ö¹Çı¶¯³ÌĞò£¬Èç¹ûÍ£Ö¹Ê§°Ü£¬Ö»ÓĞÖØĞÂÆô¶¯²ÅÄÜ£¬ÔÙ¶¯Ì¬¼ÓÔØ¡£ 
+	//åœæ­¢é©±åŠ¨ç¨‹åºï¼Œå¦‚æœåœæ­¢å¤±è´¥ï¼Œåªæœ‰é‡æ–°å¯åŠ¨æ‰èƒ½ï¼Œå†åŠ¨æ€åŠ è½½ã€‚ 
 	if (!ControlService(hServiceDDK, SERVICE_CONTROL_STOP, &SvrSta)) {
 		lastErr = GetLastError();
 		if (lastErr == ERROR_SERVICE_MARKED_FOR_DELETE) {
-			MessageBox(NULL, L"Çı¶¯ÒÑĞ¶ÔØ²¢É¾³ı£¬Çë²»ÒªÖØ¸´²Ù×÷", L"DzjsTrainer - ÌáÊ¾", MB_ICONEXCLAMATION);
+			MessageBox(NULL, L"é©±åŠ¨å·²å¸è½½å¹¶åˆ é™¤ï¼Œè¯·ä¸è¦é‡å¤æ“ä½œ", L"DzjsTrainer - æç¤º", MB_ICONEXCLAMATION);
 			bRet = FALSE;
 			goto BeforeLeave;
 		}
 		else {
-			FAST_STR_BINDER(str, L"Ğ¶ÔØÇı¶¯´íÎó£¬Í£Ö¹Çı¶¯Ê§°Ü£º%s", 128, SysHlp::ConvertErrorCodeToString(lastErr));
-			MessageBox(NULL, str, L"DzjsTrainer - ´íÎó", MB_ICONERROR);
+			FAST_STR_BINDER(str, L"å¸è½½é©±åŠ¨é”™è¯¯ï¼Œåœæ­¢é©±åŠ¨å¤±è´¥ï¼š%s", 128, SysHlp::ConvertErrorCodeToString(lastErr));
+			MessageBox(NULL, str, L"DzjsTrainer - é”™è¯¯", MB_ICONERROR);
 		}
 	}
-	//¶¯Ì¬Ğ¶ÔØÇı¶¯³ÌĞò¡£ 
+	//åŠ¨æ€å¸è½½é©±åŠ¨ç¨‹åºã€‚ 
 	if (!DeleteService(hServiceDDK)) {
 		lastErr = GetLastError();
 		if (lastErr == ERROR_SERVICE_MARKED_FOR_DELETE) 
-			MessageBox(NULL, L"Çı¶¯ÒÑĞ¶ÔØ²¢É¾³ı£¬Çë²»ÒªÖØ¸´²Ù×÷", L"DzjsTrainer - ÌáÊ¾", MB_ICONEXCLAMATION);
+			MessageBox(NULL, L"é©±åŠ¨å·²å¸è½½å¹¶åˆ é™¤ï¼Œè¯·ä¸è¦é‡å¤æ“ä½œ", L"DzjsTrainer - æç¤º", MB_ICONEXCLAMATION);
 		else {
-			FAST_STR_BINDER(str, L"Ğ¶ÔØÇı¶¯´íÎó£¬É¾³ıÇı¶¯´íÎó£º%s", 128, SysHlp::ConvertErrorCodeToString(lastErr));
-			MessageBox(NULL, str, L"DzjsTrainer - ´íÎó", MB_ICONERROR);
+			FAST_STR_BINDER(str, L"å¸è½½é©±åŠ¨é”™è¯¯ï¼Œåˆ é™¤é©±åŠ¨é”™è¯¯ï¼š%s", 128, SysHlp::ConvertErrorCodeToString(lastErr));
+			MessageBox(NULL, str, L"DzjsTrainer - é”™è¯¯", MB_ICONERROR);
 			bRet = FALSE;
 		}
 	}
 	else bDeleted = TRUE;
 BeforeLeave:
-	//Àë¿ªÇ°¹Ø±Õ´ò¿ªµÄ¾ä±ú
+	//ç¦»å¼€å‰å…³é—­æ‰“å¼€çš„å¥æŸ„
 	if (hServiceDDK) CloseServiceHandle(hServiceDDK);
 	if (hServiceMgr) CloseServiceHandle(hServiceMgr);
 
@@ -1061,7 +1073,7 @@ BeforeLeave:
 
 	return bRet;
 }
-//´ò¿ªÇı¶¯
+//æ‰“å¼€é©±åŠ¨
 BOOL XOpenDriver(BOOL startGuard)
 {
 	HANDLE driverHandle = CreateFile(L"\\\\.\\JKRK",
@@ -1146,7 +1158,7 @@ BOOL XTryReuseInstalledDriver()
 	if (XDriverLoaded()) return TRUE;
 	if (!XTestDriverCanUse()) return FALSE;
 
-	// ÏÈÇå×ßÖ¸Ïò±¾Ä¿Â¼µÄÒÅÁô/ÍâÀ´Çı¶¯·şÎñ£¨¾É¹Ì¶¨Ãû¡¢Ëæ»úÃû±ä¸üºóµÄ¹Â¶ù£©
+	// å…ˆæ¸…èµ°æŒ‡å‘æœ¬ç›®å½•çš„é—ç•™/å¤–æ¥é©±åŠ¨æœåŠ¡ï¼ˆæ—§å›ºå®šåã€éšæœºåå˜æ›´åçš„å­¤å„¿ï¼‰
 	// Disabled: never delete services discovered by heuristic.
 
 	SC_HANDLE serviceManager = OpenSCManager(NULL, NULL, SC_MANAGER_CONNECT);
@@ -1200,11 +1212,11 @@ BOOL XTryReuseInstalledDriver()
 BOOL XTestDriverCanUse() {
 
 	if (!SysHlp::Is64BitOS()) {
-		currentLogger->LogWarn(L"64 Î»Çı¶¯²»Ö§³Ö 32 Î» Windows");
+		currentLogger->LogWarn(L"64 ä½é©±åŠ¨ä¸æ”¯æŒ 32 ä½ Windows");
 		return FALSE;
 	}
 	if (!SysHlp::IsRunasAdmin()) {
-		currentLogger->LogWarn(L"Òª¼ÓÔØÇı¶¯£¬ÇëÒÔ¹ÜÀíÔ±Éí·İÔËĞĞ±¾³ÌĞò");
+		currentLogger->LogWarn(L"è¦åŠ è½½é©±åŠ¨ï¼Œè¯·ä»¥ç®¡ç†å‘˜èº«ä»½è¿è¡Œæœ¬ç¨‹åº");
 		return FALSE;
 	}
 
@@ -1231,10 +1243,10 @@ BOOL XLoadDriver() {
 			currentLogger->Log(L"Windows Bulid version %d", sysBulidVersion);
 			KFSendDriverinitParam(isXp, isWin7, sysBulidVersion);
 			
-			currentLogger->LogInfo(L"Çı¶¯¼ÓÔØ³É¹¦");
+			currentLogger->LogInfo(L"é©±åŠ¨åŠ è½½æˆåŠŸ");
 			return TRUE;
 		}
-		else currentLogger->LogWarn2(L"Çı¶¯¼ÓÔØ³É¹¦£¬µ«´ò¿ªÇı¶¯Ê§°Ü");
+		else currentLogger->LogWarn2(L"é©±åŠ¨åŠ è½½æˆåŠŸï¼Œä½†æ‰“å¼€é©±åŠ¨å¤±è´¥");
 	}
 
 	return FALSE;
@@ -1258,10 +1270,16 @@ BOOL XUnLoadDriver()
 {
 	if (!XDriverLoaded()) {
 		currentLogger->LogError(L"Driver unload authorization requires an open driver handle");
+		SetLastError(ERROR_INVALID_HANDLE);
 		return FALSE;
 	}
 	if (!KFBeforeUnInitDriver()) {
-		currentLogger->LogError(L"Driver unload authorization failed; service stop was not attempted");
+		// å¿…é¡»åœ¨è°ƒç”¨æ–¹å†™æ—¥å¿—ä¹‹å‰æŠŠé”™è¯¯ç å–å‡ºæ¥ï¼šå†™æ—¥å¿—ä¼šè¦†ç›– GetLastErrorï¼Œ
+		// ä¹‹å‰è¿™é‡Œæ¼æ‰ä¿å­˜ï¼Œä¸Šå±‚è¯»åˆ°çš„ 183 æ˜¯æ—¥å¿—æ“ä½œç•™ä¸‹çš„åƒåœ¾å€¼ã€‚
+		const DWORD authorizeError = GetLastError();
+		currentLogger->LogError(L"Driver unload authorization failed; service stop was not attempted (error=%lu)",
+			static_cast<unsigned long>(authorizeError));
+		SetLastError(authorizeError);
 		return FALSE;
 	}
 	// The authorization IOCTL must be sent while the device handle is open.

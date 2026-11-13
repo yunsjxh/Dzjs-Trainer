@@ -26,10 +26,10 @@
        outputs during a parallel build. The .exe still lands in $(OutDir) because
        DzjsTrainer.vcxproj embeds it from there. -->
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
-    <IntDir>$(SolutionDir)$(Configuration)\obj-updater-exe\</IntDir>
+    <IntDir>$(SolutionDir)$(Configuration)\obj-updater-exe-$(Platform)\</IntDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
-    <IntDir>$(SolutionDir)$(Configuration)\obj-updater-exe\</IntDir>
+    <IntDir>$(SolutionDir)$(Configuration)\obj-updater-exe-$(Platform)\</IntDir>
   </PropertyGroup>
   <ImportGroup Label="ExtensionSettings" />
   <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'"><Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" /></ImportGroup>

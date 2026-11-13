@@ -1,4 +1,4 @@
-#include "stdafx.h"
+ï»¿#include "stdafx.h"
 #include "JyUdpAttack.h"
 #include "NetUtils.h"
 #include "Logger.h"
@@ -104,7 +104,7 @@ void JyUdpAttack::TaskFeedbackMessage(struct SendTask* task, std::wstring* msg) 
 DWORD __stdcall JyUdpAttack::SendThread(void* data) {
     auto task = (SendTask*)data;
 
-    TaskFeedbackMessage(task, new std::wstring(L"¿ªÊ¼·¢ËÍ"));
+    TaskFeedbackMessage(task, new std::wstring(L"å¼€å§‹å‘é€"));
 
     int sockfd;
     struct sockaddr_in dest_addr;
@@ -116,7 +116,7 @@ DWORD __stdcall JyUdpAttack::SendThread(void* data) {
     dest_addr.sin_family = AF_INET;
     dest_addr.sin_port = htons((u_short)task->port);
 
-    //·¢UDP°ü
+    //å‘UDPåŒ…
     sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sockfd > 0) {
 
@@ -127,14 +127,14 @@ DWORD __stdcall JyUdpAttack::SendThread(void* data) {
         if ((sendBytes = sendto(sockfd,
             (const char*)task->data, sizeof(task->data), 0,
             (sockaddr*)&dest_addr, sizeof(sockaddr))) == -1)
-            TaskFeedbackMessage(task, FormatStringPtr(L"sendÊ§°Ü: %d", errno));
+            TaskFeedbackMessage(task, FormatStringPtr(L"sendå¤±è´¥: %d", errno));
         else 
-            TaskFeedbackMessage(task, FormatStringPtr(L"·¢ËÍ³É¹¦¡£%d ×Ö½Ú", sendBytes));
+            TaskFeedbackMessage(task, FormatStringPtr(L"å‘é€æˆåŠŸã€‚%d å­—èŠ‚", sendBytes));
            
         closesocket(sockfd);
     }
     else 
-        TaskFeedbackMessage(task, FormatStringPtr(L"socketÊ§°Ü: %d", errno));
+        TaskFeedbackMessage(task, FormatStringPtr(L"socketå¤±è´¥: %d", errno));
 
     delete task;
     return 0;
@@ -186,7 +186,7 @@ DWORD __stdcall JyUdpAttack::CheckStudentMainTCPPortThread(void* data) {
         {
             MIB_TCPROW_OWNER_PID* current = &netProcess->table[i];
             if (current->dwState == MIB_TCP_STATE_LISTEN) {
-                //²éÕÒTCPÁ¬½Ó£¬±¾µØµØÖ·ÊÇ127.0.0.1
+                //æŸ¥æ‰¾TCPè¿žæŽ¥ï¼Œæœ¬åœ°åœ°å€æ˜¯127.0.0.1
                 if (current->dwOwningPid == studentMainPid && current->dwLocalAddr == s.s_addr)
                 {
                     SendMessage(_this->checkStudentMainTCPPortReceivehhWnd, WM_MY_GET_SM_TICP_PORT_FINISH, (WPARAM)ntohs((u_short)current->dwLocalPort), NULL);

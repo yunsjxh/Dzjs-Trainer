@@ -74,17 +74,21 @@
     <LinkIncremental>true</LinkIncremental>
     <LibraryPath>$(SolutionDir)$(Configuration)\;$(VC_LibraryPath_x86);$(WindowsSDK_LibraryPath_x86)</LibraryPath>
     <IncludePath>$(VC_IncludePath);$(WindowsSDK_IncludePath);$(MSBuildProjectDirectory);$(MSBuildProjectDirectory)\curl;$(MSBuildProjectDirectory)\curl\curl</IncludePath>
+    <IntDir>$(SolutionDir)$(Configuration)\obj-updater-lib-$(Platform)\</IntDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <LinkIncremental>true</LinkIncremental>
+    <IntDir>$(SolutionDir)$(Configuration)\obj-updater-lib-$(Platform)\</IntDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <LinkIncremental>false</LinkIncremental>
     <IncludePath>$(VC_IncludePath);$(WindowsSDK_IncludePath);$(MSBuildProjectDirectory);$(MSBuildProjectDirectory)\curl;$(MSBuildProjectDirectory)\curl\curl</IncludePath>
     <LibraryPath>$(SolutionDir)$(Configuration)\;$(VC_LibraryPath_x86);$(WindowsSDK_LibraryPath_x86)</LibraryPath>
+    <IntDir>$(SolutionDir)$(Configuration)\obj-updater-lib-$(Platform)\</IntDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <LinkIncremental>false</LinkIncremental>
+    <IntDir>$(SolutionDir)$(Configuration)\obj-updater-lib-$(Platform)\</IntDir>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
@@ -178,6 +182,7 @@
     <ClInclude Include="UpdaterManifest.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="BuiltinUpdate.cpp" />
     <ClCompile Include="DzjsTrainerUpdater.cpp" />
     <ClCompile Include="UpdaterManifest.cpp" />
     <ClCompile Include="stdafx.cpp">

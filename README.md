@@ -1,6 +1,6 @@
 # Dzjs Trainer
 
-当前版本：`v1.0.2`
+当前版本：`v1.0.3`
 
 Dzjs Trainer 是基于 JiYu Trainer 翻新和持续维护的 Windows 桌面项目，面向经授权的教学机房、设备维护与兼容性研究场景。
 
@@ -70,9 +70,44 @@ MSBuild.exe DzjsTrainerDriver\DzjsTrainerDriver.vcxproj /t:Build /p:Configuratio
 
 构建产物会写入被 Git 忽略的 `Release` 目录，不应提交到源码仓库。
 
+### 更新通道公钥
+
+`DzjsTrainerUpdater` 需要一把内嵌的 RSA 公钥来验证服务器返回的时效票据。仓库里不含真实公钥，只有 `DzjsTrainerUpdater/UpdaterTicketKey.h.example` —— 示例公钥，对应私钥 `update-server/ticket-sign.pem.example` 是公开的。
+
+`UpdaterTicket.h` 通过 `__has_include` 回退到 `.example`，所以克隆下来直接就能编译。这样编出来的程序连不上正式更新服务器，会明确提示「此版本内置的是开源示例公钥」—— 这是刻意的失败方向，不是缺陷。
+
+要构建能接收正式更新的发行版，先把自己的公钥生成进去：
+
+```powershell
+python tools\make-ticket-key.py
+```
+
+脚本读取 `update-server/ticket-sign.pub.der`，生成被 Git 忽略的 `DzjsTrainerUpdater/UpdaterTicketKey.h`。加 `--check` 可确认现有头文件没有和 DER 脱节。
+
+这份 DER 同样不进版本库 —— 否则任何人都能一键编出一个连得上正式服务器的客户端，占位符就白做了。它从私钥导出：
+
+```powershell
+openssl pkey -in update-server\ticket-sign.pem -pubout -outform DER -out update-server\ticket-sign.pub.der
+```
+
 ## 驱动签名与发布
 
 仓库不包含发布者的代码签名证书、私有解锁密钥或实际解锁令牌。`DzjsTrainerDriver.unlock.enc.sample` 是公开构建所需的占位资源。
+
+> **注意：用上面的 MSBuild 命令构建出来的 exe，无法卸载自己加载的驱动。**
+>
+> `DzjsTrainer.vcxproj` 把 `IDR_DRIVER_UNLOAD_TOKEN` 固定绑定到
+> `$(SolutionDir)DzjsTrainerDriver.unlock.enc.sample`，而该占位令牌与本次构建产出的
+> `.sys` 并不匹配。驱动会拒绝卸载，日志中出现：
+>
+> ```
+> [E] Embedded unload token is missing, invalid, or cannot be decrypted
+> [E] Driver unload authorization failed; service stop was not attempted
+> ```
+>
+> 这是预期行为，不是缺陷。要获得可卸载的构建，必须走下面的签名流程，让
+> `tools\Complete-DriverSigning.ps1` 针对当次驱动重新生成令牌并回嵌主程序。
+> 开发调试阶段如需卸载，可手工 `sc stop <驱动服务名>` 后重启。
 
 发布维护者需要自行完成以下工作：
 

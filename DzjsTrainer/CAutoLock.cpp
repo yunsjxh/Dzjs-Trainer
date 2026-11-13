@@ -1,10 +1,10 @@
-#include "stdafx.h"
+ï»¿#include "stdafx.h"
 #include "CAutoLock.h"
 
 CAutoLock::CAutoLock()
 {
     InitializeCriticalSection(&m_Section);
-    //Lock();Èç¹ûÊÇÓÃµÄÊ±ºòÖ»¶¨ÒåËø¶ÔÏó£¬¿ÉÒÔ²»ÊÖ¶¯½øÈëÁÙ½çÇøºÍÍË³öÁÙ½çÇø
+    //Lock();å¦‚æœæ˜¯ç”¨çš„æ—¶å€™åªå®šä¹‰é”å¯¹è±¡ï¼Œå¯ä»¥ä¸æ‰‹åŠ¨è¿›å…¥ä¸´ç•ŒåŒºå’Œé€€å‡ºä¸´ç•ŒåŒº
 }
 CAutoLock::~CAutoLock()
 {

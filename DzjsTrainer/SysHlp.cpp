@@ -1,4 +1,4 @@
-#include "stdafx.h"
+ï»¿#include "stdafx.h"
 #include "SysHlp.h"
 #include "NtHlp.h"
 #include "VersionHelpers.h"
@@ -136,15 +136,15 @@ bool SysHlp::EnableDebugPriv(const wchar_t * name)
 	HANDLE hToken;
 	TOKEN_PRIVILEGES tp;
 	LUID luid;
-	//´ò¿ª½ø³ÌÁîÅÆ»·
+	//æ‰“å¼€è¿›ç¨‹ä»¤ç‰Œç¯
 	OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken);
-	//»ñµÃ½ø³Ì±¾µØÎ¨Ò»ID
+	//è·å¾—è¿›ç¨‹æœ¬åœ°å”¯ä¸€ID
 	LookupPrivilegeValue(NULL, name, &luid);
 
 	tp.PrivilegeCount = 1;
 	tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
 	tp.Privileges[0].Luid = luid;
-	//µ÷ÕûÈ¨ÏŞ
+	//è°ƒæ•´æƒé™
 	return AdjustTokenPrivileges(hToken, 0, &tp, sizeof(TOKEN_PRIVILEGES), NULL, NULL);
 }
 bool SysHlp::IsRunasAdmin()
@@ -232,7 +232,7 @@ bool SysHlp::ChooseFileSingal(HWND hWnd, LPCWSTR startDir, LPCWSTR title, LPCWST
 		ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
 		if (GetOpenFileName(&ofn))
 		{
-			//ÏÔÊ¾Ñ¡ÔñµÄÎÄ¼ş¡£ szFile
+			//æ˜¾ç¤ºé€‰æ‹©çš„æ–‡ä»¶ã€‚ szFile
 			wcscpy_s((LPWSTR)strrs, bufsize, szFile);
 			return TRUE;
 		}

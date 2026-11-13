@@ -204,8 +204,10 @@ BOOL KFBeforeUnInitDriver()
 	{
 		JDRV_UNLOAD_TOKEN token = {};
 		if (!LoadEmbeddedUnloadToken(&token)) {
-			SetLastError(ERROR_INVALID_DATA);
+			// 先写日志再设置错误码：LogError 内部会调 WriteFile 等 API，
+			// 会把 GetLastError 覆盖掉，调用方就再也读不到真实原因了。
 			currentLogger->LogError(L"Embedded unload token is missing, invalid, or cannot be decrypted");
+			SetLastError(ERROR_INVALID_DATA);
 			return false;
 		}
 		DWORD ReturnLength = 0;
@@ -220,7 +222,9 @@ BOOL KFBeforeUnInitDriver()
 			NULL)) {
 			return TRUE;
 		}
-		currentLogger->LogError(L"DeviceIoControl CTL_UNINIT unlock token rejected: %d", GetLastError());
+		const DWORD uninitError = GetLastError();
+		currentLogger->LogError(L"DeviceIoControl CTL_UNINIT unlock token rejected: %d", uninitError);
+		SetLastError(uninitError);
 	}
 	else {
 		SetLastError(ERROR_INVALID_HANDLE);

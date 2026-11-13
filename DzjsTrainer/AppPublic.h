@@ -1,11 +1,11 @@
-#pragma once
+﻿#pragma once
 
 #include "Logger.h"
 #include "SettingHlp.h"
 #include "TrainerWorker.h" 
 #include "JyUdpAttack.h" 
 
-#define CURRENT_VERSION "1.0.3"
+#define CURRENT_VERSION "1.0.4"
 
 #define FAST_STR_BINDER(str, fstr, size, ...) WCHAR str[size]; swprintf_s(str, fstr, __VA_ARGS__)
 

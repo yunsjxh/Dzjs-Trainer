@@ -26,9 +26,10 @@ else {
 }
 $driverPackage = Split-Path $driverOutput -Parent
 $resourcePackage = Join-Path $solutionRoot 'Release\DzjsTrainerDriver'
-$unlockTokenSource = Join-Path $solutionRoot 'DzjsTrainerDriver.unlock.enc.sample'
 $unlockTokenDestination = Join-Path $resourcePackage 'DzjsTrainerDriver.unlock.enc'
+$unlockTokenMaterial = Join-Path $solutionRoot 'tools\unlock-key-material\DzjsTrainerDriver.sys.unlock'
 $mainProject = Join-Path $solutionRoot 'DzjsTrainer\DzjsTrainer.vcxproj'
+$resourceScript = Join-Path $solutionRoot 'DzjsTrainer\DzjsTrainer.rc'
 $mainExecutable = Join-Path $solutionRoot 'Release\DzjsTrainer.exe'
 
 foreach ($path in @($driverOutput, $mainProject)) {
@@ -36,8 +37,20 @@ foreach ($path in @($driverOutput, $mainProject)) {
         throw "Missing required file: $path"
     }
 }
-if (-not (Test-Path -LiteralPath $unlockTokenSource)) {
-    throw "Missing public unload-token placeholder: $unlockTokenSource"
+if (Test-Path -LiteralPath $unlockTokenMaterial) {
+    $protectScript = Join-Path $PSScriptRoot 'Protect-DriverUnlockToken.ps1'
+    if (-not (Test-Path -LiteralPath $protectScript)) {
+        throw "Missing unload-token protection script: $protectScript"
+    }
+    & powershell -ExecutionPolicy Bypass -File $protectScript `
+        -InputPath $unlockTokenMaterial `
+        -OutputPath $unlockTokenDestination
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unload-token encryption failed with exit code $LASTEXITCODE"
+    }
+}
+if (-not (Test-Path -LiteralPath $unlockTokenDestination)) {
+    throw "Missing protected unload token: $unlockTokenDestination"
 }
 
 $driverSignature = Get-AuthenticodeSignature -LiteralPath $driverOutput
@@ -80,8 +93,7 @@ foreach ($destination in @($resourcePackage)) {
     foreach ($copy in @(
         @{ Source = $driverOutput; Destination = $driverDestination },
         @{ Source = $infSource; Destination = $infDestination },
-        @{ Source = $catalog; Destination = $catalogDestination },
-        @{ Source = $unlockTokenSource; Destination = $unlockTokenDestination }
+        @{ Source = $catalog; Destination = $catalogDestination }
     )) {
         if ([IO.Path]::GetFullPath($copy.Source) -ne [IO.Path]::GetFullPath($copy.Destination)) {
             Copy-Item -LiteralPath $copy.Source -Destination $copy.Destination -Force
@@ -89,9 +101,30 @@ foreach ($destination in @($resourcePackage)) {
     }
 }
 
-& $msbuild $mainProject '/t:Rebuild' '/p:Configuration=Release' '/p:Platform=Win32' "/p:SolutionDir=$solutionRoot\" '/p:BuildProjectReferences=false' '/m' '/v:minimal'
-if ($LASTEXITCODE -ne 0) {
-    throw "Main executable build failed with exit code $LASTEXITCODE"
+$projectBytes = [IO.File]::ReadAllBytes($mainProject)
+$resourceBytes = [IO.File]::ReadAllBytes($resourceScript)
+try {
+    $projectText = [Text.UTF8Encoding]::new($false, $true).GetString($projectBytes)
+    $projectText = $projectText.Replace(
+        '$(SolutionDir)DzjsTrainerDriver.unlock.enc.sample',
+        '$(SolutionDir)$(Configuration)\DzjsTrainerDriver\DzjsTrainerDriver.unlock.enc')
+    [IO.File]::WriteAllBytes($mainProject, [Text.UTF8Encoding]::new($true).GetPreamble() + [Text.UTF8Encoding]::new($false, $true).GetBytes($projectText))
+
+    $resourceEncoding = [Text.UnicodeEncoding]::new($false, $true)
+    $resourceText = $resourceEncoding.GetString($resourceBytes)
+    $resourceText = $resourceText.Replace(
+        '..\\DzjsTrainerDriver.unlock.enc.sample',
+        '..\\Release\\DzjsTrainerDriver\\DzjsTrainerDriver.unlock.enc')
+    [IO.File]::WriteAllBytes($resourceScript, $resourceEncoding.GetPreamble() + $resourceEncoding.GetBytes($resourceText))
+
+    & $msbuild $mainProject '/t:Rebuild' '/p:Configuration=Release' '/p:Platform=Win32' "/p:SolutionDir=$solutionRoot\" '/p:BuildProjectReferences=false' '/m' '/v:minimal'
+    if ($LASTEXITCODE -ne 0) {
+        throw "Main executable build failed with exit code $LASTEXITCODE"
+    }
+}
+finally {
+    [IO.File]::WriteAllBytes($mainProject, $projectBytes)
+    [IO.File]::WriteAllBytes($resourceScript, $resourceBytes)
 }
 
 $readerSource = @'

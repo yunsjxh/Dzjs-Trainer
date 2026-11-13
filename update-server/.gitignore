@@ -1,2 +1,23 @@
 manifest.json
 releases/
+
+# 更新通道的 RSA 签名私钥。绝不能进版本库。
+# 泄漏的后果是别人能签出被客户端采信的票据，等于更新通道完全失守。
+# 客户端里只嵌公钥，公钥泄漏不会带来任何签发能力。
+ticket-sign.pem
+ticket-sign.php
+
+# 旧版的对称 HMAC 密钥。换成 RSA 签名后已不再使用，留着这两条是防历史文件
+# 被误提交（在旧版本里它们是有效的签发凭据）。
+ticket-key.bin
+ticket-key.php
+
+# 公钥本身不保密，但它不进版本库：让仓库里不存在任何"能一键生成可连正式服务器的
+# 客户端"的材料。开源携带的是 DzjsTrainerUpdater/UpdaterTicketKey.h.example
+# （示例公钥，对应私钥 ticket-sign.pem.example 是公开的）。
+# 构建机上这两个文件仍然存在，只是不提交。
+ticket-sign.pub.der
+ticket-sign.pub.pem
+
+# 示例材料是故意跟踪的，别被上面的规则或通配误伤。
+!ticket-sign.pem.example

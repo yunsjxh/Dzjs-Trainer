@@ -6,6 +6,10 @@
 
 #include "stdafx.h"
 #include "UpdaterManifest.h"
+#include <winhttp.h>
+#include "UpdaterTrust.h"
+#include "UpdaterTicket.h"
+#pragma comment(lib, "Winhttp.lib")
 #include "../DzjsTrainer/AppPublic.h"
 #include "../DzjsTrainer/DzjsTrainer.h"
 #include <vector>
@@ -36,15 +40,6 @@ static const wchar_t* const kUpdateHostSuffix =
 	L".dzjstrainer.xn--9kq396ceqaq4si9m.cn/update-server/update.php";
 
 // ---------------------------------------------------------------- text helpers
-
-static std::string Trim(std::string text)
-{
-	size_t begin = 0;
-	while (begin < text.size() && static_cast<unsigned char>(text[begin]) <= ' ') ++begin;
-	size_t end = text.size();
-	while (end > begin && static_cast<unsigned char>(text[end - 1]) <= ' ') --end;
-	return text.substr(begin, end - begin);
-}
 
 static std::wstring WideFromUtf8(const std::string& text)
 {
@@ -95,86 +90,196 @@ static std::vector<std::wstring> UpdateEndpoints()
 	return endpoints;
 }
 
+std::wstring ApexBaseUrl()
+{
+	return ApexEndpoint();
+}
+
 // ---------------------------------------------------------------- HTTP
 
-// 打开一个 WinINet 会话。accessType 先试 PRECONFIG（沿用系统代理设置），
-// 失败再试 DIRECT。
+// 用 WinHTTP 而不是 WinINet。
 //
-// 为什么要两档：主程序是提权进程，实测在部分机器上 PRECONFIG 会直接
-// ERROR_INTERNET_CANNOT_CONNECT(0x800C0005) —— 读不到当前用户的 Internet 配置。
-// 同时显式启用 TLS 1.2：默认协议列表来自注册表，提权/新用户配置下可能拿不到。
-static HINTERNET OpenSession(DWORD accessType)
+// 原因写在 DzjsTrainerUpdater.h 里：主程序（GUI 进程）里调 WinINet 会直接
+// ERROR_INTERNET_CANNOT_CONNECT，历史上就是为了绕开它才把探测工作推给独立的
+// 更新器进程；那个进程又会 AllocConsole 弹一个黑窗口。换成 WinHTTP 后探测可以
+// 在本进程里完成，既不依赖子进程，也不会再闪黑框。
+static HINTERNET OpenWinHttpSession()
 {
-	HINTERNET session = InternetOpenW(L"DzjsTrainer/1.0", accessType, nullptr, nullptr, 0);
+	HINTERNET session = WinHttpOpen(L"DzjsTrainer/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+		WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
 	if (!session) return nullptr;
-	DWORD timeout = 8000;
-	InternetSetOptionW(session, INTERNET_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
-	InternetSetOptionW(session, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
-	// 显式启用 TLS 1.2。默认协议列表来自注册表，提权进程或新用户配置下可能拿不到。
-	// 84 = INTERNET_OPTION_SECURE_PROTOCOLS；0x800 = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2
-	// （WinINet 与 WinHTTP 共用这个位值）。这两个常量在部分 SDK 里没有声明，直接写数值。
-	const DWORD kOptionSecureProtocols = 84;
-	const DWORD kProtocolTls12 = 0x00000800;
-	DWORD protocols = kProtocolTls12;
-	InternetSetOptionW(session, kOptionSecureProtocols, &protocols, sizeof(protocols));
+	WinHttpSetTimeouts(session, 8000, 8000, 8000, 8000);
 	return session;
 }
 
-static bool HttpGetWOnce(const std::wstring& url, DWORD accessType, std::string& body)
+static bool HttpGetWOnce(const std::wstring& url, std::string& body, std::string& ticket)
 {
 	body.clear();
-	HINTERNET session = OpenSession(accessType);
-	if (!session) return false;
-
-	// 证书校验保持开启：端点用有效的通配证书，安装包哈希也走这条通道。
-	HINTERNET request = InternetOpenUrlW(session, url.c_str(), nullptr, 0,
-		INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_SECURE, 0);
-	bool ok = false;
-	if (request) {
-		char buffer[8192];
-		DWORD read = 0;
-		while (InternetReadFile(request, buffer, sizeof(buffer), &read) && read)
-			body.append(buffer, read);
-		DWORD status = 0, statusSize = sizeof(status);
-		const BOOL queried = HttpQueryInfoW(request, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER,
-			&status, &statusSize, nullptr);
-		if (!queried)
-			LogTrace(L"更新探测：取状态码失败 err=%lu url=%s", GetLastError(), url.c_str());
-		else if (status < 200 || status >= 300)
-			LogTrace(L"更新探测：HTTP %lu url=%s", status, url.c_str());
-		ok = queried && status >= 200 && status < 300;
-		InternetCloseHandle(request);
-	} else {
-		LogTrace(L"更新探测：InternetOpenUrl 失败 err=%lu accessType=%lu url=%s",
-			GetLastError(), accessType, url.c_str());
+	ticket.clear();
+	HINTERNET session = OpenWinHttpSession();
+	if (!session) {
+		LogTrace(L"更新探测：WinHttpOpen 失败 err=%lu", GetLastError());
+		return false;
 	}
-	InternetCloseHandle(session);
+
+	URL_COMPONENTS parts{};
+	parts.dwStructSize = sizeof(parts);
+	WCHAR host[256] = {};
+	WCHAR path[2048] = {};
+	parts.lpszHostName = host;
+	parts.dwHostNameLength = _countof(host);
+	parts.lpszUrlPath = path;
+	parts.dwUrlPathLength = _countof(path);
+	bool ok = false;
+	HINTERNET connection = nullptr;
+	HINTERNET request = nullptr;
+	if (!WinHttpCrackUrl(url.c_str(), static_cast<DWORD>(url.size()), 0, &parts)) {
+		LogTrace(L"更新探测：URL 解析失败 url=%s", url.c_str());
+	}
+	else {
+		connection = WinHttpConnect(session, host, parts.nPort, 0);
+		if (!connection) {
+			LogTrace(L"更新探测：WinHttpConnect 失败 err=%lu host=%s", GetLastError(), host);
+		}
+	}
+	if (connection) {
+		request = WinHttpOpenRequest(connection, L"GET", path, nullptr, WINHTTP_NO_REFERER,
+			WINHTTP_DEFAULT_ACCEPT_TYPES,
+			parts.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
+		if (!request) {
+			LogTrace(L"更新探测：WinHttpOpenRequest 失败 err=%lu", GetLastError());
+		}
+	}
+	// 证书校验保持开启：端点用有效的通配证书，安装包哈希也走这条通道。
+	// 发送和接收分开记日志：合成一个条件时只能看到"请求发送失败"，无法区分是
+	// 握手失败还是 HTTP 层失败。
+	BOOL sent = FALSE;
+	if (request) {
+		LogTrace(L"更新探测：目标 host=%s port=%u path=%s secure=%d",
+			host, static_cast<unsigned>(parts.nPort), path,
+			parts.nScheme == INTERNET_SCHEME_HTTPS ? 1 : 0);
+		sent = WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+			WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+		if (!sent) {
+			LogTrace(L"更新探测：SendRequest 失败 err=%lu", GetLastError());
+		}
+	}
+	BOOL received = FALSE;
+	if (sent) {
+		received = WinHttpReceiveResponse(request, nullptr);
+		if (!received) {
+			LogTrace(L"更新探测：ReceiveResponse 失败 err=%lu", GetLastError());
+		}
+	}
+	// 握手已经完成、正文还没开始读：看一眼服务端证书。
+	//
+	// 只记日志，不再据此中断。钉公钥挡不住真冒名（域名被劫持后对方照样能
+	// 申请到合法证书），却会在 Let's Encrypt 换钥匙时把旧客户端全部锁死 ——
+	// 而客户端唯一的自救手段就是这条更新通道。身份改由下面的时效票据确认。
+	if (received) {
+		std::string observed;
+		if (!JupCheckWinHttpCert(request, observed) && !observed.empty()) {
+			static bool reported = false;
+			if (!reported) {
+				reported = true;
+				LogTrace(L"更新探测：服务端公钥不在已知列表，改由时效票据确认 host=%s 实际 SPKI=%S",
+					host, observed.c_str());
+			}
+		}
+	}
+	if (request && sent && received) {
+		DWORD status = 0;
+		DWORD statusSize = sizeof(status);
+		const BOOL queried = WinHttpQueryHeaders(request,
+			WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+			WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize, WINHTTP_NO_HEADER_INDEX);
+		if (!queried) {
+			LogTrace(L"更新探测：取状态码失败 err=%lu url=%s", GetLastError(), url.c_str());
+		}
+		else if (status < 200 || status >= 300) {
+			LogTrace(L"更新探测：HTTP %lu url=%s", status, url.c_str());
+		}
+		else {
+			ok = true;
+			for (;;) {
+				DWORD available = 0;
+				if (!WinHttpQueryDataAvailable(request, &available)) {
+					ok = false;
+					break;
+				}
+				if (available == 0) break;
+				char buffer[8192];
+				DWORD read = 0;
+				const DWORD want = (available < sizeof(buffer)) ? available : static_cast<DWORD>(sizeof(buffer));
+				if (!WinHttpReadData(request, buffer, want, &read) || read == 0) {
+					ok = false;
+					break;
+				}
+				body.append(buffer, read);
+			}
+			if (!ok) LogTrace(L"更新探测：读取响应体失败 err=%lu", GetLastError());
+			// 票据头必须等正文读完再取：它绑定的是正文哈希，提前取没有意义。
+			if (ok) jup_ticket::ReadTicketHeader(request, ticket);
+		}
+	}
+	else if (request) {
+		LogTrace(L"更新探测：请求发送失败 err=%lu url=%s", GetLastError(), url.c_str());
+	}
+	if (request) WinHttpCloseHandle(request);
+	if (connection) WinHttpCloseHandle(connection);
+	WinHttpCloseHandle(session);
 	if (!ok) body.clear();
 	return ok;
 }
 
-static bool HttpGetW(const std::wstring& url, std::string& body)
+static bool HttpGetW(const std::wstring& url, std::string& body, std::string& ticket)
 {
-	if (HttpGetWOnce(url, INTERNET_OPEN_TYPE_PRECONFIG, body)) return true;
-	// PRECONFIG 失败时改直连重试一次：提权进程读不到用户代理配置时会出现这种情况。
-	return HttpGetWOnce(url, INTERNET_OPEN_TYPE_DIRECT, body);
+	// WinHTTP 只有一套代理策略（DEFAULT_PROXY 会读 WinHTTP 自己的配置），
+	// 失败时再直连重试一次：个别机器上代理探测会拖住请求。
+	if (HttpGetWOnce(url, body, ticket)) return true;
+	return HttpGetWOnce(url, body, ticket);
 }
 
-static bool HttpGetAny(const std::wstring& query, std::string& body)
+// 带时效票据取清单：先发挑战，再拿正文和票据，三项都过才认。
+//
+// 清单是整条更新链的根：它同时决定"下哪个包"和"这个包该是什么哈希"。
+// 清单被换掉的话，后面比对的 SHA-256 只是在核对攻击者自己填的值，
+// 等于没有校验，所以这一环必须验身份 + 验内容。
+static bool HttpGetManifest(std::string& body, std::wstring& error)
 {
+	error.clear();
+	const jup_ticket::Challenge challenge = jup_ticket::MakeChallenge("t1");
+	const std::string query = std::string("?manifest=1") + jup_ticket::ChallengeQuery(challenge);
+
 	int index = 0;
 	for (const std::wstring& endpoint : UpdateEndpoints()) {
 		++index;
-		const std::wstring url = endpoint + query;
-		if (HttpGetW(url, body)) {
-			LogTrace(L"更新探测：端点 %d 成功 query=%s body=%u 字节", index, query.c_str(),
-				static_cast<unsigned>(body.size()));
-			return true;
+		std::string ticket;
+		if (!HttpGetW(endpoint + WideFromUtf8(query), body, ticket)) {
+			// 连不上和"连上了但被 403"在这里是同一个返回值（挑战签名不符时服务端
+			// 会直接 403）。哪一种是日志里那行 "更新探测：HTTP <code>" 才分得清，
+			// 所以提示语不写成确定的"网络不通"。
+			error = L"无法连接更新服务器，或服务器拒绝了本次请求";
+			LogTrace(L"更新探测：端点 %d 请求失败", index);
+			continue;
 		}
-		LogTrace(L"更新探测：端点 %d 失败 query=%s url=%s", index, query.c_str(), url.c_str());
+		if (body.empty()) {
+			error = L"服务器返回的清单为空";
+			LogTrace(L"更新探测：端点 %d 返回空正文", index);
+			continue;
+		}
+		const jup_ticket::VerifyResult verdict = jup_ticket::Verify(ticket, challenge.nonce, body);
+		if (!verdict.Ok()) {
+			error = verdict.Text();
+			LogTrace(L"更新探测：端点 %d 票据校验失败 —— %s", index, verdict.Text());
+			continue;
+		}
+		LogTrace(L"更新探测：端点 %d 通过票据校验 body=%u 字节", index,
+			static_cast<unsigned>(body.size()));
+		return true;
 	}
 	body.clear();
-	LogTrace(L"更新探测：全部端点失败 query=%s", query.c_str());
+	LogTrace(L"更新探测：全部端点失败");
 	return false;
 }
 
@@ -265,7 +370,8 @@ bool Fetch(Info& info)
 	}
 
 	std::string body;
-	if (HttpGetAny(L"?manifest=1", body)) {
+	std::wstring error;
+	if (HttpGetManifest(body, error)) {
 		std::string version, notes, url, sha256;
 		JsonString(body, "version", version);
 		JsonString(body, "notes", notes);
@@ -276,14 +382,13 @@ bool Fetch(Info& info)
 		info.url = WideFromUtf8(url);
 		info.sha256 = WideFromUtf8(sha256);
 	}
+	else {
+		info.error = error;
+	}
 
-	// 服务端仍保留纯文本接口，兼容还没发布清单的部署。
-	if (info.version.empty() && HttpGetAny(L"?getnewver", body))
-		info.version = WideFromUtf8(Trim(body));
-	if (info.notes.empty() && HttpGetAny(L"?getupdateinfo", body))
-		info.notes = WideFromUtf8(Trim(body));
-	if (info.url.empty() && HttpGetAny(L"?getupdate", body))
-		info.url = WideFromUtf8(Trim(body));
+	// 纯文本回退接口（?getnewver / ?getupdateinfo / ?getupdate）在这里停用：
+	// 它们返回裸字符串，既没有票据也无从绑定正文，等于给"验票据"开了个后门。
+	// 服务端现在都能力返回 manifest，留着只会成为唯一的绕过路径。
 
 	LogTrace(L"更新探测：解析结果 version=\"%s\" url=%s sha256=%s", info.version.c_str(),
 		info.url.empty() ? L"(空)" : L"(有)", info.sha256.empty() ? L"(空)" : L"(有)");

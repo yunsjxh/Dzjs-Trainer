@@ -16,6 +16,9 @@ struct JUpdaterManifestInfo {
 	wchar_t notes[4096];    // 更新说明，可含换行
 	wchar_t url[1024];      // 安装包地址（可能是相对路径）
 	wchar_t sha256[128];    // 安装包 SHA-256，小写十六进制；可能为空
+	// 失败原因（成功时为空串）。清单请求要过时效票据校验，失败可能是
+	// "服务器没提供票据""签名不符""本机时间差太大"等，光一个 FALSE 分不清。
+	wchar_t error[256];
 };
 
 UPEXPORT_CFUNC(BOOL) JUpdater_CheckInternet();
@@ -24,13 +27,14 @@ UPEXPORT_CFUNC(BOOL) JUpdater_CheckInternet();
 // 内部按 "随机子域 x2 -> 顶点域名" 依次尝试，JSON 清单不可用时回退旧的纯文本接口。
 // 这是只读操作，不会下载或替换任何文件。
 //
-// 注意：**在主程序（GUI 进程）里调用这个函数会失败** —— 实测返回
-// ERROR_INTERNET_CANNOT_CONNECT，同账号同权限的控制台进程却正常。
-// 主程序请改用下面的 JUpdater_ProbeManifest。
+// 主程序直接调用它即可：内部已从 WinINet 换成 WinHTTP，GUI 进程里可用
+// （WinINet 在这个进程里会返回 ERROR_INTERNET_CANNOT_CONNECT，那正是历史上
+// 被迫引入 JUpdater_ProbeManifest 子进程、进而闪黑窗口的原因）。
 UPEXPORT_CFUNC(BOOL) JUpdater_FetchManifest(JUpdaterManifestInfo* info);
 
-// 释放内嵌更新器，让它以 `--manifest <临时文件>` 代取一次清单，再读回结果。
-// 更新器是控制台进程，不受上面那个问题影响。这是主程序该用的探测入口。
+// 旧路径：释放内嵌更新器、让它以 `--manifest <临时文件>` 代取清单。
+// WinHTTP 版本可用后它只作为兜底（代理/防火墙下 WinHTTP 不通时）。
+// 该模式下更新器已改成不建控制台，不会再闪黑窗口。
 UPEXPORT_CFUNC(BOOL) JUpdater_ProbeManifest(JUpdaterManifestInfo* info);
 
 // 版本比较：left < right 返回 -1，相等 0，大于 1。缺失分量按 0 处理。
@@ -38,3 +42,15 @@ UPEXPORT_CFUNC(int) JUpdater_CompareVersion(const wchar_t* left, const wchar_t* 
 
 // 释放内嵌的更新器并启动它。主程序确认用户要更新之后才调用。
 UPEXPORT_CFUNC(BOOL) JUpdater_LaunchUpdater();
+
+// 只让它替换：包已经由主程序下载并校验过，更新器会先等主程序退出，
+// 然后把包换上去并重启。sha256Hex 可为空。
+UPEXPORT_CFUNC(BOOL) JUpdater_LaunchApply(LPCWSTR packagePath, LPCWSTR sha256Hex);
+
+// 借子进程下载安装包。主程序自己的进程里 WinHTTP 的 TLS 会失败
+// （Schannel 返回 SEC_E_SECPKG_NOT_FOUND），同一个库在独立进程里正常，
+// 所以网络抓取统一退到子进程做，主程序只负责校验与替换。
+// notifyWindow 非空时，子进程每读完一块就 PostMessage(WM_JUP_DOWNLOAD_PROGRESS)
+// 回来（total 在 wParam、done 在 lParam），界面靠它画真实进度条。
+UPEXPORT_CFUNC(BOOL) JUpdater_LaunchDownload(LPCWSTR url, LPCWSTR destPath, LPCWSTR sha256Hex,
+	DWORD timeoutMs, HWND notifyWindow);

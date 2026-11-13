@@ -1,4 +1,4 @@
-**/.vs/
+﻿**/.vs/
 /Release/
 /Debug/
 /build/
@@ -40,6 +40,12 @@
 *.tmp
 *.vcxproj.user
 unlock-key-material/
+
+# 更新通道的正式公钥（由 tools/make-ticket-key.py 从 update-server/ticket-sign.pub.der 生成）。
+# 公钥本身泄漏无害，不进版本库的目的不是保密，而是让开源出去的源码编不出一个
+# 「看起来在连官方服务器」的客户端。仓库带的是 UpdaterTicketKey.h.example，
+# 里面是公开私钥对应的示例公钥，只能用于编译和自测。
+/DzjsTrainerUpdater/UpdaterTicketKey.h
 
 # Local or unrelated source copies and inspection artifacts
 /dzjstools-main/

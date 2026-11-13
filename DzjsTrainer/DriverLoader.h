@@ -1,18 +1,18 @@
-#pragma once
+ï»¿#pragma once
 #include "stdafx.h"
 
-//¼ÓÔØÇı¶¯
-//    lpszDriverName£ºÇı¶¯µÄ·şÎñÃû
-//    driverPath£ºÇı¶¯µÄÍêÕûÂ·¾¶
-//    lpszDisplayName£ºnullptr
+//åŠ è½½é©±åŠ¨
+//    lpszDriverNameï¼šé©±åŠ¨çš„æœåŠ¡å
+//    driverPathï¼šé©±åŠ¨çš„å®Œæ•´è·¯å¾„
+//    lpszDisplayNameï¼šnullptr
 BOOL MLoadKernelDriver(const wchar_t* lpszDriverName, const wchar_t* driverPath, const wchar_t* lpszDisplayName);
-//Ğ¶ÔØÇı¶¯
-//    szSvrName£º·şÎñÃû
+//å¸è½½é©±åŠ¨
+//    szSvrNameï¼šæœåŠ¡å
 BOOL MUnLoadKernelDriver(const wchar_t* szSvrName);
 BOOL MUnLoadDriverServiceWithMessage(const wchar_t * szSvrName);
-//´ò¿ªÇı¶¯
+//æ‰“å¼€é©±åŠ¨
 BOOL XOpenDriver(BOOL startGuard);
-//·µ»ØÇı¶¯ÊÇ·ñ¼ÓÔØ
+//è¿”å›é©±åŠ¨æ˜¯å¦åŠ è½½
 BOOL XDriverLoaded();
 BOOL XTryReuseInstalledDriver();
 

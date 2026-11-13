@@ -1,11 +1,11 @@
-#pragma once
+ï»¿#pragma once
 #include "stdafx.h"
 #include <stdio.h>  
 #include <stdlib.h>  
 #include <string>  
 #include <vector>
 
-//×Ö·û´®°ïÖúÀà
+//å­—ç¬¦ä¸²å¸®åŠ©ç±»
 class EXPORT StringHlp
 {
 public:
@@ -30,9 +30,9 @@ public:
 	static std::wstring * FormatStringPtrW(const wchar_t *format, ...);
 	static std::string *FormatStringPtrA(const char *format, ...);
 
-	//×Ö·û´®ÊÇ·ñÊÇ¿ÕµÄ
+	//å­—ç¬¦ä¸²æ˜¯å¦æ˜¯ç©ºçš„
 	static BOOLEAN StrEmeptyW(LPCWSTR str);
-	//×Ö·û´®ÊÇ·ñÊÇ¿ÕµÄ
+	//å­—ç¬¦ä¸²æ˜¯å¦æ˜¯ç©ºçš„
 	static BOOLEAN StrEmeptyA(LPCSTR str);
 
 	static LPCWSTR StrUpW(LPCWSTR str);
@@ -41,9 +41,9 @@ public:
 	static LPCSTR StrLoA(LPCSTR str);
 	static LPCWSTR StrAddW(LPCWSTR str1, LPCWSTR str2);
 	static LPCSTR StrAddA(LPCSTR str1, const LPCSTR str2);
-	//×Ö·û´®ÊÇ·ñÏàµÈ
+	//å­—ç¬¦ä¸²æ˜¯å¦ç›¸ç­‰
 	static BOOL StrEqualA(LPCSTR str1, LPCSTR str2);
-	//×Ö·û´®ÊÇ·ñÏàµÈ
+	//å­—ç¬¦ä¸²æ˜¯å¦ç›¸ç­‰
 	static BOOL StrEqualW(const wchar_t* str1, const wchar_t* str2);
 	static LPCSTR IntToStrA(int i);
 	static LPCWSTR IntToStrW(int i);
@@ -65,25 +65,25 @@ private:
 
 };
 
-//¸ñÊ½»¯×Ö·û´®£¨½öÔÚµ±Ç°Ä£¿é»ò/MDÔËĞĞ¿â±àÒëÊ±Ê¹ÓÃ£©£¬ÆäËûÄ£¿éÇëÊ¹ÓÃ FormatStringPtr
+//æ ¼å¼åŒ–å­—ç¬¦ä¸²ï¼ˆä»…åœ¨å½“å‰æ¨¡å—æˆ–/MDè¿è¡Œåº“ç¼–è¯‘æ—¶ä½¿ç”¨ï¼‰ï¼Œå…¶ä»–æ¨¡å—è¯·ä½¿ç”¨ FormatStringPtr
 #define FormatString StringHlp::FormatString
-//×Ö·û´®ÊÇ·ñº¬ÓĞÄ³¸ö×Ö·û
+//å­—ç¬¦ä¸²æ˜¯å¦å«æœ‰æŸä¸ªå­—ç¬¦
 #define StrContainsChar StringHlp::StrContainsCharW
-//¼ì²â×Ö·û´®ÊÇ·ñÊÇ¿ÕµÄ
+//æ£€æµ‹å­—ç¬¦ä¸²æ˜¯å¦æ˜¯ç©ºçš„
 #define StrEmepty StringHlp::StrEmeptyW
-//¼ì²â×Ö·û´®ÊÇ·ñÊÇ¿ÕµÄ
+//æ£€æµ‹å­—ç¬¦ä¸²æ˜¯å¦æ˜¯ç©ºçš„
 #define StrEmeptyAnsi StringHlp::StrEmeptyA
-//×Ö·û´®ÊÇ·ñÏàµÈ
+//å­—ç¬¦ä¸²æ˜¯å¦ç›¸ç­‰
 #define StrEqual StringHlp::StrEqualW
-//×Ö·û´®ÊÇ·ñÏàµÈA
+//å­—ç¬¦ä¸²æ˜¯å¦ç›¸ç­‰A
 #define StrEqualAnsi StringHlp::StrEqualA
-//Õ­×Ö·û×ªÎª¿í×Ö·û
+//çª„å­—ç¬¦è½¬ä¸ºå®½å­—ç¬¦
 #define A2W StringHlp::AnsiToUnicode
-//¿í×Ö·û×ªÎªÕ­×Ö·û
+//å®½å­—ç¬¦è½¬ä¸ºçª„å­—ç¬¦
 #define W2A StringHlp::UnicodeToAnsi
-//¸ñÊ½»¯×Ö·û´®£¬·µ»ØµÄ×Ö·û´®Ö¸ÕëÇëÊ¹ÓÃ FreeStringPtr ÊÍ·Å
+//æ ¼å¼åŒ–å­—ç¬¦ä¸²ï¼Œè¿”å›çš„å­—ç¬¦ä¸²æŒ‡é’ˆè¯·ä½¿ç”¨ FreeStringPtr é‡Šæ”¾
 #define FormatStringPtr StringHlp::FormatStringPtrW
-//ÊÍ·ÅÓÉ StringHlp Àà·µ»ØµÄ×Ö·û´®Ö¸Õë
+//é‡Šæ”¾ç”± StringHlp ç±»è¿”å›çš„å­—ç¬¦ä¸²æŒ‡é’ˆ
 #define FreeStringPtr(v) StringHlp::FreeStringPtr((LPVOID)v)
 
 

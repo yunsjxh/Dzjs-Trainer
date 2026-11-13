@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #include "stdafx.h"
 #include <unknwn.h>
 #include <ShellAPI.h>

@@ -1,11 +1,19 @@
 #include "stdafx.h"
 #include "MainWindow.h"
+#include "../DzjsTrainerUpdater/BuiltinUpdate.h"
 #include "../WindowCaptureProtection.h"
 #include "DriverServiceActions.h"
 #include "resource.h"
 #include "DzjsTrainerUI.h"
 #include "../DzjsTrainerUpdater/DzjsTrainerUpdater.h"
+#include "../DzjsTrainerUpdater/UpdaterIpc.h"
 #include "../DzjsTrainer/AppPublic.h"
+
+// 窗口默认从抓屏里排除（防极域/录屏）。排查 UI 视觉效果期间临时关掉，
+// 这样截图工具能拍到真实界面；视觉调整完成后改回 1 即可恢复。
+#ifndef DZJS_ENABLE_CAPTURE_EXCLUSION
+#define DZJS_ENABLE_CAPTURE_EXCLUSION 1
+#endif
 
 // The About page shows the version of the binary that is actually running, read
 // from its own file version resource. A compile-time constant drifts from
@@ -118,6 +126,66 @@ constexpr UINT WM_BLOCKED_INJECTED_INPUT = WM_APP + 42;
 constexpr UINT WM_AV_SCAN_FINISHED = WM_APP + 43;
 // 更新探测在工作线程里完成后，用它把结果交回 UI 线程。
 constexpr UINT WM_UPDATE_PROBE_DONE = WM_APP + 44;
+// 内置更新的下载进度/结果回到 UI 线程用。
+constexpr UINT WM_UPDATE_DOWNLOAD_STATE = WM_APP + 45;
+
+struct UpdateDownloadContext {
+	HWND window = nullptr;
+	std::wstring url;
+	std::wstring packagePath;
+	std::wstring sha256;
+	int lastReportedPercent = -100;
+	unsigned long long lastReportedBytes = 0;
+};
+
+// 进度回调跑在下载线程里，只能把数据打包丢回 UI 线程。用堆上的小结构体
+// 而不是把数值塞进 wParam/lParam —— 窗口不大也塞不下，读起来也更容易错。
+struct UpdateProgressPayload {
+	int percent;
+	unsigned long long done;
+	unsigned long long total;
+};
+
+// 弹窗里的两个按钮和普通按钮共用一套 hover/press 机制，编号避开页面上的。
+constexpr int kUpdateDialogPrimary = 120;
+constexpr int kUpdateDialogSecondary = 121;
+
+std::wstring FormatByteSize(unsigned long long bytes)
+{
+	wchar_t buffer[64] = {};
+	if (bytes >= 1024ull * 1024ull * 1024ull)
+		swprintf_s(buffer, L"%.2f GB", static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0));
+	else if (bytes >= 1024ull * 1024ull)
+		swprintf_s(buffer, L"%.1f MB", static_cast<double>(bytes) / (1024.0 * 1024.0));
+	else if (bytes >= 1024ull)
+		swprintf_s(buffer, L"%.0f KB", static_cast<double>(bytes) / 1024.0);
+	else
+		swprintf_s(buffer, L"%llu B", bytes);
+	return buffer;
+}
+
+// 本进程里 WinHTTP 的 TLS 起不来：SendRequest 直接返回 SEC_E_SECPKG_NOT_FOUND
+// (0x80090305)，换个独立进程跑同一段代码却正常。失败一次就本会话不再走进程内
+// 路径，网络抓取统一交给子进程，省掉每次探测都先等一轮超时。
+bool g_httpInProcessBroken = false;
+
+void __stdcall UpdateProgressCallback(unsigned long long done, unsigned long long total, void* context)
+{
+	UpdateDownloadContext* data = static_cast<UpdateDownloadContext*>(context);
+	if (!data || !data->window) return;
+	const int percent = total ? static_cast<int>(done * 100 / total) : -1;
+	// 百分比没变时也让字节数慢慢走，否则 5% 一跳的进度条看不出在动。
+	// 这里按百分位 + 32 KB 双阈值节流，下载 3 MB 大约回几十次消息。
+	if (percent >= 0 && percent == data->lastReportedPercent &&
+		done < data->lastReportedBytes + 32768) return;
+	data->lastReportedPercent = percent;
+	data->lastReportedBytes = done;
+	auto* payload = new (std::nothrow) UpdateProgressPayload{ percent, done, total };
+	if (!payload) return;
+	if (!PostMessageW(data->window, WM_UPDATE_DOWNLOAD_STATE, 1, reinterpret_cast<LPARAM>(payload))) {
+		delete payload;
+	}
+}
 
 DWORD WINAPI UpdateProbeThread(LPVOID parameter)
 {
@@ -128,9 +196,20 @@ DWORD WINAPI UpdateProbeThread(LPVOID parameter)
 	// 就会失败并返回 ERROR_BAD_IMPERSONATION_LEVEL(1346)。
 	// 本线程只做只读探测、不需要任何模拟身份，先撤掉。线程用完即退，无需恢复。
 	RevertToSelf();
-	// 用更新器代取清单：主程序（GUI 进程）里直接调 WinINet 会 ERROR_INTERNET_CANNOT_CONNECT，
-	// 而更新器是控制台进程，同样的调用正常。详见 JUpdater_ProbeManifest 的说明。
-	context->ok = JUpdater_ProbeManifest(&context->manifest) != FALSE;
+	// 先在本进程里直接取清单（WinHTTP）。历史上这里只能让独立更新器代取，
+	// 因为 WinINet 在 GUI 进程里会 ERROR_INTERNET_CANNOT_CONNECT；而那个更新器
+	// 是控制台程序，代取时会 AllocConsole 弹一个黑窗口 —— 用户看到的就是它。
+	// 清单获取改成 WinHTTP 后这条路不再需要子进程，取不到才退回更新器。
+	// 线程本身不碰界面，只把结果投回 UI 线程。
+	context->ok = false;
+	if (!g_httpInProcessBroken) {
+		context->ok = JUpdater_FetchManifest(&context->manifest) != FALSE;
+		if (!context->ok) g_httpInProcessBroken = true;
+	}
+	if (!context->ok) {
+		// 进程内 TLS 不通（或已知不通）时才退回子进程；更新器已被要求不建控制台。
+		context->ok = JUpdater_ProbeManifest(&context->manifest) != FALSE;
+	}
 	// 线程本身不碰界面，只把结果投回 UI 线程。
 	if (!PostMessageW(context->window, WM_UPDATE_PROBE_DONE, context->byUser ? 1 : 0,
 		reinterpret_cast<LPARAM>(context))) {
@@ -386,29 +465,92 @@ SetWindowBandFunction ResolveSetWindowBand()
 	return function;
 }
 
+// SetWindowBand 是未文档化 API，返回值约定不稳：可能是 BOOL（非 0 成功），
+// 也可能是 NTSTATUS（0 才是成功）。按非 0 判成功会把成功误判成失败，
+// 结果就是"窗口确实是超级置顶，状态却显示普通置顶"。
+// 这里不再依赖返回值，改用 GetWindowBand 复核实际窗口带。
+using GetWindowBandFunction = BOOL(WINAPI*)(HWND, PDWORD);
+
+GetWindowBandFunction ResolveGetWindowBand()
+{
+	static GetWindowBandFunction function = [] {
+		const HMODULE user32 = GetModuleHandleW(L"user32.dll");
+		const FARPROC address = user32 ? GetProcAddress(user32, "GetWindowBand") : nullptr;
+		return address ? std::bit_cast<GetWindowBandFunction>(address) : nullptr;
+	}();
+	return function;
+}
+
 bool ApplyHighestPermittedTopmost(HWND window, bool pinned, bool* uiAccessBandApplied = nullptr)
 {
 	if (uiAccessBandApplied) *uiAccessBandApplied = false;
 	if (!window || !IsWindow(window)) return false;
-	constexpr DWORD kWindowBandDefault = 0;
+	// 普通窗口的实际窗口带是 1（ZBID_DESKTOP），不是 0。
+	constexpr DWORD kWindowBandDesktop = 1;
 	constexpr DWORD kWindowBandUiAccess = 2;
-	if (IsCurrentProcessUiAccessEnabled()) {
-		if (SetWindowBandFunction setWindowBand = ResolveSetWindowBand()) {
-			const bool applied = setWindowBand(window, pinned ? HWND_TOPMOST : HWND_NOTOPMOST,
-				pinned ? kWindowBandUiAccess : kWindowBandDefault) != FALSE;
-			if (uiAccessBandApplied) *uiAccessBandApplied = applied;
-		}
-	}
+	const bool uiAccessProcess = IsCurrentProcessUiAccessEnabled();
+
+	// 先真正设成 topmost，再调 SetWindowBand。窗口带只对 topmost 窗口有意义，
+	// 顺序反过来 win32k 会拒绝这次调用。
 	if (!SetWindowPos(window, pinned ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
 		SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER)) return false;
 	if (pinned) BringWindowToTop(window);
+
+	bool bandApplied = false;
+	if (uiAccessProcess) {
+		if (SetWindowBandFunction setWindowBand = ResolveSetWindowBand()) {
+			// hWndInsertAfter 只接受 NULL（即 HWND_TOP）或一个有效窗口句柄。
+			// 旧代码传 HWND_TOPMOST(-1) / HWND_NOTOPMOST(-2)，win32k 视为无效句柄，
+			// 直接返回 FALSE —— 日志里 setResult=0、actual 一直停在 1 就是这个原因。
+			const DWORD targetBand = pinned ? kWindowBandUiAccess : kWindowBandDesktop;
+			GetWindowBandFunction getWindowBand = ResolveGetWindowBand();
+			DWORD bandBefore = 0xFFFFFFFFUL;
+			if (getWindowBand) getWindowBand(window, &bandBefore);
+			SetLastError(ERROR_SUCCESS);
+			const BOOL setResult = setWindowBand(window, HWND_TOP, targetBand);
+			const DWORD setError = GetLastError();
+			DWORD bandAfter = 0xFFFFFFFFUL;
+			BOOL queryResult = FALSE;
+			if (getWindowBand) {
+				queryResult = getWindowBand(window, &bandAfter);
+				if (queryResult != FALSE) bandApplied = bandAfter == targetBand;
+			}
+			if (currentLogger) {
+				currentLogger->LogInfo(
+					L"置顶带：pinned=%d target=%lu before=%lu setResult=%d setError=%lu query=%d after=%lu applied=%d",
+					pinned ? 1 : 0, static_cast<unsigned long>(targetBand),
+					static_cast<unsigned long>(bandBefore), static_cast<int>(setResult),
+					static_cast<unsigned long>(setError), static_cast<int>(queryResult),
+					static_cast<unsigned long>(bandAfter), bandApplied ? 1 : 0);
+			}
+		}
+		else if (currentLogger) {
+			currentLogger->LogWarn(L"置顶带：user32!SetWindowBand 未解析到");
+		}
+	}
+	else if (currentLogger) {
+		currentLogger->LogInfo(L"置顶带：当前进程不是 UIAccess，跳过窗口带设置");
+	}
+
+	// 显示文案的依据是「进程是否拿到 TokenUIAccess」，不是窗口带是否设置成功。
+	// 实测 SetWindowBand 失败时超级置顶的效果依然在（UIAccess 进程的 topmost
+	// 窗口本身就压得住普通 topmost），拿窗口带当判据会把成功显示成普通置顶。
+	if (uiAccessBandApplied) *uiAccessBandApplied = uiAccessProcess && pinned;
+	if (currentLogger && uiAccessProcess) {
+		currentLogger->LogInfo(L"置顶带：窗口带 applied=%d（仅诊断用，不参与超级置顶判定）",
+			bandApplied ? 1 : 0);
+	}
 	return true;
 }
 constexpr UINT WM_COPYGLOBALDATA_COMPAT = 0x0049;
 constexpr UINT TIMER_ANIMATION = 20;
+// 服务轮询和动画分开：轮询 5 次/秒足够，动画只在有东西在动时才跑 60 帧。
+constexpr UINT TIMER_SERVICE_POLL = 23;
 constexpr UINT TIMER_TRAY_REPAIR = 21;
 constexpr UINT TIMER_RERUN = 21;
 constexpr UINT TIMER_AUTO_SHUT = 22;
+// 更新替换完成后停一下再退出，让「更新完成」这一帧留得住。
+constexpr UINT TIMER_UPDATE_RESTART = 24;
 constexpr int CMD_POWER_SHUTDOWN = 41001;
 constexpr int CMD_POWER_RESTART = 41002;
 constexpr int CMD_POWER_EXIT = 41003;
@@ -453,7 +595,7 @@ std::unique_ptr<PrivateFontCollection> materialIconCollection;
 std::unique_ptr<FontFamily> materialIconFamily;
 std::map<int, std::unique_ptr<Font>> materialIconFonts;
 std::unique_ptr<StringFormat> materialIconFormat;
-std::array<bool, 10> materialIconGlyphs{};
+std::array<bool, 13> materialIconGlyphs{};
 bool materialIconFontUsable = false;
 
 const wchar_t* MaterialIconGlyph(int icon);
@@ -528,7 +670,56 @@ void UnloadMaterialIconFont()
 	}
 }
 
-void DrawNativeButton(const DRAWITEMSTRUCT* item, HFONT font, bool dark)
+// 原生 owner-draw 按钮不会向父窗口汇报悬停，各自挂一个子类化过程记录状态，
+// 再让 DrawNativeButton 按这个标志混色 —— 否则网络页的按钮是全界面唯一没有悬停的。
+std::unordered_map<HWND, bool>& NativeButtonHoverMap()
+{
+	static std::unordered_map<HWND, bool> map;
+	return map;
+}
+
+LRESULT CALLBACK NativeButtonHoverProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam,
+	UINT_PTR, DWORD_PTR)
+{
+	switch (message) {
+	case WM_MOUSEMOVE: {
+		bool& hovered = NativeButtonHoverMap()[window];
+		if (!hovered) {
+			hovered = true;
+			InvalidateRect(window, nullptr, FALSE);
+		}
+		TRACKMOUSEEVENT track{ sizeof(track), TME_LEAVE, window, 0 };
+		TrackMouseEvent(&track);
+		return 0;
+	}
+	case WM_MOUSELEAVE:
+		NativeButtonHoverMap()[window] = false;
+		InvalidateRect(window, nullptr, FALSE);
+		return 0;
+	case WM_NCDESTROY:
+		NativeButtonHoverMap().erase(window);
+		RemoveWindowSubclass(window, NativeButtonHoverProc, 0);
+		break;
+	}
+	return DefSubclassProc(window, message, wParam, lParam);
+}
+
+void EnableNativeButtonHover(HWND button)
+{
+	if (!button) return;
+	SetWindowSubclass(button, NativeButtonHoverProc, 0, 0);
+}
+
+COLORREF BlendColorRef(COLORREF from, COLORREF to, double amount)
+{
+	auto mix = [amount](int a, int b) {
+		return static_cast<int>(a + (b - a) * amount);
+	};
+	return RGB(mix(GetRValue(from), GetRValue(to)), mix(GetGValue(from), GetGValue(to)),
+		mix(GetBValue(from), GetBValue(to)));
+}
+
+void DrawNativeButton(const DRAWITEMSTRUCT* item, HFONT font, bool dark, bool hover = false)
 {
 	const bool pressed = (item->itemState & ODS_SELECTED) != 0;
 	const int id = static_cast<int>(item->CtlID);
@@ -552,6 +743,18 @@ void DrawNativeButton(const DRAWITEMSTRUCT* item, HFONT font, bool dark)
 		else if (id == IDC_NET_SHUTDOWN || id == IDC_NET_REBOOT) {
 			fill = RGB(64, 53, 28);
 			textColor = RGB(255, 220, 141);
+		}
+	}
+	if (!pressed) {
+		// 悬停往深一档走；主色按钮压暗、浅色按钮加深一档，方向一致。
+		if (id == IDC_NET_SEND_MESSAGE || id == IDC_NET_SEND_COMMAND) {
+			fill = hover ? BlendColorRef(fill, dark ? RGB(110, 200, 186) : RGB(0, 86, 77), 0.65) : fill;
+		}
+		else if (id == IDC_NET_SHUTDOWN || id == IDC_NET_REBOOT) {
+			fill = hover ? BlendColorRef(fill, dark ? RGB(82, 68, 36) : RGB(252, 231, 176), 0.65) : fill;
+		}
+		else {
+			fill = hover ? BlendColorRef(fill, dark ? RGB(56, 96, 87) : RGB(203, 228, 219), 0.65) : fill;
 		}
 	}
 	RECT rect = item->rcItem;
@@ -621,6 +824,29 @@ void StrokeRound(Graphics& g, const RectF& rect, float radius, const Color& colo
 	g.DrawPath(&pen, &path);
 }
 
+void FillRound(Graphics& g, const RectF& rect, float radius, Brush& brush) {
+	GraphicsPath path;
+	BuildRoundPath(path, rect, radius);
+	g.FillPath(&brush, &path);
+}
+
+// 卡片投影。GDI+ 没有高斯模糊，用三层低透明度的外扩圆角矩形叠出柔和过渡。
+// 实测单次 FillRound 约 0.01 ms，一页十来张卡片只多 0.3 ms，换来整页的立体感。
+void SoftShadow(Graphics& g, const RectF& rect, float radius, bool dark, float strength = 1.0f)
+{
+	static const BYTE lightAlpha[3] = { 13, 8, 4 };
+	static const BYTE darkAlpha[3] = { 30, 18, 9 };
+	for (int layer = 2; layer >= 0; --layer) {
+		const float spread = (layer + 1) * 2.5f;
+		const int raw = static_cast<int>((dark ? darkAlpha[layer] : lightAlpha[layer]) * strength);
+		if (raw <= 0) continue;
+		FillRound(g,
+			RectF(rect.X - spread, rect.Y - spread + 2.0f,
+				rect.Width + spread * 2.0f, rect.Height + spread * 2.0f),
+			radius + spread, Color(static_cast<BYTE>(raw > 255 ? 255 : raw), 0, 0, 0));
+	}
+}
+
 const wchar_t* MaterialIconGlyph(int icon)
 {
 	// Google Material Icons code points. The hand-drawn implementation below
@@ -636,6 +862,10 @@ const wchar_t* MaterialIconGlyph(int icon)
 	case 7: return L"\uE8AC"; // power_settings_new
 	case 8: return L"\uE518"; // light_mode
 	case 9: return L"\uE51C"; // dark_mode
+	// 更新弹窗用的三个图标。
+	case 10: return L"\uE2C4"; // file_download
+	case 11: return L"\uE86C"; // check_circle
+	case 12: return L"\uE002"; // warning
 	default: return nullptr;
 	}
 }
@@ -705,23 +935,116 @@ void DrawIcon(Graphics& g, int icon, float x, float y, const Color& color, float
 		g.FillPath(&fill, &moon);
 		break;
 	}
+	// 以下三个只给更新弹窗用：字体没加载成功时才走这里。
+	case 10: // download
+		g.DrawLine(&pen, X(10), Y(2), X(10), Y(13));
+		g.DrawLine(&pen, X(10), Y(13), X(6), Y(9));
+		g.DrawLine(&pen, X(10), Y(13), X(14), Y(9));
+		g.DrawLine(&pen, X(3), Y(16), X(17), Y(16));
+		break;
+	case 11: // check_circle
+		g.DrawEllipse(&pen, X(2), Y(2), 16 * s, 16 * s);
+		g.DrawLine(&pen, X(6), Y(10), X(9), Y(13));
+		g.DrawLine(&pen, X(9), Y(13), X(14), Y(7));
+		break;
+	case 12: // warning
+		g.DrawEllipse(&pen, X(2), Y(2), 16 * s, 16 * s);
+		g.DrawLine(&pen, X(10), Y(6), X(10), Y(12));
+		g.DrawEllipse(&pen, X(9.5f), Y(14), 1 * s, 1 * s);
+		break;
 	default: g.DrawEllipse(&pen, X(3), Y(3), 14 * s, 14 * s); break;
 	}
 }
 
+// GDI+ 的 Font 构造要走一次字体库解析，单次约 0.15 ms。一帧里几十次 Text()
+// 累计起来就是十几毫秒 —— 实测 60 次绘制从 9.2 ms 降到 1.8 ms。按
+// (像素字号, 字形) 缓存，绘制线程只有一个，不需要加锁。
+std::unordered_map<int, std::unique_ptr<Font>>& TextFontCache()
+{
+	static std::unordered_map<int, std::unique_ptr<Font>> cache;
+	return cache;
+}
+
+Font* ResolveTextFont(float size, FontStyle style)
+{
+	const int pixelSize = std::max(1, static_cast<int>(std::lround(size)));
+	const int key = pixelSize * 16 + static_cast<int>(style);
+	auto& cache = TextFontCache();
+	auto found = cache.find(key);
+	if (found != cache.end()) return found->second.get();
+	auto font = std::make_unique<Font>(L"Microsoft YaHei UI", static_cast<REAL>(pixelSize), style, UnitPixel);
+	if (font->GetLastStatus() != Ok) return nullptr;
+	Font* raw = font.get();
+	cache.emplace(key, std::move(font));
+	return raw;
+}
+
+// 静态缓存必须在 GdiplusShutdown 之前清空，否则进程退出时 Font 析构会碰到
+// 已经拆掉的 GDI+ 状态而崩溃（和析构函数里那段注释是同一类问题）。
+void ReleaseTextFontCache()
+{
+	TextFontCache().clear();
+}
+
+// StringFormat 同样有析构顺序问题，这里故意 new 出来不释放：进程退出时不需要
+// 回收，也就不会在 GdiplusShutdown 之后被析构。
+StringFormat* ResolveTextFormat(StringAlignment align)
+{
+	struct FormatSet {
+		StringFormat nearFormat;
+		StringFormat centerFormat;
+		StringFormat farFormat;
+		FormatSet()
+		{
+			nearFormat.SetAlignment(StringAlignmentNear);
+			centerFormat.SetAlignment(StringAlignmentCenter);
+			farFormat.SetAlignment(StringAlignmentFar);
+			for (StringFormat* format : { &nearFormat, &centerFormat, &farFormat }) {
+				format->SetLineAlignment(StringAlignmentNear);
+				format->SetTrimming(StringTrimmingEllipsisCharacter);
+			}
+		}
+	};
+	static FormatSet* formats = new FormatSet();
+	if (align == StringAlignmentCenter) return &formats->centerFormat;
+	if (align == StringAlignmentFar) return &formats->farFormat;
+	return &formats->nearFormat;
+}
+
 void Text(Graphics& g, const wchar_t* value, float x, float y, float width, float height,
 	float size, FontStyle style, const Color& color, StringAlignment align = StringAlignmentNear) {
-	Font font(L"Microsoft YaHei UI", size, style, UnitPixel);
+	Font* font = ResolveTextFont(size, style);
+	if (!font) return;
 	SolidBrush brush(color);
-	StringFormat format;
-	format.SetAlignment(align);
-	format.SetLineAlignment(StringAlignmentNear);
-	format.SetTrimming(StringTrimmingEllipsisCharacter);
-	g.DrawString(value ? value : L"", -1, &font, RectF(x, y, width, height), &format, &brush);
+	g.DrawString(value ? value : L"", -1, font, RectF(x, y, width, height), ResolveTextFormat(align), &brush);
 }
 
 bool Hit(const RECT& rect, POINT point) {
 	return PtInRect(&rect, point) != FALSE;
+}
+
+// 单行 + 省略号。日志里一条记录可能很长，普通 Text 会折行，
+// 第二行落到 20px 行高之外被裁成半截字。
+StringFormat* ResolveTextFormatSingleLine()
+{
+	static StringFormat* format = [] {
+		auto created = new StringFormat();
+		created->SetAlignment(StringAlignmentNear);
+		created->SetLineAlignment(StringAlignmentNear);
+		created->SetTrimming(StringTrimmingEllipsisCharacter);
+		created->SetFormatFlags(StringFormatFlagsNoWrap);
+		return created;
+	}();
+	return format;
+}
+
+void TextSingleLine(Graphics& g, const wchar_t* value, float x, float y, float width, float height,
+	float size, FontStyle style, const Color& color)
+{
+	Font* font = ResolveTextFont(size, style);
+	if (!font) return;
+	SolidBrush brush(color);
+	g.DrawString(value ? value : L"", -1, font, RectF(x, y, width, height), ResolveTextFormatSingleLine(), &brush);
 }
 
 constexpr wchar_t kAvPromptClass[] = L"DzjsTrainerAvTextPrompt";
@@ -1071,10 +1394,10 @@ void PaintExitConfirm(HWND window, ExitConfirmContext* context)
 		C(context->darkMode, 81, 91, 86, 171, 183, 177));
 	Text(graphics, context->challenge.c_str(), panelX + 34, panelY + 108, 452, 38, 25, FontStyleBold,
 		C(context->darkMode, 0, 107, 95, 130, 213, 199), StringAlignmentCenter);
-	Text(graphics, L"仅接受真实键盘按键，粘贴或程序模拟输入不会通过验证。", panelX + 34, panelY + 178, 452, 22, 10, FontStyleRegular,
+	Text(graphics, L"仅接受真实键盘按键，粘贴或程序模拟输入不会通过验证。", panelX + 34, panelY + 178, 452, 22, 11, FontStyleRegular,
 		C(context->darkMode, 91, 70, 20, 232, 211, 162), StringAlignmentCenter);
 	if (context->invalidInput) {
-		Text(graphics, L"输入不匹配或不是直接键盘输入，请重试。", panelX + 34, panelY + 204, 452, 22, 10, FontStyleBold,
+		Text(graphics, L"输入不匹配或不是直接键盘输入，请重试。", panelX + 34, panelY + 204, 452, 22, 11, FontStyleBold,
 			C(context->darkMode, 155, 45, 36, 244, 178, 165), StringAlignmentCenter);
 	}
 	EndPaint(window, &ps);
@@ -2676,9 +2999,9 @@ MainWindow::~MainWindow()
 	StopEmbeddedTeacherGui();
 	StopTeacherService();
 	if (controlSurfaceBrush) DeleteObject(controlSurfaceBrush);
+	if (advancedFieldBrush) DeleteObject(advancedFieldBrush);
 	if (controlFont) DeleteObject(controlFont);
-	delete backBuffer;
-	backBuffer = nullptr;
+	ReleaseBackBuffer();
 	// Member destructors run AFTER this body, so every object holding a GDI+ type
 	// must be released here. Destroying one after GdiplusShutdown touches torn-down
 	// GDI+ state and crashes on exit — this is why quitting used to crash whenever a
@@ -2689,6 +3012,8 @@ MainWindow::~MainWindow()
 		teacherBackend->preview_bitmap.reset();
 		teacherBackend->remote_bitmap.reset();
 	}
+	// 文本字体是文件级静态缓存，同样要在 GdiplusShutdown 之前清掉。
+	ReleaseTextFontCache();
 	UnloadMaterialIconFont();
 	if (gdiplusToken) GdiplusShutdown(gdiplusToken);
 	if (currentMainWindow == this) currentMainWindow = nullptr;
@@ -2698,7 +3023,9 @@ bool MainWindow::RegisterWindowClass()
 {
 	WNDCLASSEXW wc{};
 	wc.cbSize = sizeof(wc);
-	wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
+	// 不要再加 CS_HREDRAW/CS_VREDRAW：那会让窗口每拖动一个像素就整窗重绘，
+	// 配合整页 GDI+ 重画，拖拽缩放时明显掉帧。WM_SIZE 里已经自己 Invalidate 了。
+	wc.style = CS_DBLCLKS;
 	wc.lpfnWndProc = WndProc;
 	wc.hInstance = JTAppGetInstanceDirect();
 	wc.hIcon = LoadIconW(wc.hInstance, MAKEINTRESOURCEW(IDI_APP));
@@ -2739,7 +3066,7 @@ bool MainWindow::Initialize()
 	CreateAdvancedControls();
 	InstallInputOriginHooks();
 
-	SetTimer(_hWnd, TIMER_ANIMATION, 16, nullptr);
+	SetTimer(_hWnd, TIMER_SERVICE_POLL, 200, nullptr);
 	int corner = 2;
 	DwmSetWindowAttribute(_hWnd, 33, &corner, sizeof(corner));
 	OnFirstShow();
@@ -2892,7 +3219,9 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 		if (!self) return FALSE;
 		self->_hWnd = hwnd;
 		SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+#if DZJS_ENABLE_CAPTURE_EXCLUSION
 		JiYuWindowCapture::ExcludeWindowFromCapture(hwnd);
+#endif
 	}
 	if (!self) return DefWindowProcW(hwnd, message, wParam, lParam);
 	if (self->WM_TASKBARCREATED != 0 && message == static_cast<UINT>(self->WM_TASKBARCREATED)) {
@@ -2903,7 +3232,13 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 	switch (message) {
 	case WM_ERASEBKGND: return 1;
 	case WM_PAINT: self->Paint(); return 0;
-	case WM_SIZE: self->LayoutEmbeddedWindows(); InvalidateRect(hwnd, nullptr, FALSE); return 0;
+	case WM_SIZE: {
+		// 最小化时客户区是 0x0，没必要重排控件，也避免把后备缓冲建成 0 尺寸。
+		if (wParam == SIZE_MINIMIZED) return 0;
+		self->LayoutEmbeddedWindows();
+		InvalidateRect(hwnd, nullptr, FALSE);
+		return 0;
+	}
 	case WM_GETMINMAXINFO: {
 		auto info = reinterpret_cast<MINMAXINFO*>(lParam);
 		info->ptMinTrackSize = { 960, 760 };
@@ -2921,6 +3256,8 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 	case WM_MOUSELEAVE:
 		self->mouseTracking = false;
 		self->hoverTarget = -1;
+		self->pressTarget = -1;
+		self->EnsureAnimationTimer();
 		InvalidateRect(hwnd, nullptr, FALSE);
 		return 0;
 	case WM_MOUSEWHEEL: {
@@ -2955,27 +3292,98 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 		if ((wParam & 0xFFF0) == SC_CLOSE && !self->closeButtonClickPending)
 			return 0;
 		break;
+	case WM_LBUTTONDOWN: {
+		// 只是记住按下的目标，用来给按钮画"按下去"的样子；真正的动作仍在抬起时执行。
+		POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+		if (self->UpdateDialogVisible()) {
+			self->pressTarget = self->HitUpdateDialogAt(point);
+			if (self->pressTarget >= 0) {
+				self->EnsureAnimationTimer();
+				InvalidateRect(hwnd, nullptr, FALSE);
+			}
+			return 0;
+		}
+		self->focusTarget = -1;
+		self->pressTarget = self->HitTargetAt(point);
+		if (self->pressTarget >= 0) {
+			self->EnsureAnimationTimer();
+			InvalidateRect(hwnd, nullptr, FALSE);
+		}
+		return 0;
+	}
 	case WM_LBUTTONUP: {
 		POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
 		self->HandleClick(point);
+		self->pressTarget = -1;
+		self->EnsureAnimationTimer();
 		return 0;
 	}
+	case WM_KEYDOWN:
+	case WM_SYSKEYDOWN:
+		// 录制快捷键时，主键先归这里，别让 DefWindowProc 抢去（Alt 会拉系统菜单）。
+		if (self->hotkeyCaptureIndex >= 0) {
+			self->HandleHotkeyKey(static_cast<UINT>(wParam));
+			return 0;
+		}
+		// 弹窗上的 Esc：等同关掉/取消，不让它去清焦点环。
+		if (self->UpdateDialogVisible() && wParam == VK_ESCAPE) {
+			if (self->updateDialog.mode == UpdateDialogMode::Confirm) {
+				self->CloseUpdateDialog();
+				self->ShowFastTip(L"已取消更新");
+			}
+			else if (self->updateDialog.mode == UpdateDialogMode::Failed) {
+				self->CloseUpdateDialog();
+			}
+			return 0;
+		}
+		// 键盘操作：Tab 走焦点，Enter/Space 触发，Esc 取消。
+		if (wParam == VK_TAB) {
+			self->MoveFocus((GetKeyState(VK_SHIFT) & 0x8000) != 0);
+			return 0;
+		}
+		if ((wParam == VK_RETURN || wParam == VK_SPACE) && self->ActivateFocus()) {
+			return 0;
+		}
+		if (wParam == VK_ESCAPE && self->focusTarget >= 0) {
+			self->focusTarget = -1;
+			InvalidateRect(hwnd, nullptr, FALSE);
+			return 0;
+		}
+		break;
+	case WM_KILLFOCUS:
+		if (self->hotkeyCaptureIndex >= 0) {
+			self->hotkeyCaptureIndex = -1;
+			InvalidateRect(hwnd, nullptr, FALSE);
+		}
+		break;
 	case WM_TIMER: self->OnWmTimer(wParam); return 0;
 	case WM_COMMAND: self->OnWmCommand(wParam); return 0;
 	case WM_DRAWITEM: {
 		auto item = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
 		if (item && ((item->CtlID >= IDC_NET_DETECT_PORT && item->CtlID <= IDC_NET_SCAN) || item->CtlID == IDC_NET_TEACHER ||
 			(item->CtlID >= IDC_TEACHER_REFRESH && item->CtlID <= IDC_TEACHER_REBOOT) || item->CtlID == IDC_TEACHER_VIEW || item->CtlID == IDC_TEACHER_CHAT_SEND)) {
-			DrawNativeButton(item, self->controlFont, self->darkMode);
+			DrawNativeButton(item, self->controlFont, self->darkMode, NativeButtonHoverMap()[item->hwndItem]);
 			return TRUE;
 		}
 		break;
 	}
 	case WM_CTLCOLOREDIT:
-	case WM_CTLCOLORLISTBOX: {
+	case WM_CTLCOLORLISTBOX:
+	// STATIC 也要接管，否则教师端宿主框（WS_EX_CLIENTEDGE）会用系统灰
+	// COLOR_BTNFACE 画底，把下面自绘的圆角卡片盖成一个灰方块。
+	case WM_CTLCOLORSTATIC: {
 		HDC controlDc = reinterpret_cast<HDC>(wParam);
+		// 高级配置页的输入框要跟自绘的圆角框同色，否则控件那块方底色会顶出来。
+		const int controlId = GetDlgCtrlID(reinterpret_cast<HWND>(lParam));
+		if (controlId == IDC_ADV_INTERVAL) {
+			SetTextColor(controlDc, self->darkMode ? RGB(222, 230, 226) : RGB(35, 42, 39));
+			SetBkColor(controlDc, self->darkMode ? RGB(26, 33, 30) : RGB(255, 255, 255));
+			if (!self->advancedFieldBrush) break;
+			return reinterpret_cast<LRESULT>(self->advancedFieldBrush);
+		}
 		SetTextColor(controlDc, self->darkMode ? RGB(222, 230, 226) : RGB(35, 42, 39));
 		SetBkColor(controlDc, self->darkMode ? RGB(38, 45, 42) : RGB(255, 255, 255));
+		if (!self->controlSurfaceBrush) break;
 		return reinterpret_cast<LRESULT>(self->controlSurfaceBrush);
 	}
 	case WM_COPYDATA: {
@@ -2993,6 +3401,13 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 	case WM_USER: self->OnWmUser(wParam, lParam); return 0;
 	case WM_NATIVE_REFRESH: InvalidateRect(hwnd, nullptr, FALSE); return 0;
 	case WM_AV_SCAN_FINISHED: self->FinishAvProcessScan(); return 0;
+	case WM_UPDATE_DOWNLOAD_STATE:
+		self->OnUpdateDownloadState(wParam, lParam);
+		return 0;
+	case WM_JUP_DOWNLOAD_PROGRESS:
+		// 下载子进程发来的真实进度。跨进程消息，wParam/lParam 里只有数值。
+		self->OnChildDownloadProgress(wParam, lParam);
+		return 0;
 	case WM_UPDATE_PROBE_DONE: {
 		// 探测线程把结果投回来了。上下文由本线程负责释放。
 		UpdateProbeContext* context = reinterpret_cast<UpdateProbeContext*>(lParam);
@@ -3052,34 +3467,94 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 	return DefWindowProcW(hwnd, message, wParam, lParam);
 }
 
+void MainWindow::ReleaseBackBuffer()
+{
+	// Bitmap 只是包住 DIB 的内存，必须先于 DIB 释放，否则析构时会碰到已回收的像素。
+	delete backBuffer;
+	backBuffer = nullptr;
+	if (backBufferDc) {
+		if (backBufferPreviousBitmap) SelectObject(backBufferDc, backBufferPreviousBitmap);
+		backBufferPreviousBitmap = nullptr;
+		DeleteDC(backBufferDc);
+		backBufferDc = nullptr;
+	}
+	if (backBufferDib) {
+		DeleteObject(backBufferDib);
+		backBufferDib = nullptr;
+	}
+	backBufferBits = nullptr;
+	backBufferWidth = 0;
+	backBufferHeight = 0;
+}
+
+bool MainWindow::EnsureBackBuffer(int width, int height)
+{
+	if (backBuffer && backBufferWidth == width && backBufferHeight == height) return true;
+	ReleaseBackBuffer();
+	BITMAPINFO info{};
+	info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+	info.bmiHeader.biWidth = width;
+	info.bmiHeader.biHeight = -height; // 负值 = 自上而下，行序与 GDI+ 一致
+	info.bmiHeader.biPlanes = 1;
+	info.bmiHeader.biBitCount = 32;
+	info.bmiHeader.biCompression = BI_RGB;
+	HDC screen = GetDC(nullptr);
+	if (!screen) return false;
+	backBufferDib = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &backBufferBits, nullptr, 0);
+	backBufferDc = CreateCompatibleDC(screen);
+	ReleaseDC(nullptr, screen);
+	if (!backBufferDib || !backBufferDc || !backBufferBits) {
+		ReleaseBackBuffer();
+		return false;
+	}
+	backBufferPreviousBitmap = SelectObject(backBufferDc, backBufferDib);
+	backBuffer = new Bitmap(width, height, width * 4, PixelFormat32bppPARGB,
+		static_cast<BYTE*>(backBufferBits));
+	if (backBuffer->GetLastStatus() != Ok) {
+		ReleaseBackBuffer();
+		return false;
+	}
+	backBufferWidth = width;
+	backBufferHeight = height;
+	return true;
+}
+
 void MainWindow::Paint()
 {
+	static LARGE_INTEGER frequency{};
+	if (frequency.QuadPart == 0) QueryPerformanceFrequency(&frequency);
+	LARGE_INTEGER paintStarted{};
+	QueryPerformanceCounter(&paintStarted);
 	PAINTSTRUCT ps{};
 	HDC dc = BeginPaint(_hWnd, &ps);
+	{
+		const ULONGLONG now = GetTickCount64();
+		if (lastPaintTick != 0) {
+			const double delta = static_cast<double>(now - lastPaintTick) / 1000.0;
+			frameDelta = (std::max)(0.001, (std::min)(0.05, delta));
+		}
+		lastPaintTick = now;
+	}
 	RECT client{};
 	GetClientRect(_hWnd, &client);
 	const int width = client.right;
 	const int height = client.bottom;
-	if (width <= 0 || height <= 0) {
+	if (width <= 0 || height <= 0 || !EnsureBackBuffer(width, height)) {
 		EndPaint(_hWnd, &ps);
 		return;
-	}
-	if (!backBuffer || backBufferWidth != width || backBufferHeight != height) {
-		delete backBuffer;
-		backBuffer = new Bitmap(width, height, PixelFormat32bppPARGB);
-		backBufferWidth = width;
-		backBufferHeight = height;
 	}
 	Graphics g(backBuffer);
 	g.SetSmoothingMode(SmoothingModeAntiAlias);
 	// ClearType assumes an opaque target; the ARGB back buffer needs alpha-safe antialiasing.
 	g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
-	g.Clear(C(darkMode, 246, 248, 246, 17, 20, 19));
+	// 三层表面明度：侧栏 (226,234,230) 低于 画布 (237,242,239) 低于 卡片 (255,255,255)。
+	// 原来画布 (246,248,246) 与白卡只差 9 级，卡片完全浮不起来。
+	g.Clear(C(darkMode, 237, 242, 239, 15, 18, 17));
 
 	PaintNavigation(g, height);
 	PaintHeader(g, width);
-	const double easedMotion = 1.0 - pow(1.0 - pageMotion, 3.0);
-	const int offset = static_cast<int>((1.0 - easedMotion) * 18.0);
+	const double easedMotion = 1.0 - pow(1.0 - pageMotion, 4.0);
+	const int offset = static_cast<int>((1.0 - easedMotion) * 22.0);
 	switch (page) {
 	case Page::Overview: PaintOverview(g, width, height, offset); break;
 	case Page::Protection: PaintProtection(g, width, height, offset); break;
@@ -3092,46 +3567,96 @@ void MainWindow::Paint()
 	case Page::Logs: PaintLogs(g, width, height, offset); break;
 	case Page::About: PaintAbout(g, width, height, offset); break;
 	}
-	PaintToast(g, width);
-	Graphics target(dc);
-	target.DrawImage(backBuffer, 0, 0);
+	// 键盘焦点环。只在 Tab 导航时出现，鼠标点击会清掉。
+	// 更新弹窗有自己的一套焦点环（画在卡片里），这里跳过，免得环被卡片盖住。
+	if (focusTarget >= 0 && !UpdateDialogVisible()) {
+		RECT focusRect{};
+		if (TargetRect(focusTarget, &focusRect)) {
+			const RectF ring(static_cast<REAL>(focusRect.left) - 3.0f, static_cast<REAL>(focusRect.top) - 3.0f,
+				static_cast<REAL>(focusRect.right - focusRect.left) + 6.0f,
+				static_cast<REAL>(focusRect.bottom - focusRect.top) + 6.0f);
+			const float ringRadius = (std::min)(ring.Height / 2.0f, 20.0f);
+			StrokeRound(g, ring, ringRadius, C(darkMode, 0, 107, 95, 130, 213, 199), 2.0f);
+		}
+	}
+	PaintToast(g, width, height);
+	// 弹窗画在最后：提示条、页面内容、焦点环都得在它下面。
+	PaintUpdateDialog(g, width, height);
+	// 直接 BitBlt 到窗口 DC：比 Graphics::DrawImage 快约 45 倍。
+	// BeginPaint 拿到的 DC 已经按更新区裁剪，被子控件挡住的部分不会覆盖。
+	BitBlt(dc, 0, 0, width, height, backBufferDc, 0, 0, SRCCOPY);
 	EndPaint(_hWnd, &ps);
+	LARGE_INTEGER paintEnded{};
+	QueryPerformanceCounter(&paintEnded);
+	LogPaintDuration(static_cast<double>(paintEnded.QuadPart - paintStarted.QuadPart) * 1000.0 /
+		static_cast<double>(frequency.QuadPart));
+}
+
+void MainWindow::LogPaintDuration(double milliseconds)
+{
+	// 只在连续动画（悬停渐变、翻页）期间才有参考价值，所以按帧数汇总，
+	// 每 300 帧输出一行，平时几乎不会写日志。
+	static double totalMs = 0.0;
+	static double worstMs = 0.0;
+	static int frames = 0;
+	totalMs += milliseconds;
+	if (milliseconds > worstMs) worstMs = milliseconds;
+	if (++frames < 300) return;
+	if (currentLogger) {
+		currentLogger->LogInfo(L"UI 帧耗时：平均 %.2f ms / 最慢 %.2f ms（%d 帧）",
+			totalMs / frames, worstMs, frames);
+	}
+	totalMs = 0.0;
+	worstMs = 0.0;
+	frames = 0;
 }
 
 void MainWindow::PaintNavigation(Graphics& g, int height)
 {
 	const bool d = darkMode;
-	SolidBrush side(C(d, 235, 241, 238, 27, 33, 31));
+	SolidBrush side(C(d, 226, 234, 230, 24, 29, 27));
 	g.FillRectangle(&side, 0, 0, 220, height);
 
-	FillRound(g, RectF(20, 18, 44, 44), 8, C(d, 0, 107, 95, 130, 213, 199));
+	{
+		// 品牌块用同色系线性渐变，比纯色方块有质感得多。
+		LinearGradientBrush logoBrush(PointF(20.0f, 18.0f), PointF(64.0f, 62.0f),
+			C(d, 0, 133, 117, 148, 233, 219), C(d, 0, 76, 67, 100, 186, 173));
+		FillRound(g, RectF(20, 18, 44, 44), 12, logoBrush);
+	}
 	Text(g, L"J", 20, 24, 44, 32, 21, FontStyleBold, C(d, 255, 255, 255, 0, 55, 49), StringAlignmentCenter);
 	Text(g, L"Dzjs Trainer", 76, 21, 128, 24, 15, FontStyleBold, C(d, 26, 29, 28, 226, 232, 229));
-	Text(g, L"\u8bbe\u5907\u9632\u62a4\u4e2d\u5fc3", 76, 44, 128, 18, 10, FontStyleRegular, C(d, 67, 72, 70, 191, 200, 196));
-	Text(g, L"\u5de5\u4f5c\u533a", 24, 94, 150, 18, 10, FontStyleBold, C(d, 91, 97, 94, 164, 174, 169));
+	Text(g, L"\u8bbe\u5907\u9632\u62a4\u4e2d\u5fc3", 76, 44, 128, 18, 11, FontStyleRegular, C(d, 67, 72, 70, 191, 200, 196));
+	Text(g, L"\u5de5\u4f5c\u533a", 24, 94, 150, 18, 11, FontStyleBold, C(d, 91, 97, 94, 164, 174, 169));
 
 	const int navIcons[] = { 0, 1, 5, 5, 6, 3, 0, 2, 3, 6 };
 	for (int i = 0; i < 10; ++i) {
 		const float y = 110.0f + i * 45.0f;
 		navRects[i] = { 12, static_cast<LONG>(y), 208, static_cast<LONG>(y + 40) };
 		const bool active = static_cast<int>(page) == i;
-		if (active) {
-			FillRound(g, RectF(12, y, 196, 40), 20, C(d, 183, 232, 222, 42, 79, 72));
-		}
-		else if (hoverProgress[i] > 0.002f) {
+		if (!active && hoverProgress[i] > 0.002f) {
 			FillRound(g, RectF(12, y, 196, 40), 20,
 				Blend(C(d, 235, 241, 238, 27, 33, 31), C(d, 220, 229, 225, 39, 47, 44), hoverProgress[i]));
 		}
+	}
+	{
+		// 选中胶囊按浮点位置绘制，翻页时从上一项滑到下一项，不是瞬间跳。
+		const float pillY = 110.0f + navIndicator * 45.0f;
+		FillRound(g, RectF(12, pillY, 196, 40), 20, C(d, 183, 232, 222, 42, 79, 72));
+	}
+	for (int i = 0; i < 10; ++i) {
+		const float y = 110.0f + i * 45.0f;
+		const bool active = static_cast<int>(page) == i;
 		const Color navColor = active ? C(d, 0, 81, 72, 156, 240, 225) : C(d, 58, 64, 61, 197, 207, 202);
 		DrawIcon(g, navIcons[i], 30, y + 10, navColor, 18);
-		Text(g, kNavLabels[i], 66, y + 9, 126, 22, 10, active ? FontStyleBold : FontStyleRegular, navColor);
+		Text(g, kNavLabels[i], 66, y + 9, 126, 22, 11, active ? FontStyleBold : FontStyleRegular, navColor);
 	}
 
-	FillRound(g, RectF(16, static_cast<float>(height - 82), 188, 62), 8, C(d, 221, 231, 226, 34, 42, 39));
+	FillRound(g, RectF(16, static_cast<float>(height - 82), 188, 62), 12, C(d, 255, 255, 255, 33, 40, 37));
+	StrokeRound(g, RectF(16, static_cast<float>(height - 82), 188, 62), 12, C(d, 216, 228, 222, 48, 56, 52));
 	SolidBrush online(C(d, 0, 107, 95, 130, 213, 199));
 	g.FillEllipse(&online, 32, height - 59, 10, 10);
-	Text(g, L"\u9632\u62a4\u670d\u52a1\u5df2\u5c31\u7eea", 54, static_cast<float>(height - 66), 136, 20, 10, FontStyleBold, C(d, 35, 42, 39, 222, 230, 226));
-	Text(g, NavVersionLine().c_str(), 54, static_cast<float>(height - 45), 136, 16, 9, FontStyleRegular, C(d, 91, 99, 95, 166, 177, 171));
+	Text(g, L"\u9632\u62a4\u670d\u52a1\u5df2\u5c31\u7eea", 54, static_cast<float>(height - 66), 136, 20, 11, FontStyleBold, C(d, 35, 42, 39, 222, 230, 226));
+	Text(g, NavVersionLine().c_str(), 54, static_cast<float>(height - 45), 136, 16, 10, FontStyleRegular, C(d, 91, 99, 95, 166, 177, 171));
 }
 
 void MainWindow::PaintHeader(Graphics& g, int width)
@@ -3139,24 +3664,93 @@ void MainWindow::PaintHeader(Graphics& g, int width)
 	const int pageIndex = static_cast<int>(page);
 	const bool topMostEnabled = setTopMost && IsWindowActuallyTopmost(_hWnd);
 	const wchar_t* topMostText = !topMostEnabled
-		? L"\u7f6e\u9876\uff1a\u672a\u5f00\u542f"
+		? L"\u8d85\u7ea7\u7f6e\u9876\uff1a\u672a\u5f00\u542f"
 		: (topMostUiAccessBand ? L"\u8d85\u7ea7\u7f6e\u9876\uff1a\u5df2\u5f00\u542f" : L"\u666e\u901a\u7f6e\u9876\uff1a\u5df2\u5f00\u542f");
 	Text(g, kPageTitles[pageIndex], 248, 22, 430, 34, 23, FontStyleBold, C(darkMode, 28, 32, 30, 227, 233, 230));
-	Text(g, page == Page::Overview ? L"\u5f53\u524d\u8bbe\u5907\u7684\u8fd0\u884c\u4e0e\u9632\u62a4\u72b6\u6001" : L"Dzjs Trainer  \u00b7  \u672c\u673a", 248, 55, 440, 18, 10,
+	Text(g, page == Page::Overview ? L"\u5f53\u524d\u8bbe\u5907\u7684\u8fd0\u884c\u4e0e\u9632\u62a4\u72b6\u6001" : L"Dzjs Trainer  \u00b7  \u672c\u673a", 248, 55, 440, 18, 11 ,
 		FontStyleRegular, C(darkMode, 86, 92, 89, 174, 184, 179));
 
-	superTopMostRect = { width - 214, 20, width - 88, 68 };
-	const float superX = static_cast<float>(width - 208);
+	superTopMostRect = { width - 224, 20, width - 92, 68 };
+	const float superX = static_cast<float>(width - 218);
 	const bool superHover = hoverTarget == 80;
-	FillRound(g, RectF(superX, 26, 118, 36), 18,
+	FillRound(g, RectF(superX, 26, 126, 36), 18,
 		topMostEnabled ? C(darkMode, 185, 226, 217, 43, 76, 69) :
-			(superHover ? C(darkMode, 220, 237, 231, 49, 63, 58) : C(darkMode, 237, 242, 239, 31, 37, 34)));
-	Text(g, topMostText, superX, 36, 118, 18, 10, FontStyleBold,
+			(superHover ? C(darkMode, 220, 237, 231, 49, 63, 58) : C(darkMode, 251, 253, 252, 33, 40, 37)));
+	if (!topMostEnabled) {
+		StrokeRound(g, RectF(superX, 26, 126, 36), 18, C(darkMode, 219, 228, 223, 48, 56, 52));
+	}
+	Text(g, topMostText, superX, 36, 126, 18, 11, FontStyleBold,
 		topMostEnabled ? C(darkMode, 0, 81, 72, 155, 239, 224) : C(darkMode, 42, 48, 45, 220, 229, 225), StringAlignmentCenter);
-	themeRect = { width - 76, 20, width - 28, 68 };
+	themeRect = { width - 80, 20, width - 24, 68 };
 	const bool themeHover = hoverTarget == 41;
-	if (themeHover) FillRound(g, RectF(static_cast<float>(width - 76), 20, 48, 48), 24, C(darkMode, 226, 233, 229, 39, 47, 44));
-	DrawIcon(g, darkMode ? 8 : 9, static_cast<float>(width - 62), 34, C(darkMode, 52, 59, 56, 205, 215, 210), 20);
+	// 常驻一个浅色圆形底，否则月亮图标孤零零浮在标题栏里，看不出是可点的按钮。
+	FillRound(g, RectF(static_cast<float>(width - 78), 22, 44, 44), 22,
+		themeHover ? C(darkMode, 224, 233, 228, 41, 50, 46) : C(darkMode, 246, 249, 247, 30, 36, 34));
+	DrawIcon(g, darkMode ? 8 : 9, static_cast<float>(width - 66), 34, C(darkMode, 52, 59, 56, 205, 215, 210), 20);
+}
+
+void MainWindow::PaintButton(Graphics& g, const RectF& rect, LPCWSTR label, int hoverId,
+	ButtonStyle style, float radius, int icon, bool enabled)
+{
+	// 四种语义色 + 三态（常态/悬停/按下）。所有自绘按钮都走这里，
+	// 免得每个页面各拼一套颜色，hover 有的一有的一无。
+	const bool pressed = enabled && pressTarget == hoverId;
+	const float hover = enabled ? hoverProgress[hoverId] : 0.0f;
+	const float sink = pressed ? 1.0f : 0.0f;
+	Color fill;
+	Color textColor;
+	switch (style) {
+	case ButtonStyle::Primary:
+		fill = pressed ? C(darkMode, 0, 74, 66, 108, 186, 173)
+			: Blend(C(darkMode, 0, 107, 95, 130, 213, 199), C(darkMode, 0, 82, 73, 154, 232, 217), hover);
+		textColor = C(darkMode, 255, 255, 255, 0, 55, 49);
+		break;
+	case ButtonStyle::Tonal:
+		fill = pressed ? C(darkMode, 190, 222, 212, 42, 71, 64)
+			: Blend(C(darkMode, 226, 241, 234, 43, 76, 69), C(darkMode, 206, 232, 222, 56, 98, 88), hover);
+		textColor = C(darkMode, 0, 81, 72, 177, 239, 228);
+		break;
+	case ButtonStyle::Danger:
+		fill = pressed ? C(darkMode, 232, 190, 182, 96, 52, 46)
+			: Blend(C(darkMode, 246, 221, 214, 52, 50, 48), C(darkMode, 236, 198, 190, 76, 59, 54), hover);
+		textColor = C(darkMode, 165, 48, 37, 240, 172, 158);
+		break;
+	default: // Ghost
+		fill = pressed ? C(darkMode, 230, 237, 233, 40, 47, 44)
+			: Blend(C(darkMode, 247, 250, 248, 32, 38, 35), C(darkMode, 233, 240, 236, 45, 53, 49), hover);
+		textColor = C(darkMode, 52, 62, 57, 214, 224, 219);
+		break;
+	}
+	if (!enabled) {
+		fill = C(darkMode, 240, 244, 241, 34, 39, 37);
+		textColor = C(darkMode, 156, 165, 160, 110, 120, 115);
+	}
+	const RectF body(rect.X, rect.Y + sink, rect.Width, rect.Height);
+	if (enabled && (style == ButtonStyle::Primary || style == ButtonStyle::Tonal)) {
+		SoftShadow(g, body, radius, darkMode, (pressed ? 0.30f : 0.50f) + hover * 0.40f);
+	}
+	FillRound(g, body, radius, fill);
+	if (style == ButtonStyle::Ghost) {
+		StrokeRound(g, body, radius, enabled ? C(darkMode, 219, 228, 223, 46, 55, 51)
+			: C(darkMode, 232, 237, 234, 40, 47, 43));
+	}
+	const float textTop = rect.Y + sink + (rect.Height - 20.0f) / 2.0f;
+	if (icon >= 0) {
+		const Color iconColor = style == ButtonStyle::Primary ? textColor
+			: (style == ButtonStyle::Danger ? textColor : C(darkMode, 0, 107, 95, 130, 213, 199));
+		DrawIcon(g, icon, rect.X + 14.0f, rect.Y + sink + (rect.Height - 16.0f) / 2.0f,
+			enabled ? iconColor : textColor, 16);
+		Text(g, label, rect.X + 38.0f, textTop, rect.Width - 52.0f, 20, 11, FontStyleBold, textColor);
+	}
+	else {
+		Text(g, label, rect.X + 6.0f, textTop, rect.Width - 12.0f, 20, 11, FontStyleBold, textColor,
+			StringAlignmentCenter);
+	}
+}
+
+void MainWindow::PaintPrimaryButton(Graphics& g, const RectF& rect, LPCWSTR label, int hoverId, float radius)
+{
+	PaintButton(g, rect, label, hoverId, ButtonStyle::Primary, radius);
 }
 
 void MainWindow::RequestSuperTopmost()
@@ -3172,6 +3766,26 @@ void MainWindow::RequestSuperTopmost()
 		SaveSettings();
 		ShowFastTip(L"\u5df2\u53d6\u6d88\u7f6e\u9876");
 		InvalidateRect(_hWnd, nullptr, FALSE);
+		return;
+	}
+	// 普通置顶只能设 HWND_TOPMOST，挡不住「前台窗口强制上浮」这类竞争。
+	// 要拿到不受影响的窗口带，进程必须带 TokenUIAccess，那就得重启自身一次。
+	// 这段与 v1.0.2 一致：那一版就是靠它让"超级置顶"真正生效的。
+	if (!IsCurrentProcessUiAccessEnabled()) {
+		const UiAccessLaunchResult launch = RelaunchWithUiAccess();
+		if (launch.success) {
+			if (auto settings = JTAppGetSettingsDirect())
+				settings->SetSettingBool(L"TopMost", true);
+			isUserCancel = true;
+			DestroyWindow(_hWnd);
+			return;
+		}
+		const std::wstring detail = launch.step + L" 失败，错误码: " +
+			std::to_wstring(static_cast<unsigned long>(launch.error));
+		ShowFastTip(L"超级置顶启动失败");
+		if (currentLogger) currentLogger->LogError(L"超级置顶启动失败: %s", detail.c_str());
+		MessageBoxW(_hWnd, detail.c_str(), L"超级置顶启动失败",
+			MB_OK | MB_ICONERROR | MB_TOPMOST);
 		return;
 	}
 	bool bandApplied = false;
@@ -3194,54 +3808,72 @@ void MainWindow::PaintOverview(Graphics& g, int width, int height, int offsetY)
 	const float top = 94.0f + offsetY;
 	const Color primary = C(darkMode, 0, 107, 95, 130, 213, 199);
 	const Color onPrimary = C(darkMode, 255, 255, 255, 0, 55, 49);
-	FillRound(g, RectF(contentX, top, contentW, 170), 8, C(darkMode, 219, 239, 233, 28, 55, 50));
+	SoftShadow(g, RectF(contentX, top, contentW, 170), 12, darkMode);
+	FillRound(g, RectF(contentX, top, contentW, 170), 12, C(darkMode, 219, 239, 233, 28, 55, 50));
 	FillRound(g, RectF(contentX + 24, top + 22, 96, 28), 14, C(darkMode, 185, 226, 217, 43, 76, 69));
-	Text(g, L"\u9632\u62a4\u4e2d", contentX + 24, top + 29, 96, 18, 10, FontStyleBold, C(darkMode, 0, 81, 72, 155, 239, 224), StringAlignmentCenter);
+	Text(g, L"\u9632\u62a4\u4e2d", contentX + 24, top + 29, 96, 18, 11, FontStyleBold, C(darkMode, 0, 81, 72, 155, 239, 224), StringAlignmentCenter);
 	Text(g, statusTitle.c_str(), contentX + 24, top + 64, contentW - 230, 38, 23, FontStyleBold, C(darkMode, 25, 35, 32, 225, 236, 232));
 	Text(g, statusDetail.c_str(), contentX + 24, top + 108, contentW - 230, 38, 11, FontStyleRegular, C(darkMode, 65, 79, 74, 178, 197, 190));
 
-	const float badgeX = contentX + contentW - 158;
-	const float badgeY = top + 27;
-	FillRound(g, RectF(badgeX, badgeY, 126, 116), 8, primary);
-	DrawIcon(g, 1, badgeX + 48, badgeY + 20, onPrimary, 30);
-	Text(g, studentRunning ? L"\u5df2\u8fde\u63a5" : L"\u5f85\u68c0\u6d4b", badgeX + 12, badgeY + 60, 102, 25, 14, FontStyleBold, onPrimary, StringAlignmentCenter);
-	Text(g, studentRunning ? L"StudentMain" : L"\u8fdb\u7a0b\u672a\u8fd0\u884c", badgeX + 12, badgeY + 88, 102, 18, 9, FontStyleRegular, onPrimary, StringAlignmentCenter);
+	const float badgeX = contentX + contentW - 152;
+	const float badgeY = top + 29;
+	FillRound(g, RectF(badgeX, badgeY, 120, 112), 20, primary);
+	DrawIcon(g, 1, badgeX + 46, badgeY + 18, onPrimary, 28);
+	Text(g, studentRunning ? L"\u5df2\u8fde\u63a5" : L"\u5f85\u68c0\u6d4b", badgeX + 8, badgeY + 56, 104, 26, 15, FontStyleBold, onPrimary, StringAlignmentCenter);
+	Text(g, studentRunning ? L"StudentMain" : L"\u8fdb\u7a0b\u672a\u8fd0\u884c", badgeX + 8, badgeY + 84, 104, 18, 10, FontStyleRegular, onPrimary, StringAlignmentCenter);
 
 	const float gap = 12.0f;
 	const float cardW = (contentW - gap * 2) / 3.0f;
 	const float metricsY = top + 186;
 	for (int i = 0; i < 3; ++i) {
 		const float x = contentX + i * (cardW + gap);
-		FillRound(g, RectF(x, metricsY, cardW, 94), 8, C(darkMode, 255, 255, 255, 28, 33, 31));
-		StrokeRound(g, RectF(x, metricsY, cardW, 94), 8, C(darkMode, 198, 203, 200, 67, 75, 71));
+		SoftShadow(g, RectF(x, metricsY, cardW, 94), 12, darkMode);
+		FillRound(g, RectF(x, metricsY, cardW, 94), 12, C(darkMode, 255, 255, 255, 28, 33, 31));
+		StrokeRound(g, RectF(x, metricsY, cardW, 94), 12, C(darkMode, 222, 228, 224, 52, 60, 56));
 	}
-	Text(g, L"\u9632\u62a4\u72b6\u6001", contentX + 18, metricsY + 15, cardW - 32, 18, 10, FontStyleRegular, C(darkMode, 91, 97, 94, 169, 179, 174));
-	Text(g, currentControlled ? L"\u5b8c\u6574\u9632\u62a4" : L"\u6b63\u5728\u76d1\u63a7", contentX + 18, metricsY + 42, cardW - 32, 28, 16, FontStyleBold, C(darkMode, 32, 38, 35, 223, 231, 227));
+	Text(g, L"\u9632\u62a4\u72b6\u6001", contentX + 18, metricsY + 15, cardW - 32, 18, 11, FontStyleRegular, C(darkMode, 91, 97, 94, 169, 179, 174));
+	Text(g, currentControlled ? L"\u5b8c\u6574\u9632\u62a4" : L"\u6b63\u5728\u76d1\u63a7", contentX + 18, metricsY + 42, cardW - 32, 28, 16, FontStyleBold, C(darkMode, 24, 30, 27, 226, 233, 229));
 	wchar_t pidText[64];
 	swprintf_s(pidText, L"PID  %lu", static_cast<unsigned long>(studentPid));
-	Text(g, L"\u5b66\u751f\u7aef\u8fdb\u7a0b", contentX + cardW + gap + 18, metricsY + 15, cardW - 32, 18, 10, FontStyleRegular, C(darkMode, 91, 97, 94, 169, 179, 174));
-	Text(g, studentRunning ? pidText : L"\u672a\u8fd0\u884c", contentX + cardW + gap + 18, metricsY + 42, cardW - 32, 28, 16, FontStyleBold, C(darkMode, 32, 38, 35, 223, 231, 227));
-	Text(g, L"\u68c0\u6d4b\u8def\u5f84", contentX + (cardW + gap) * 2 + 18, metricsY + 15, cardW - 32, 18, 10, FontStyleRegular, C(darkMode, 91, 97, 94, 169, 179, 174));
-	Text(g, studentPath.c_str(), contentX + (cardW + gap) * 2 + 18, metricsY + 40, cardW - 34, 38, 10, FontStyleBold, C(darkMode, 32, 38, 35, 223, 231, 227));
+	Text(g, L"\u5b66\u751f\u7aef\u8fdb\u7a0b", contentX + cardW + gap + 18, metricsY + 15, cardW - 32, 18, 11, FontStyleRegular, C(darkMode, 91, 97, 94, 169, 179, 174));
+	Text(g, studentRunning ? pidText : L"\u672a\u8fd0\u884c", contentX + cardW + gap + 18, metricsY + 42, cardW - 32, 28, 16, FontStyleBold, C(darkMode, 24, 30, 27, 226, 233, 229));
+	Text(g, L"\u68c0\u6d4b\u8def\u5f84", contentX + (cardW + gap) * 2 + 18, metricsY + 15, cardW - 32, 18, 11, FontStyleRegular, C(darkMode, 91, 97, 94, 169, 179, 174));
+	Text(g, studentPath.c_str(), contentX + (cardW + gap) * 2 + 18, metricsY + 40, cardW - 34, 38, 11, FontStyleBold, C(darkMode, 24, 30, 27, 226, 233, 229));
 
 	const float actionsY = metricsY + 110;
-	FillRound(g, RectF(contentX, actionsY, contentW, static_cast<float>(height) - actionsY - 20), 8, C(darkMode, 237, 242, 239, 31, 37, 34));
-	Text(g, L"\u5feb\u6377\u64cd\u4f5c", contentX + 20, actionsY + 16, 180, 24, 14, FontStyleBold, C(darkMode, 32, 38, 35, 223, 231, 227));
-	Text(g, L"\u5e38\u7528\u7684\u8fd0\u884c\u63a7\u5236\u548c\u8bbe\u5907\u5de5\u5177", contentX + 20, actionsY + 42, 300, 18, 9, FontStyleRegular, C(darkMode, 91, 99, 95, 166, 177, 171));
-	const wchar_t* labels[] = { L"\u9632\u62a4\u72b6\u6001", setTopMost ? L"\u53d6\u6d88\u7f6e\u9876" : L"\u5f00\u542f\u7f6e\u9876", studentRunning ? L"\u7ed3\u675f\u6781\u57df" : L"\u91cd\u542f\u6781\u57df", L"\u63a7\u5236\u4e0e\u8bbe\u7f6e", L"\u7535\u6e90\u63a7\u5236" };
-	const float actionGap = 10.0f;
+	const float actionGap = 12.0f;
 	const float actionW = (contentW - 40 - actionGap * 4) / 5.0f;
+	const float actionH = 116.0f;
+	// 卡片按内容收缩（标题 64 + 按钮 + 底部 24）。撑满窗口会让这一页下半截
+	// 空出一大块 —— 空白的画布比空白的大卡片看起来自然得多。
+	const float actionsH = 64.0f + actionH + 24.0f;
+	SoftShadow(g, RectF(contentX, actionsY, contentW, actionsH), 12, darkMode);
+	FillRound(g, RectF(contentX, actionsY, contentW, actionsH), 12, C(darkMode, 255, 255, 255, 33, 40, 37));
+	StrokeRound(g, RectF(contentX, actionsY, contentW, actionsH), 12, C(darkMode, 236, 241, 238, 45, 53, 49));
+	Text(g, L"\u5feb\u6377\u64cd\u4f5c", contentX + 20, actionsY + 18, 180, 24, 14, FontStyleBold, C(darkMode, 24, 30, 27, 226, 233, 229));
+	Text(g, L"\u5e38\u7528\u7684\u8fd0\u884c\u63a7\u5236\u548c\u8bbe\u5907\u5de5\u5177", contentX + 20, actionsY + 44, 340, 18, 10, FontStyleRegular, C(darkMode, 91, 99, 95, 166, 177, 171));
+	const wchar_t* labels[] = { L"\u9632\u62a4\u72b6\u6001", setTopMost ? L"\u53d6\u6d88\u7f6e\u9876" : L"\u5f00\u542f\u7f6e\u9876", studentRunning ? L"\u7ed3\u675f\u6781\u57df" : L"\u91cd\u542f\u6781\u57df", L"\u63a7\u5236\u4e0e\u8bbe\u7f6e", L"\u7535\u6e90\u63a7\u5236" };
+	const float actionY = actionsY + 64.0f;
 	for (int i = 0; i < 5; ++i) {
 		const float x = contentX + 20 + i * (actionW + actionGap);
-		const float y = actionsY + 70;
-		actionRects[i] = { static_cast<LONG>(x), static_cast<LONG>(y), static_cast<LONG>(x + actionW), static_cast<LONG>(y + 68) };
+		actionRects[i] = { static_cast<LONG>(x), static_cast<LONG>(actionY),
+			static_cast<LONG>(x + actionW), static_cast<LONG>(actionY + actionH) };
 		const float hover = hoverProgress[10 + i];
-		const Color base = i == 4 ? C(darkMode, 255, 248, 231, 47, 42, 30) : C(darkMode, 255, 255, 255, 37, 44, 41);
-		const Color over = i == 4 ? C(darkMode, 247, 232, 197, 64, 55, 34) : C(darkMode, 220, 237, 231, 49, 63, 58);
-		FillRound(g, RectF(x, y, actionW, 68), 8, Blend(base, over, hover));
+		const bool pressed = pressTarget == 10 + i;
+		const float sink = pressed ? 1.0f : 0.0f;
+		const Color base = i == 4 ? C(darkMode, 255, 246, 224, 58, 49, 28) : C(darkMode, 243, 248, 245, 39, 46, 43);
+		const Color over = i == 4 ? C(darkMode, 255, 236, 194, 76, 63, 34) : C(darkMode, 224, 240, 233, 51, 66, 60);
+		// 悬停时投影跟着加重一格，卡片才算"浮起来"；按下再压回去。
+		SoftShadow(g, RectF(x, actionY + sink, actionW, actionH), 12, darkMode,
+			pressed ? 0.3f : 0.35f + hover * 0.45f);
+		FillRound(g, RectF(x, actionY + sink, actionW, actionH), 12, Blend(base, over, hover));
 		const Color iconColor = i == 4 ? C(darkMode, 121, 86, 0, 241, 194, 98) : primary;
-		DrawIcon(g, i == 0 ? 1 : i == 1 ? 4 : i == 2 ? 5 : i == 3 ? 6 : 7, x + 14, y + 23, iconColor, 20);
-		Text(g, labels[i], x + 44, y + 21, actionW - 52, 28, 10, FontStyleBold, C(darkMode, 42, 48, 45, 220, 229, 225));
+		// 图标在上、文字在下，两者水平居中 —— 原来图标靠左、文字跟在右边，
+		// 按钮右侧会空掉一半。
+		DrawIcon(g, i == 0 ? 1 : i == 1 ? 4 : i == 2 ? 5 : i == 3 ? 6 : 7,
+			x + actionW / 2.0f - 14.0f, actionY + 24.0f + sink, iconColor, 28);
+		Text(g, labels[i], x + 8, actionY + 68 + sink, actionW - 16, 26, 12, FontStyleBold,
+			C(darkMode, 42, 48, 45, 220, 229, 225), StringAlignmentCenter);
 	}
 }
 
@@ -3251,24 +3883,44 @@ void MainWindow::PaintProtection(Graphics& g, int width, int height, int offsetY
 	const float y = 94.0f + offsetY;
 	const float w = static_cast<float>(width - 276);
 	const bool replacementPage = page == Page::Replacement;
-	FillRound(g, RectF(x, y, w, static_cast<float>(height) - y - 20), 8, C(darkMode, 237, 242, 239, 31, 37, 34));
+	// 防护策略页这里只有标题 + 4 行开关（内容到 y+378），卡片按内容收缩；
+	// 替换画面页下方还有整块预览面板，需要撑满可用高度。
+	// 固定 68px 行距时卡片只占 384px，窗口剩下的 250px 全是空白画布，
+	// 页面看着像没画完。改成按可用高度把四行开关均匀铺开。
+	const float fillHeight = (std::max)(320.0f, static_cast<float>(height) - y - 20.0f);
+	const float protectionCardH = replacementPage ? fillHeight : (std::min)(fillHeight, 560.0f);
+	// 标题区 88 + 底部留白 24，剩下按 4 个槽位平分。
+	const float toggleSlot = replacementPage ? 68.0f
+		: (std::max)(68.0f, (protectionCardH - 112.0f) / 4.0f);
+	// 行卡片在槽位里居中，槽位够大时最多长到 80，避免细长条看着像空行。
+	const float toggleRowH = (std::max)(62.0f, (std::min)(80.0f, toggleSlot - 14.0f));
+	SoftShadow(g, RectF(x, y, w, protectionCardH), 12, darkMode);
+	FillRound(g, RectF(x, y, w, protectionCardH), 12, C(darkMode, 255, 255, 255, 33, 40, 37));
 	if (!replacementPage) {
-	Text(g, L"\u884c\u4e3a\u63a7\u5236", x + 24, y + 20, 200, 28, 16, FontStyleBold, C(darkMode, 32, 38, 35, 223, 231, 227));
-	Text(g, L"\u9009\u62e9\u5141\u8bb8\u7684\u8fdc\u7a0b\u884c\u4e3a\uff0c\u66f4\u6539\u5c06\u7acb\u5373\u5e94\u7528", x + 24, y + 50, 440, 20, 10, FontStyleRegular, C(darkMode, 91, 99, 95, 166, 177, 171));
+	Text(g, L"\u884c\u4e3a\u63a7\u5236", x + 24, y + 20, 200, 28, 16, FontStyleBold, C(darkMode, 24, 30, 27, 226, 233, 229));
+	Text(g, L"\u9009\u62e9\u5141\u8bb8\u7684\u8fdc\u7a0b\u884c\u4e3a\uff0c\u66f4\u6539\u5c06\u7acb\u5373\u5e94\u7528", x + 24, y + 50, 440, 20, 11, FontStyleRegular, C(darkMode, 91, 99, 95, 166, 177, 171));
 	bool values[] = { !setAllowAllRunOp, setBandAllRunOp, setAllowGbTop, setProhibitKillProcess, setAllowMonitor, setProhibitCloseWindow, setAllowControl };
 	const float cardW = (w - 62) / 2.0f;
 	for (int i = 0; i < 7; ++i) {
 		const int col = i % 2;
 		const int row = i / 2;
 		const float cardX = x + 24 + col * (cardW + 14);
-		const float cardY = y + 88 + row * 76;
-		toggleRects[i] = { static_cast<LONG>(cardX), static_cast<LONG>(cardY), static_cast<LONG>(cardX + cardW), static_cast<LONG>(cardY + 62) };
-		FillRound(g, RectF(cardX, cardY, cardW, 62), 8,
-			Blend(C(darkMode, 255, 255, 255, 38, 45, 42), C(darkMode, 223, 238, 232, 48, 60, 56), hoverProgress[20 + i]));
-		Text(g, kToggleLabels[i], cardX + 16, cardY + 20, cardW - 94, 25, 11, FontStyleRegular, C(darkMode, 43, 49, 46, 219, 228, 224));
-		FillRound(g, RectF(cardX + cardW - 62, cardY + 18, 44, 26), 13, values[i] ? C(darkMode, 0, 107, 95, 130, 213, 199) : C(darkMode, 116, 124, 120, 97, 108, 103));
-		SolidBrush knob(values[i] ? C(darkMode, 255, 255, 255, 0, 55, 49) : C(darkMode, 245, 247, 245, 219, 225, 222));
-		g.FillEllipse(&knob, RectF(cardX + cardW - (values[i] ? 40.0f : 58.0f), cardY + 22, 18.0f, 18.0f));
+		// 最后一行只有一个开关，仍按槽位对齐，不要让它自己居中跑偏。
+		const float cardY = y + 88 + row * toggleSlot + (toggleSlot - toggleRowH) / 2.0f;
+		toggleRects[i] = { static_cast<LONG>(cardX), static_cast<LONG>(cardY),
+			static_cast<LONG>(cardX + cardW), static_cast<LONG>(cardY + toggleRowH) };
+		FillRound(g, RectF(cardX, cardY, cardW, toggleRowH), 12 ,
+			Blend(C(darkMode, 248, 251, 249, 31, 37, 35), C(darkMode, 223, 238, 232, 48, 60, 56), hoverProgress[20 + i]));
+		const float toggleTextY = cardY + toggleRowH / 2.0f - 12.0f;
+		Text(g, kToggleLabels[i], cardX + 18, toggleTextY, cardW - 100, 25, 12, FontStyleRegular,
+			C(darkMode, 40, 46, 43, 220, 229, 225));
+		const float switchY = cardY + toggleRowH / 2.0f - 13.0f;
+		// 滑块按插值走，不是瞬间跳；轨道颜色跟着一起过渡。
+		const float motion = AnimateToggle(i, values[i]);
+		FillRound(g, RectF(cardX + cardW - 62, switchY, 44, 26), 13,
+			Blend(C(darkMode, 116, 124, 120, 97, 108, 103), C(darkMode, 0, 107, 95, 130, 213, 199), motion));
+		SolidBrush knob(Blend(C(darkMode, 245, 247, 245, 219, 225, 222), C(darkMode, 255, 255, 255, 0, 55, 49), motion));
+		g.FillEllipse(&knob, RectF(cardX + cardW - (58.0f - motion * 18.0f), switchY + 4.0f, 18.0f, 18.0f));
 	}
 	toggleRects[7] = {};
 	driverLoadRect = {};
@@ -3284,8 +3936,8 @@ void MainWindow::PaintProtection(Graphics& g, int width, int height, int offsetY
 		const float buttonX = x + w - 150;
 		const float buttonY = y + 20;
 		driverUnloadRect = { static_cast<LONG>(buttonX), static_cast<LONG>(buttonY), static_cast<LONG>(buttonX + 126), static_cast<LONG>(buttonY + 36) };
-		FillRound(g, RectF(buttonX, buttonY, 126, 36), 18, C(darkMode, 246, 221, 214, 52, 50, 48));
-		Text(g, L"\u5378\u8f7d\u4e3b\u9a71\u52a8", buttonX, buttonY + 10, 126, 18, 9, FontStyleBold, C(darkMode, 145, 45, 35, 230, 155, 140), StringAlignmentCenter);
+		PaintButton(g, RectF(buttonX, buttonY, 126, 36), L"\u5378\u8f7d\u4e3b\u9a71\u52a8", 44,
+			ButtonStyle::Danger, 18);
 		temporaryVideoEnableRect = {};
 		temporaryVideoImageModeRect = {};
 		temporaryVideoFileModeRect = {};
@@ -3305,58 +3957,69 @@ void MainWindow::PaintProtection(Graphics& g, int width, int height, int offsetY
 	// 这段代码同时服务于「替换画面」页（panelY=y+18，面板高）和「防护策略」页
 	// 下方的同名面板（panelY=y+404，只有 228px 高），所以纵向必须控制在 226px 内。
 	// ────────────────────────────────────────────────────────────────────
-	FillRound(g, RectF(x + 24, panelY, w - 48, panelH), 8, C(darkMode, 255, 255, 255, 38, 45, 42));
+	FillRound(g, RectF(x + 24, panelY, w - 48, panelH), 12, C(darkMode, 248, 251, 249, 31, 37, 35));
 
-	Text(g, page == Page::Replacement ? L"\u66ff\u6362\u753b\u9762" : L"\u4fe1\u606f\u6d41\u4fdd\u62a4", x + 42, panelY + 12, 200, 24, 13, FontStyleBold, C(darkMode, 32, 38, 35, 223, 231, 227));
-	Text(g, L"开启后教师端看到你选的图片/视频；未选媒体时为纯黑。", x + 42, panelY + 46, 420, 17, 9, FontStyleRegular, C(darkMode, 91, 99, 95, 166, 177, 171));
+	Text(g, page == Page::Replacement ? L"\u66ff\u6362\u753b\u9762" : L"\u4fe1\u606f\u6d41\u4fdd\u62a4", x + 42, panelY + 12, 200, 24, 13, FontStyleBold, C(darkMode, 24, 30, 27, 226, 233, 229));
+	Text(g, L"开启后教师端看到你选的图片/视频；未选媒体时为纯黑。", x + 42, panelY + 46, 420, 17, 10, FontStyleRegular, C(darkMode, 91, 99, 95, 166, 177, 171));
 	// Keep the main-driver action visible on the same protection surface.
 	driverUnloadRect = {};
 
 	advancedSettingsRect = { static_cast<LONG>(x + w - 250), static_cast<LONG>(panelY + 12), static_cast<LONG>(x + w - 144), static_cast<LONG>(panelY + 44) };
-	FillRound(g, RectF(x + w - 250, panelY + 12, 106, 32), 16, C(darkMode, 219, 238, 232, 43, 76, 69));
-	Text(g, L"高级设置", x + w - 250, panelY + 20, 106, 18, 9, FontStyleBold, C(darkMode, 0, 81, 72, 177, 239, 228), StringAlignmentCenter);
+	PaintButton(g, RectF(x + w - 250, panelY + 12, 106, 32), L"高级设置", 42, ButtonStyle::Tonal, 16);
 
 	const bool imageMode = temporaryVideoMode == L"image" || temporaryVideoMode == L"photo";
 	const float controlX = x + 42;
 
 	// 左列 · 信息流保护开关（原先在右上角，被预览图整块盖住，用户看不到）
-	Text(g, L"信息流保护", controlX, panelY + 78, 80, 18, 10, FontStyleBold, C(darkMode, 32, 38, 35, 223, 231, 227));
+	Text(g, L"信息流保护", controlX, panelY + 78, 80, 18, 11, FontStyleBold, C(darkMode, 24, 30, 27, 226, 233, 229));
 	temporaryVideoEnableRect = { static_cast<LONG>(controlX + 86), static_cast<LONG>(panelY + 72), static_cast<LONG>(controlX + 178), static_cast<LONG>(panelY + 100) };
 	FillRound(g, RectF(controlX + 86, panelY + 72, 92, 28), 14,
 		temporaryVideoProtection ? C(darkMode, 0, 107, 95, 130, 213, 199) : C(darkMode, 116, 124, 120, 97, 108, 103));
-	Text(g, temporaryVideoProtection ? L"已启用" : L"已关闭", controlX + 86, panelY + 79, 92, 18, 10, FontStyleBold,
+	Text(g, temporaryVideoProtection ? L"已启用" : L"已关闭", controlX + 86, panelY + 79, 92, 18, 11, FontStyleBold,
 		temporaryVideoProtection ? C(darkMode, 255, 255, 255, 0, 55, 49) : C(darkMode, 245, 247, 245, 219, 225, 222), StringAlignmentCenter);
 
 	// 左列 · 模式
-	Text(g, L"模式", controlX, panelY + 112, 40, 18, 10, FontStyleRegular, C(darkMode, 91, 99, 95, 166, 177, 171));
+	Text(g, L"模式", controlX, panelY + 112, 40, 18, 11, FontStyleRegular, C(darkMode, 91, 99, 95, 166, 177, 171));
 	temporaryVideoImageModeRect = { static_cast<LONG>(controlX + 46), static_cast<LONG>(panelY + 106), static_cast<LONG>(controlX + 110), static_cast<LONG>(panelY + 134) };
 	temporaryVideoFileModeRect = { static_cast<LONG>(controlX + 116), static_cast<LONG>(panelY + 106), static_cast<LONG>(controlX + 180), static_cast<LONG>(panelY + 134) };
-	auto drawMode = [&](RECT rect, LPCWSTR label, bool selected) {
-		FillRound(g, RectF(static_cast<REAL>(rect.left), static_cast<REAL>(rect.top), static_cast<REAL>(rect.right - rect.left), static_cast<REAL>(rect.bottom - rect.top)), 14,
-			selected ? C(darkMode, 183, 232, 222, 42, 79, 72) : C(darkMode, 225, 232, 228, 39, 47, 44));
-		Text(g, label, static_cast<float>(rect.left), static_cast<float>(rect.top + 7), static_cast<float>(rect.right - rect.left), 18, 9,
+	auto drawMode = [&](RECT rect, LPCWSTR label, bool selected, int hoverId) {
+		const float hover = selected ? 0.0f : hoverProgress[hoverId];
+		const float sink = pressTarget == hoverId ? 1.0f : 0.0f;
+		FillRound(g, RectF(static_cast<REAL>(rect.left), static_cast<REAL>(rect.top) + sink,
+			static_cast<REAL>(rect.right - rect.left), static_cast<REAL>(rect.bottom - rect.top)), 14,
+			selected ? C(darkMode, 183, 232, 222, 42, 79, 72)
+				: Blend(C(darkMode, 225, 232, 228, 39, 47, 44), C(darkMode, 208, 230, 221, 54, 74, 67), hover));
+		Text(g, label, static_cast<float>(rect.left), static_cast<float>(rect.top + 7) + sink, static_cast<float>(rect.right - rect.left), 18, 10 ,
 			selected ? FontStyleBold : FontStyleRegular, selected ? C(darkMode, 0, 81, 72, 156, 240, 225) : C(darkMode, 60, 68, 64, 197, 207, 202), StringAlignmentCenter);
 	};
-	drawMode(temporaryVideoImageModeRect, L"图片", imageMode);
-	drawMode(temporaryVideoFileModeRect, L"视频", !imageMode);
+	drawMode(temporaryVideoImageModeRect, L"图片", imageMode, 75);
+	drawMode(temporaryVideoFileModeRect, L"视频", !imageMode, 76);
 
 	// 左列 · 选择媒体 + 循环
 	temporaryVideoImagePickerRect = { static_cast<LONG>(controlX), static_cast<LONG>(panelY + 140), static_cast<LONG>(controlX + 100), static_cast<LONG>(panelY + 170) };
 	temporaryVideoFilePickerRect = { static_cast<LONG>(controlX + 106), static_cast<LONG>(panelY + 140), static_cast<LONG>(controlX + 206), static_cast<LONG>(panelY + 170) };
-	auto drawPicker = [&](RECT rect, LPCWSTR label, bool selected) {
-		FillRound(g, RectF(static_cast<REAL>(rect.left), static_cast<REAL>(rect.top), static_cast<REAL>(rect.right - rect.left), static_cast<REAL>(rect.bottom - rect.top)), 7,
-			Blend(C(darkMode, 219, 238, 232, 43, 76, 69), C(darkMode, 198, 228, 219, 55, 91, 83), selected ? 1.0f : 0.0f));
-		Text(g, label, static_cast<float>(rect.left), static_cast<float>(rect.top + 7), static_cast<float>(rect.right - rect.left), 18, 9, FontStyleBold,
+	auto drawPicker = [&](RECT rect, LPCWSTR label, bool selected, int hoverId) {
+		const float hover = hoverProgress[hoverId];
+		const float sink = pressTarget == hoverId ? 1.0f : 0.0f;
+		FillRound(g, RectF(static_cast<REAL>(rect.left), static_cast<REAL>(rect.top) + sink,
+			static_cast<REAL>(rect.right - rect.left), static_cast<REAL>(rect.bottom - rect.top)), 10,
+			Blend(C(darkMode, 219, 238, 232, 43, 76, 69), C(darkMode, 196, 226, 217, 56, 100, 90),
+				selected ? 1.0f : hover));
+		Text(g, label, static_cast<float>(rect.left), static_cast<float>(rect.top + 7) + sink, static_cast<float>(rect.right - rect.left), 18, 10, FontStyleBold,
 			C(darkMode, 0, 81, 72, 177, 239, 228), StringAlignmentCenter);
 	};
-	drawPicker(temporaryVideoImagePickerRect, L"选择图片", imageMode);
-	drawPicker(temporaryVideoFilePickerRect, L"选择视频", !imageMode);
+	drawPicker(temporaryVideoImagePickerRect, L"选择图片", imageMode, 77);
+	drawPicker(temporaryVideoFilePickerRect, L"选择视频", !imageMode, 78);
 
 	temporaryVideoLoopRect = { static_cast<LONG>(controlX + 218), static_cast<LONG>(panelY + 140), static_cast<LONG>(controlX + 288), static_cast<LONG>(panelY + 170) };
-	FillRound(g, RectF(controlX + 218, panelY + 140, 70, 30), 7,
-		temporaryVideoLoop ? C(darkMode, 183, 232, 222, 42, 79, 72) : C(darkMode, 225, 232, 228, 39, 47, 44));
-	Text(g, temporaryVideoLoop ? L"循环：开" : L"循环：关", controlX + 218, panelY + 147, 70, 18, 9, FontStyleBold,
-		temporaryVideoLoop ? C(darkMode, 0, 81, 72, 156, 240, 225) : C(darkMode, 60, 68, 64, 197, 207, 202), StringAlignmentCenter);
+	{
+		const float sink = pressTarget == 79 ? 1.0f : 0.0f;
+		FillRound(g, RectF(controlX + 218, panelY + 140 + sink, 70, 30), 10,
+			temporaryVideoLoop ? C(darkMode, 183, 232, 222, 42, 79, 72)
+				: Blend(C(darkMode, 225, 232, 228, 39, 47, 44), C(darkMode, 208, 230, 221, 54, 74, 67), hoverProgress[79]));
+		Text(g, temporaryVideoLoop ? L"循环：开" : L"循环：关", controlX + 218, panelY + 147 + sink, 70, 18, 10, FontStyleBold,
+			temporaryVideoLoop ? C(darkMode, 0, 81, 72, 156, 240, 225) : C(darkMode, 60, 68, 64, 197, 207, 202), StringAlignmentCenter);
+	}
 
 	// 左列 · 状态 / 警告
 	const std::wstring& selectedPath = imageMode ? temporaryVideoImagePath : temporaryVideoFilePath;
@@ -3365,19 +4028,27 @@ void MainWindow::PaintProtection(Graphics& g, int width, int height, int offsetY
 	const wchar_t* pathText = noMedia
 		? (imageMode ? L"尚未选择图片 —— 此时开启保护，教师端会显示纯黑" : L"尚未选择视频 —— 此时开启保护，教师端会显示纯黑")
 		: selectedPath.c_str();
-	Text(g, pathText, controlX, panelY + 176, 340, 17, 8, FontStyleRegular,
+	Text(g, pathText, controlX, panelY + 176, 340, 17, 10, FontStyleRegular,
 		(noMedia && temporaryVideoProtection) ? C(darkMode, 198, 96, 40, 236, 146, 90) : C(darkMode, 91, 99, 95, 166, 177, 171));
 
 	// 左列 · 一键恢复（遮挡有两个来源，只关一个教师端还是黑的）
 	restoreTeacherViewRect = { static_cast<LONG>(controlX), static_cast<LONG>(panelY + 196), static_cast<LONG>(controlX + 152), static_cast<LONG>(panelY + 226) };
-	FillRound(g, RectF(controlX, panelY + 196, 152, 30), 7, C(darkMode, 214, 234, 227, 48, 84, 76));
-	Text(g, L"恢复教师画面", controlX, panelY + 203, 152, 18, 9, FontStyleBold, C(darkMode, 0, 81, 72, 177, 239, 228), StringAlignmentCenter);
+	PaintButton(g, RectF(controlX, panelY + 196, 152, 30), L"恢复教师画面", 81, ButtonStyle::Tonal, 10);
 
 	// 右列 · 预览图（从 panelY+72 起，标题行与说明行都留给上方）
-	const float previewW = (std::min)(300.0f, (std::max)(228.0f, w * 0.30f));
-	const float previewH = (std::min)(300.0f, (std::max)(110.0f, panelH - 100.0f));
+	// 原来最大只有 300px，在 860px 宽的卡片里像个小缩略图，右侧留白很别扭。
+	const float previewW = (std::min)(384.0f, (std::max)(240.0f, w * 0.44f));
+	const float previewH = (std::min)(360.0f, (std::max)(140.0f, panelH - 110.0f));
 	temporaryVideoPreviewRect = { static_cast<LONG>(x + w - previewW - 42), static_cast<LONG>(panelY + 72), static_cast<LONG>(x + w - 42), static_cast<LONG>(panelY + 72 + previewH) };
-	FillRound(g, RectF(static_cast<REAL>(temporaryVideoPreviewRect.left), static_cast<REAL>(temporaryVideoPreviewRect.top), previewW, previewH), 7, C(darkMode, 29, 38, 34, 232, 240, 236));
+	// 预览图不是按钮，但光标移上去时给一圈描边，说明"这里可以点开选片"。
+	{
+		const float previewHover = hoverProgress[85];
+		FillRound(g, RectF(static_cast<REAL>(temporaryVideoPreviewRect.left), static_cast<REAL>(temporaryVideoPreviewRect.top), previewW, previewH), 12, C(darkMode, 29, 38, 34, 232, 240, 236));
+		if (previewHover > 0.002f) {
+			StrokeRound(g, RectF(static_cast<REAL>(temporaryVideoPreviewRect.left), static_cast<REAL>(temporaryVideoPreviewRect.top), previewW, previewH), 12,
+				Blend(C(darkMode, 232, 238, 234, 40, 47, 44), C(darkMode, 0, 152, 132, 96, 200, 184), previewHover), 1.5f);
+		}
+	}
 	if (temporaryVideoPreview && temporaryVideoPreview->GetLastStatus() == Ok) {
 		const float imageW = static_cast<float>(temporaryVideoPreview->GetWidth());
 		const float imageH = static_cast<float>(temporaryVideoPreview->GetHeight());
@@ -3388,7 +4059,7 @@ void MainWindow::PaintProtection(Graphics& g, int width, int height, int offsetY
 	}
 	else {
 		DrawIcon(g, imageMode ? 3 : 5, x + w - previewW / 2.0f - 52, panelY + 72 + previewH / 2.0f - 3, C(darkMode, 135, 156, 148, 116, 140, 130), 24);
-		Text(g, imageMode ? L"图片预览" : L"视频文件", x + w - previewW - 42, panelY + 72 + previewH / 2.0f + 28, previewW, 18, 9, FontStyleRegular,
+		Text(g, imageMode ? L"图片预览" : L"视频文件", x + w - previewW - 42, panelY + 72 + previewH / 2.0f + 28, previewW, 18, 10, FontStyleRegular,
 			C(darkMode, 135, 156, 148, 116, 140, 130), StringAlignmentCenter);
 	}
 }
@@ -3403,39 +4074,37 @@ void MainWindow::PaintAntivirus(Graphics& g, int width, int height, int offsetY)
 	const bool running = InterlockedCompareExchange(&avScanRunning, 0, 0) != 0;
 	const bool driverReady = AvIntegratedIsLoaded() != FALSE;
 	const Color primary = C(darkMode, 0, 107, 95, 130, 213, 199);
-	const Color titleColor = C(darkMode, 32, 38, 35, 223, 231, 227);
+	const Color titleColor = C(darkMode, 24, 30, 27, 226, 233, 229);
 	const Color secondary = C(darkMode, 91, 99, 95, 166, 177, 171);
-	const Color surface = C(darkMode, 255, 255, 255, 38, 45, 42);
+	const Color surface = C(darkMode, 248, 251, 249, 31, 37, 35);
 
-	FillRound(g, RectF(x, y, w, h), 8, C(darkMode, 237, 242, 239, 31, 37, 34));
+	SoftShadow(g, RectF(x, y, w, h), 12, darkMode);
+	FillRound(g, RectF(x, y, w, h), 12, C(darkMode, 255, 255, 255, 33, 40, 37));
 	Text(g, L"\u8fdb\u7a0b\u5185\u5b58\u7279\u5f81\u626b\u63cf", x + 24, y + 18, 320, 28, 16, FontStyleBold, titleColor);
-	Text(g, L"\u7531 JiYuAvKernel \u626b\u63cf\u6240\u6709\u8fdb\u7a0b\u7684\u53ef\u6267\u884c\u5185\u5b58\u533a\u57df\uff0c\u652f\u6301\u8de8\u7248\u672c\u901a\u914d\u7279\u5f81", x + 24, y + 48, w - 48, 20, 10, FontStyleRegular, secondary);
+	Text(g, L"\u7531 JiYuAvKernel \u626b\u63cf\u6240\u6709\u8fdb\u7a0b\u7684\u53ef\u6267\u884c\u5185\u5b58\u533a\u57df\uff0c\u652f\u6301\u8de8\u7248\u672c\u901a\u914d\u7279\u5f81", x + 24, y + 48, w - 48, 20, 11, FontStyleRegular, secondary);
 
-	FillRound(g, RectF(x + 24, y + 78, w - 48, 86), 8, surface);
+	FillRound(g, RectF(x + 24, y + 78, w - 48, 86), 12, surface);
 	FillRound(g, RectF(x + 42, y + 98, 12, 12), 6,
 		driverReady ? primary : C(darkMode, 180, 72, 48, 232, 154, 123));
 	Text(g, driverReady ? L"JiYuAvKernel \u5df2\u8fde\u63a5" : L"JiYuAvKernel \u672a\u8fde\u63a5",
 		x + 66, y + 91, 240, 24, 12, FontStyleBold, titleColor);
-	Text(g, avScanStatus.c_str(), x + 42, y + 124, w - 84, 24, 10, FontStyleRegular, secondary);
+	Text(g, avScanStatus.c_str(), x + 42, y + 124, w - 84, 24, 11, FontStyleRegular, secondary);
 
 	auto drawButton = [&](RECT& target, float buttonX, float buttonW, LPCWSTR label, int hoverId, bool primaryButton) {
 		target = { static_cast<LONG>(buttonX), static_cast<LONG>(y + 178),
 			static_cast<LONG>(buttonX + buttonW), static_cast<LONG>(y + 220) };
-		const Color base = primaryButton ? primary : C(darkMode, 219, 238, 232, 43, 76, 69);
-		const Color over = primaryButton ? C(darkMode, 0, 82, 73, 154, 232, 217) : C(darkMode, 198, 228, 219, 55, 91, 83);
-		FillRound(g, RectF(buttonX, y + 178, buttonW, 42), 8, Blend(base, over, hoverProgress[hoverId]));
-		Text(g, label, buttonX + 8, y + 189, buttonW - 16, 20, 10, FontStyleBold,
-			primaryButton ? C(darkMode, 255, 255, 255, 0, 55, 49) : C(darkMode, 0, 81, 72, 177, 239, 228), StringAlignmentCenter);
+		PaintButton(g, RectF(buttonX, y + 178, buttonW, 42), label, hoverId,
+			primaryButton ? ButtonStyle::Primary : ButtonStyle::Tonal, 12);
 	};
+	// 六个按钮等宽，原来按内容比例给宽度，一排看下来参差不齐。
 	const float buttonGap = 10.0f;
-	const float buttonAvailable = w - 48.0f - buttonGap * 5.0f;
-	const float unit = buttonAvailable / 8.6f;
-	drawButton(avScanRect, x + 24, unit * 1.65f, running ? L"\u626b\u63cf\u4e2d..." : L"\u626b\u63cf\u5168\u90e8\u8fdb\u7a0b", 45, true);
-	drawButton(avImportRect, avScanRect.right + buttonGap, unit * 1.45f, L"\u8fd0\u884c\u8fdb\u7a0b\u5f55\u5165", 46, false);
-	drawButton(avInputRect, avImportRect.right + buttonGap, unit * 1.35f, L"\u8f93\u5165\u7279\u5f81\u7801", 50, false);
-	drawButton(avCopyRect, avInputRect.right + buttonGap, unit * 1.15f, L"\u590d\u5236", 47, false);
-	drawButton(avUnloadRect, avCopyRect.right + buttonGap, unit * 1.45f, L"\u5378\u8f7d\u626b\u63cf\u9a71\u52a8", 49, false);
-	drawButton(avCancelRect, avUnloadRect.right + buttonGap, unit * 1.0f, L"\u505c\u6b62", 48, false);
+	const float buttonW = (w - 48.0f - buttonGap * 5.0f) / 6.0f;
+	drawButton(avScanRect, x + 24, buttonW, running ? L"\u626b\u63cf\u4e2d..." : L"\u626b\u63cf\u5168\u90e8\u8fdb\u7a0b", 45, true);
+	drawButton(avImportRect, avScanRect.right + buttonGap, buttonW, L"\u8fd0\u884c\u8fdb\u7a0b\u5f55\u5165", 46, false);
+	drawButton(avInputRect, avImportRect.right + buttonGap, buttonW, L"\u8f93\u5165\u7279\u5f81\u7801", 50, false);
+	drawButton(avCopyRect, avInputRect.right + buttonGap, buttonW, L"\u590d\u5236", 47, false);
+	drawButton(avUnloadRect, avCopyRect.right + buttonGap, buttonW, L"\u5378\u8f7d\u626b\u63cf\u9a71\u52a8", 49, false);
+	drawButton(avCancelRect, avUnloadRect.right + buttonGap, buttonW, L"\u505c\u6b62", 48, false);
 
 	const float metricsY = y + 238;
 	const float metricGap = 10.0f;
@@ -3444,8 +4113,8 @@ void MainWindow::PaintAntivirus(Graphics& g, int width, int height, int offsetY)
 	const DWORD metricValues[] = { avScanSummary.processCount, avScanSummary.scannedCount, avScanSummary.detectionCount, avScanSummary.failedCount };
 	for (int index = 0; index < 4; ++index) {
 		const float cardX = x + 24 + index * (metricW + metricGap);
-		FillRound(g, RectF(cardX, metricsY, metricW, 74), 8, surface);
-		Text(g, metricLabels[index], cardX + 14, metricsY + 11, metricW - 28, 18, 9, FontStyleRegular, secondary);
+		FillRound(g, RectF(cardX, metricsY, metricW, 74), 12, surface);
+		Text(g, metricLabels[index], cardX + 14, metricsY + 11, metricW - 28, 18, 10, FontStyleRegular, secondary);
 		WCHAR value[32] = {};
 		swprintf_s(value, L"%lu", static_cast<unsigned long>(metricValues[index]));
 		Text(g, value, cardX + 14, metricsY + 34, metricW - 28, 27, 17, FontStyleBold,
@@ -3453,31 +4122,92 @@ void MainWindow::PaintAntivirus(Graphics& g, int width, int height, int offsetY)
 	}
 
 	const float signatureY = metricsY + 88;
-	FillRound(g, RectF(x + 24, signatureY, w - 48, 84), 8, surface);
+	FillRound(g, RectF(x + 24, signatureY, w - 48, 84), 12, surface);
 	WCHAR signatureCaption[128] = {};
 	swprintf_s(signatureCaption, L"\u6700\u8fd1\u5f55\u5165\u7684\u5185\u5b58\u7279\u5f81  |  %lu \u4e2a\u7248\u672c  |  %lu \u4e2a\u7cbe\u786e\u5b57\u8282",
 		static_cast<unsigned long>(avSignatureSampleCount), static_cast<unsigned long>(avSignatureExactBytes));
-	Text(g, signatureCaption, x + 40, signatureY + 11, w - 80, 18, 9, FontStyleRegular, secondary);
+	Text(g, signatureCaption, x + 40, signatureY + 11, w - 80, 18, 10, FontStyleRegular, secondary);
 	Text(g, avSignaturePath.empty() ? L"\u5c1a\u672a\u5f55\u5165\u8fd0\u884c\u65f6\u7279\u5f81" : avSignaturePath.c_str(),
-		x + 40, signatureY + 32, w - 80, 18, 9, FontStyleBold, titleColor);
+		x + 40, signatureY + 32, w - 80, 18, 10, FontStyleBold, titleColor);
 	Text(g, avSignaturePattern.empty() ? L"-" : avSignaturePattern.c_str(),
-		x + 40, signatureY + 54, w - 80, 18, 9, FontStyleRegular, primary);
+		x + 40, signatureY + 54, w - 80, 18, 10, FontStyleRegular, primary);
 
 	const float resultY = signatureY + 98;
 	const float resultH = std::max(58.0f, y + h - resultY - 16.0f);
-	FillRound(g, RectF(x + 24, resultY, w - 48, resultH), 8, surface);
+	FillRound(g, RectF(x + 24, resultY, w - 48, resultH), 12, surface);
 	Text(g, L"\u626b\u63cf\u547d\u4e2d", x + 40, resultY + 12, 160, 20, 11, FontStyleBold, titleColor);
 	if (avScanSummary.findingCount == 0) {
 		Text(g, running ? L"\u6b63\u5728\u68c0\u67e5\u8fdb\u7a0b\u6620\u50cf..." : L"\u6682\u65e0\u547d\u4e2d\u8bb0\u5f55",
-			x + 40, resultY + 42, w - 80, 20, 10, FontStyleRegular, secondary);
+			x + 40, resultY + 42, w - 80, 20, 11, FontStyleRegular, secondary);
 	}
 	else {
 		const DWORD visibleCount = std::min<DWORD>(avScanSummary.findingCount, AV_INTEGRATED_MAX_FINDINGS);
 		for (DWORD index = 0; index < visibleCount; ++index) {
 			Text(g, avScanSummary.findings[index], x + 40, resultY + 40 + index * 22.0f,
-				w - 80, 18, 9, FontStyleRegular, C(darkMode, 150, 52, 37, 244, 158, 132));
+				w - 80, 18, 10, FontStyleRegular, C(darkMode, 150, 52, 37, 244, 158, 132));
 		}
 	}
+}
+
+// 高级配置页的纵向节奏。绘制和原生控件的 MoveWindow 都从这里取，
+// 否则两边各写一套坐标，改一处就错位。
+// 底部那段（说明条 + 保存按钮）从卡片底边往上排，快捷键卡挂在说明条上方，
+// 窗口拉高时多出来的空白落在开关区和快捷键区之间，不会把按钮顶到半空。
+
+// 把 HOTKEY 控件的编码翻成可读文字：HIBYTE 是修饰键位（1 Shift / 2 Ctrl / 4 Alt / 8 Ext），
+// LOBYTE 是虚拟键码。
+std::wstring HotkeyDisplayText(int value)
+{
+	if (value == 0) return L"\u672a\u8bbe\u7f6e";
+	const int mods = (value >> 8) & 0xFF;
+	const int key = value & 0xFF;
+	std::wstring text;
+	if (mods & 0x02) text += L"Ctrl + ";
+	if (mods & 0x04) text += L"Alt + ";
+	if (mods & 0x01) text += L"Shift + ";
+	if (key >= 'A' && key <= 'Z') text += static_cast<wchar_t>(key);
+	else if (key >= '0' && key <= '9') text += static_cast<wchar_t>(key);
+	else if (key >= VK_F1 && key <= VK_F24) {
+		text += L"F";
+		text += std::to_wstring(key - VK_F1 + 1);
+	}
+	else {
+		switch (key) {
+		case VK_TAB: text += L"Tab"; break;
+		case VK_SPACE: text += L"Space"; break;
+		case VK_RETURN: text += L"Enter"; break;
+		case VK_BACK: text += L"Backspace"; break;
+		case VK_LEFT: text += L"\u2190"; break;
+		case VK_RIGHT: text += L"\u2192"; break;
+		case VK_UP: text += L"\u2191"; break;
+		case VK_DOWN: text += L"\u2193"; break;
+		case VK_HOME: text += L"Home"; break;
+		case VK_END: text += L"End"; break;
+		case VK_INSERT: text += L"Insert"; break;
+		case VK_DELETE: text += L"Delete"; break;
+		case VK_PRIOR: text += L"PageUp"; break;
+		case VK_NEXT: text += L"PageDown"; break;
+		default: {
+			wchar_t buffer[16] = {};
+			swprintf_s(buffer, L"VK %02X", static_cast<unsigned>(key));
+			text += buffer;
+			break;
+		}
+		}
+	}
+	return text;
+}
+
+float AdvancedSaveButtonY(float cardHeight) { return cardHeight - 54.0f; }
+
+float AdvancedHintBannerY(float cardHeight) { return AdvancedSaveButtonY(cardHeight) - 90.0f; }
+
+float AdvancedHotkeyCardY(float cardHeight) { return AdvancedHintBannerY(cardHeight) - 114.0f; }
+
+float AdvancedToggleSlot(float cardHeight)
+{
+	// 三行开关平分 78 到快捷键卡之间的区域。
+	return (std::max)(72.0f, (std::min)(104.0f, (AdvancedHotkeyCardY(cardHeight) - 94.0f) / 3.0f));
 }
 
 void MainWindow::PaintAdvanced(Graphics& g, int width, int height, int offsetY)
@@ -3486,71 +4216,130 @@ void MainWindow::PaintAdvanced(Graphics& g, int width, int height, int offsetY)
 	const float y = 94.0f + offsetY;
 	const float w = static_cast<float>(width - 276);
 	const float h = static_cast<float>(height) - y - 20;
-	FillRound(g, RectF(x, y, w, h), 8, C(darkMode, 237, 242, 239, 31, 37, 34));
+	const Color surface = C(darkMode, 248, 251, 249, 31, 37, 35);
+	const Color titleColor = C(darkMode, 42, 49, 46, 220, 229, 225);
+	const Color secondary = C(darkMode, 98, 106, 102, 159, 171, 165);
+	const Color fieldFill = C(darkMode, 255, 255, 255, 26, 33, 30);
+	const Color hairline = C(darkMode, 226, 234, 229, 44, 52, 48);
+	SoftShadow(g, RectF(x, y, w, h), 12, darkMode);
+	FillRound(g, RectF(x, y, w, h), 12, C(darkMode, 255, 255, 255, 33, 40, 37));
 	const wchar_t* tabs[] = { L"\u5e38\u89c4\u4e0e\u5feb\u6377\u952e", L"\u8c03\u8bd5\u4e0e\u517c\u5bb9\u6027" };
 	for (int i = 0; i < 2; ++i) {
 		const float tabX = x + 24 + i * 166.0f;
 		advancedTabRects[i] = { static_cast<LONG>(tabX), static_cast<LONG>(y + 18), static_cast<LONG>(tabX + 156), static_cast<LONG>(y + 58) };
+		const Color idle = Blend(C(darkMode, 235, 241, 238, 36, 43, 40), C(darkMode, 222, 231, 226, 45, 53, 49), hoverProgress[70 + i]);
 		FillRound(g, RectF(tabX, y + 18, 156, 40), 20,
-			advancedTab == i ? C(darkMode, 183, 232, 222, 42, 79, 72) : C(darkMode, 225, 232, 228, 39, 47, 44));
-		Text(g, tabs[i], tabX, y + 29, 156, 20, 10, advancedTab == i ? FontStyleBold : FontStyleRegular,
+			advancedTab == i ? C(darkMode, 183, 232, 222, 42, 79, 72) : idle);
+		Text(g, tabs[i], tabX, y + 29, 156, 20, 11, advancedTab == i ? FontStyleBold : FontStyleRegular,
 			advancedTab == i ? C(darkMode, 0, 81, 72, 156, 240, 225) : C(darkMode, 60, 68, 64, 197, 207, 202), StringAlignmentCenter);
 	}
 	auto drawToggle = [&](int index, float cardX, float cardY, float cardW, LPCWSTR title, LPCWSTR detail, bool enabled) {
 		advancedToggleRects[index] = { static_cast<LONG>(cardX), static_cast<LONG>(cardY), static_cast<LONG>(cardX + cardW), static_cast<LONG>(cardY + 64) };
-		FillRound(g, RectF(cardX, cardY, cardW, 64), 8,
-			Blend(C(darkMode, 255, 255, 255, 38, 45, 42), C(darkMode, 220, 237, 231, 49, 63, 58), hoverProgress[50 + index]));
-		Text(g, title, cardX + 16, cardY + 12, cardW - 92, 20, 10, FontStyleBold, C(darkMode, 42, 49, 46, 220, 229, 225));
-		Text(g, detail, cardX + 16, cardY + 35, cardW - 92, 17, 8, FontStyleRegular, C(darkMode, 98, 106, 102, 159, 171, 165));
+		FillRound(g, RectF(cardX, cardY, cardW, 64), 12 ,
+			Blend(C(darkMode, 248, 251, 249, 31, 37, 35), C(darkMode, 220, 237, 231, 49, 63, 58), hoverProgress[50 + index]));
+		Text(g, title, cardX + 16, cardY + 12, cardW - 92, 20, 11, FontStyleBold, C(darkMode, 42, 49, 46, 220, 229, 225));
+		Text(g, detail, cardX + 16, cardY + 36, cardW - 92, 17, 10, FontStyleRegular, C(darkMode, 98, 106, 102, 159, 171, 165));
+		const float knobMotion = AnimateToggle(8 + index, enabled);
 		FillRound(g, RectF(cardX + cardW - 60, cardY + 19, 44, 26), 13,
-			enabled ? C(darkMode, 0, 107, 95, 130, 213, 199) : C(darkMode, 116, 124, 120, 97, 108, 103));
-		SolidBrush knob(enabled ? C(darkMode, 255, 255, 255, 0, 55, 49) : C(darkMode, 245, 247, 245, 219, 225, 222));
-		g.FillEllipse(&knob, RectF(cardX + cardW - (enabled ? 38.0f : 56.0f), cardY + 23, 18, 18));
+			Blend(C(darkMode, 116, 124, 120, 97, 108, 103), C(darkMode, 0, 107, 95, 130, 213, 199), knobMotion));
+		SolidBrush knob(Blend(C(darkMode, 245, 247, 245, 219, 225, 222), C(darkMode, 255, 255, 255, 0, 55, 49), knobMotion));
+		g.FillEllipse(&knob, RectF(cardX + cardW - (56.0f - knobMotion * 18.0f), cardY + 23, 18, 18));
 	};
+	// 原生控件自己带方形边框，所以这里先画一块圆角输入框，把控件放在框内 4px，
+	// 控件背景色和框内填充色一致（见 WM_CTLCOLOR 里的分支），边缘就看不出来了。
+	auto drawField = [&](const RectF& field, HWND control) {
+		const bool focused = control && GetFocus() == control;
+		FillRound(g, field, 10, fieldFill);
+		StrokeRound(g, field, 10, focused ? C(darkMode, 0, 107, 95, 130, 213, 199) : hairline);
+	};
+	const float gap = 12.0f;
+	const float cardW = (w - 60) / 2.0f;
 	if (advancedTab == 0) {
-		const float gap = 12.0f;
-		const float cardW = (w - 60) / 2.0f;
 		const wchar_t* titles[] = { L"\u7981\u7528\u5185\u6838\u9a71\u52a8", L"\u9a71\u52a8\u5c42\u81ea\u6211\u4fdd\u62a4", L"\u81ea\u52a8\u5f3a\u5236\u6e05\u7406", L"\u4e25\u683c\u7a97\u53e3\u63a7\u5236", L"\u9690\u85cf\u63a7\u5236\u8f93\u51fa", L"\u9690\u85cf\u4efb\u52a1\u680f\u56fe\u6807" };
 		const wchar_t* details[] = { L"32 \u4f4d\u7cfb\u7edf\u9009\u9879", L"\u4ec5 32 \u4f4d\u7cfb\u7edf\u6709\u6548", L"\u64cd\u4f5c\u5931\u8d25\u65f6\u7ed3\u675f\u76f8\u5173\u8fdb\u7a0b", L"\u63a7\u5236\u6240\u6709\u6781\u57df\u7a97\u53e3", L"\u9690\u85cf\u5de6\u4e0a\u89d2\u8f93\u51fa\u7a97\u53e3", L"\u4ecd\u53ef\u4f7f\u7528\u5feb\u6377\u952e\u5524\u8d77" };
 		bool values[] = { advDisableDriver, advSelfProtect, advAutoForceKill, advStrictWindow, advHideOutput, advHideTaskbar };
+		const float slot = AdvancedToggleSlot(h);
 		for (int i = 0; i < 6; ++i) {
 			const int col = i % 2, row = i / 2;
-			drawToggle(i, x + 24 + col * (cardW + gap), y + 78 + row * 76.0f, cardW, titles[i], details[i], values[i]);
+			// 行卡片在槽位里垂直居中，槽位变大时不会贴着上一行。
+			drawToggle(i, x + 24 + col * (cardW + gap),
+				y + 78 + row * slot + (slot - 64.0f) / 2.0f, cardW, titles[i], details[i], values[i]);
 		}
-		Text(g, L"\u7d27\u6025\u5168\u5c4f\u5feb\u6377\u952e", x + 24, y + 316, 170, 20, 10, FontStyleBold, C(darkMode, 42, 49, 46, 220, 229, 225));
-		Text(g, L"\u663e\u793a / \u9690\u85cf\u4e3b\u7a97\u53e3", x + w / 2 + 6, y + 316, 180, 20, 10, FontStyleBold, C(darkMode, 42, 49, 46, 220, 229, 225));
+		const float hotkeyY = y + AdvancedHotkeyCardY(h);
+		FillRound(g, RectF(x + 24, hotkeyY - 15.0f, w - 48, 1), 0.5f, hairline);
+		const wchar_t* hotkeyTitles[] = { L"\u7d27\u6025\u5168\u5c4f\u5feb\u6377\u952e", L"\u663e\u793a / \u9690\u85cf\u4e3b\u7a97\u53e3" };
+		const wchar_t* hotkeyHints[] = { L"\u628a\u6559\u5e08\u7aef\u753b\u9762\u5207\u5230\u66ff\u6362\u753b\u9762", L"\u4ece\u4efb\u610f\u754c\u9762\u5524\u56de\u8fd9\u4e2a\u7a97\u53e3" };
+		for (int i = 0; i < 2; ++i) {
+			const float cardX = x + 24 + i * (cardW + gap);
+			FillRound(g, RectF(cardX, hotkeyY, cardW, 96), 12, surface);
+			StrokeRound(g, RectF(cardX, hotkeyY, cardW, 96), 12, hairline);
+			Text(g, hotkeyTitles[i], cardX + 16, hotkeyY + 12, cardW - 32, 20, 11, FontStyleBold, titleColor);
+			Text(g, hotkeyHints[i], cardX + 16, hotkeyY + 33, cardW - 32, 17, 10, FontStyleRegular, secondary);
+			const RectF field(cardX + 16, hotkeyY + 57, cardW - 32, 30);
+			advancedHotkeyRect[i] = { static_cast<LONG>(field.X), static_cast<LONG>(field.Y),
+				static_cast<LONG>(field.GetRight()), static_cast<LONG>(field.GetBottom()) };
+			const bool capturing = hotkeyCaptureIndex == i;
+			FillRound(g, field, 10, capturing ? C(darkMode, 232, 247, 242, 30, 56, 49) : fieldFill);
+			StrokeRound(g, field, 10, capturing ? C(darkMode, 0, 152, 132, 106, 220, 203)
+				: C(darkMode, 216, 226, 220, 46, 55, 51));
+			const int value = i == 0 ? hotkeyFakeFullValue : hotkeyShowHideValue;
+			const std::wstring label = capturing ? L"\u8bf7\u6309\u4e0b\u7ec4\u5408\u952e" : HotkeyDisplayText(value);
+			Text(g, label.c_str(), field.X + 12, field.Y + 6, field.Width - 24, 20, 11,
+				capturing ? FontStyleRegular : FontStyleBold,
+				capturing ? C(darkMode, 0, 107, 95, 130, 213, 199) : C(darkMode, 38, 46, 43, 226, 234, 230));
+		}
 	}
 	else {
-		Text(g, L"\u7ed3\u675f\u8fdb\u7a0b\u65b9\u5f0f", x + 24, y + 78, 180, 22, 11, FontStyleBold, C(darkMode, 42, 49, 46, 220, 229, 225));
+		Text(g, L"\u7ed3\u675f\u8fdb\u7a0b\u65b9\u5f0f", x + 24, y + 78, 180, 22, 11, FontStyleBold, titleColor);
 		const wchar_t* killLabels[] = { L"TerminateProcess", L"NtTerminateProcess", L"Kernel Mode" };
 		for (int i = 0; i < 3; ++i) {
 			const float bx = x + 24 + i * 154.0f;
+			const bool pressed = pressTarget == 64 + i;
+			const float sink = pressed ? 1.0f : 0.0f;
 			advancedKillRects[i] = { static_cast<LONG>(bx), static_cast<LONG>(y + 108), static_cast<LONG>(bx + 144), static_cast<LONG>(y + 146) };
-			FillRound(g, RectF(bx, y + 108, 144, 38), 19, advancedKillMode == i ? C(darkMode, 183, 232, 222, 42, 79, 72) : C(darkMode, 255, 255, 255, 38, 45, 42));
-			Text(g, killLabels[i], bx, y + 118, 144, 18, 9, advancedKillMode == i ? FontStyleBold : FontStyleRegular,
+			FillRound(g, RectF(bx, y + 108 + sink, 144, 38), 19,
+				advancedKillMode == i ? C(darkMode, 183, 232, 222, 42, 79, 72)
+					: Blend(surface, C(darkMode, 226, 238, 232, 46, 58, 53), hoverProgress[64 + i]));
+			Text(g, killLabels[i], bx, y + 118 + sink, 144, 18, 10, advancedKillMode == i ? FontStyleBold : FontStyleRegular,
 				C(darkMode, 0, 81, 72, 177, 239, 228), StringAlignmentCenter);
 		}
-		Text(g, L"\u6ce8\u5165\u65b9\u5f0f", x + 24, y + 166, 180, 22, 11, FontStyleBold, C(darkMode, 42, 49, 46, 220, 229, 225));
+		Text(g, L"\u6ce8\u5165\u65b9\u5f0f", x + 24, y + 166, 180, 22, 11, FontStyleBold, titleColor);
 		const wchar_t* injectLabels[] = { L"RemoteThread", L"HookDllStub" };
 		for (int i = 0; i < 2; ++i) {
 			const float bx = x + 24 + i * 154.0f;
+			const bool pressed = pressTarget == 67 + i;
+			const float sink = pressed ? 1.0f : 0.0f;
 			advancedInjectRects[i] = { static_cast<LONG>(bx), static_cast<LONG>(y + 196), static_cast<LONG>(bx + 144), static_cast<LONG>(y + 234) };
-			FillRound(g, RectF(bx, y + 196, 144, 38), 19, advancedInjectMode == i ? C(darkMode, 183, 232, 222, 42, 79, 72) : C(darkMode, 255, 255, 255, 38, 45, 42));
-			Text(g, injectLabels[i], bx, y + 206, 144, 18, 9, advancedInjectMode == i ? FontStyleBold : FontStyleRegular,
+			FillRound(g, RectF(bx, y + 196 + sink, 144, 38), 19,
+				advancedInjectMode == i ? C(darkMode, 183, 232, 222, 42, 79, 72)
+					: Blend(surface, C(darkMode, 226, 238, 232, 46, 58, 53), hoverProgress[67 + i]));
+			Text(g, injectLabels[i], bx, y + 206 + sink, 144, 18, 10, advancedInjectMode == i ? FontStyleBold : FontStyleRegular,
 				C(darkMode, 0, 81, 72, 177, 239, 228), StringAlignmentCenter);
 		}
+		const float intervalX = x + w - 214;
+		Text(g, L"\u68c0\u6d4b\u95f4\u9694 (ms)", intervalX, y + 166, 190, 20, 11, FontStyleBold, titleColor);
+		drawField(RectF(intervalX, y + 188, 190, 38), advancedControls[2]);
 		const wchar_t* titles[] = { L"\u542f\u7528\u63a7\u5236\u5668", L"\u59cb\u7ec8\u68c0\u67e5\u66f4\u65b0", L"\u5f3a\u5236\u5b89\u88c5\u5230\u5f53\u524d\u76ee\u5f55", L"\u7981\u7528 WatchDog", L"\u6ce8\u5165 Master Helper", L"\u6ce8\u5165 64 \u4f4d Helper" };
 		bool values[] = { advController, advAlwaysUpdate, advForceCurrentDir, advDisableWatchdog, advInjectMaster, advInject64 };
-		const float cardW = (w - 60) / 2.0f;
+		// 六个开关铺到说明条上方，别都挤在页面上半截。
+		const float compatSlot = (std::max)(68.0f, (std::min)(104.0f, (AdvancedHintBannerY(h) - 278.0f) / 3.0f));
 		for (int i = 0; i < 6; ++i) {
 			const int col = i % 2, row = i / 2;
-			drawToggle(i, x + 24 + col * (cardW + 12), y + 260 + row * 68.0f, cardW, titles[i], L"\u9ad8\u7ea7\u9009\u9879\uff0c\u4fee\u6539\u540e\u8bf7\u4fdd\u5b58", values[i]);
+			drawToggle(i, x + 24 + col * (cardW + gap),
+				y + 260 + row * compatSlot + (compatSlot - 64.0f) / 2.0f,
+				cardW, titles[i], L"\u9ad8\u7ea7\u9009\u9879\uff0c\u4fee\u6539\u540e\u8bf7\u4fdd\u5b58", values[i]);
 		}
-		Text(g, L"\u68c0\u6d4b\u95f4\u9694 (ms)", x + w - 184, y + 198, 150, 20, 10, FontStyleBold, C(darkMode, 42, 49, 46, 220, 229, 225));
 	}
-	advancedSaveRect = { static_cast<LONG>(x + w - 148), static_cast<LONG>(y + h - 54), static_cast<LONG>(x + w - 24), static_cast<LONG>(y + h - 14) };
-	FillRound(g, RectF(x + w - 148, y + h - 54, 124, 40), 20, C(darkMode, 0, 107, 95, 130, 213, 199));
-	Text(g, L"\u4fdd\u5b58\u9ad8\u7ea7\u8bbe\u7f6e", x + w - 148, y + h - 43, 124, 20, 10, FontStyleBold, C(darkMode, 255, 255, 255, 0, 55, 49), StringAlignmentCenter);
+	const float bannerY = y + AdvancedHintBannerY(h);
+	FillRound(g, RectF(x + 24, bannerY, w - 48, 66), 12, surface);
+	DrawIcon(g, 3, x + 44, bannerY + 24, C(darkMode, 0, 107, 95, 130, 213, 199), 18);
+	Text(g, advancedTab == 0
+		? L"\u5feb\u6377\u952e\u5728\u4efb\u610f\u754c\u9762\u90fd\u751f\u6548\uff1b\u70b9\u8f93\u5165\u6846\u540e\u76f4\u63a5\u6309\u4e0b\u7ec4\u5408\u952e\u5373\u53ef\u5f55\u5236\uff0cEsc \u6e05\u9664\u3002"
+		: L"\u7ed3\u675f\u65b9\u5f0f\u4e0e\u6ce8\u5165\u65b9\u5f0f\u5f71\u54cd\u9a71\u52a8\u5c42\u884c\u4e3a\uff0c\u4fee\u6539\u540e\u4fdd\u5b58\u5e76\u91cd\u542f\u4e3b\u7a0b\u5e8f\u624d\u4f1a\u751f\u6548\u3002",
+		x + 76, bannerY + 22, w - 128, 22, 10, FontStyleRegular, secondary);
+	const float saveY = y + AdvancedSaveButtonY(h);
+	advancedSaveRect = { static_cast<LONG>(x + w - 148), static_cast<LONG>(saveY), static_cast<LONG>(x + w - 24), static_cast<LONG>(saveY + 40) };
+	PaintPrimaryButton(g, RectF(x + w - 148, saveY, 124, 40), L"\u4fdd\u5b58\u9ad8\u7ea7\u8bbe\u7f6e", 69);
 }
 
 void MainWindow::PaintHelp(Graphics& g, int width, int height, int offsetY)
@@ -3559,22 +4348,64 @@ void MainWindow::PaintHelp(Graphics& g, int width, int height, int offsetY)
 	const float y = 94.0f + offsetY;
 	const float w = static_cast<float>(width - 276);
 	const float h = static_cast<float>(height) - y - 20;
-	FillRound(g, RectF(x, y, w, h), 8, C(darkMode, 237, 242, 239, 31, 37, 34));
-	Text(g, L"\u5feb\u901f\u4e0a\u624b", x + 28, y + 24, 220, 28, 17, FontStyleBold, C(darkMode, 32, 38, 35, 223, 231, 227));
+	SoftShadow(g, RectF(x, y, w, h), 12, darkMode);
+	FillRound(g, RectF(x, y, w, h), 12, C(darkMode, 255, 255, 255, 33, 40, 37));
+	Text(g, L"\u5feb\u901f\u4e0a\u624b", x + 28, y + 24, 220, 28, 17, FontStyleBold, C(darkMode, 24, 30, 27, 226, 233, 229));
 	Text(g, L"Dzjs Trainer \u4f1a\u81ea\u52a8\u68c0\u6d4b StudentMain \u5e76\u5e94\u7528\u5f53\u524d\u9632\u62a4\u7b56\u7565\u3002", x + 28, y + 58, w - 56, 28, 11,
 		FontStyleRegular, C(darkMode, 81, 91, 86, 171, 183, 177));
-	const wchar_t* steps[] = {
-		L"1", L"\u786e\u8ba4\u72b6\u6001", L"\u5728\u201c\u72b6\u6001\u603b\u89c8\u201d\u4e2d\u68c0\u67e5\u5b66\u751f\u7aef\u8fdb\u7a0b\u548c\u9632\u62a4\u670d\u52a1\u662f\u5426\u6b63\u5e38\u3002",
-		L"2", L"\u8c03\u6574\u7b56\u7565", L"\u5728\u201c\u9632\u62a4\u7b56\u7565\u201d\u4e2d\u9009\u62e9\u5141\u8bb8\u7684\u8fdc\u7a0b\u884c\u4e3a\uff0c\u4fee\u6539\u540e\u7acb\u5373\u5e94\u7528\u3002",
-		L"3", L"\u67e5\u770b\u65e5\u5fd7", L"\u5982\u679c\u9632\u62a4\u672a\u6309\u9884\u671f\u5de5\u4f5c\uff0c\u8bf7\u5728\u201c\u8fd0\u884c\u65e5\u5fd7\u201d\u4e2d\u67e5\u770b\u539f\u56e0\u3002"
+	const wchar_t* stepTitles[] = { L"\u786e\u8ba4\u72b6\u6001", L"\u8c03\u6574\u7b56\u7565", L"\u67e5\u770b\u65e5\u5fd7" };
+	const wchar_t* stepDetails[] = {
+		L"\u5728\u201c\u72b6\u6001\u603b\u89c8\u201d\u4e2d\u68c0\u67e5\u5b66\u751f\u7aef\u8fdb\u7a0b\u548c\u9632\u62a4\u670d\u52a1\u662f\u5426\u6b63\u5e38\u3002",
+		L"\u5728\u201c\u9632\u62a4\u7b56\u7565\u201d\u4e2d\u9009\u62e9\u5141\u8bb8\u7684\u8fdc\u7a0b\u884c\u4e3a\uff0c\u4fee\u6539\u540e\u7acb\u5373\u5e94\u7528\u3002",
+		L"\u5982\u679c\u9632\u62a4\u672a\u6309\u9884\u671f\u5de5\u4f5c\uff0c\u8bf7\u5728\u201c\u8fd0\u884c\u65e5\u5fd7\u201d\u4e2d\u67e5\u770b\u539f\u56e0\u3002"
 	};
+	// 三步固定高度、从上排下来。原来按可用高度拉伸到 112px，
+	// 每张卡里只有一行字，卡片反而显得空。
+	const float stepsTop = y + 96.0f;
+	const float stepH = 88.0f;
+	const float stepGap = 16.0f;
 	for (int i = 0; i < 3; ++i) {
-		const float rowY = y + 112 + i * 116.0f;
-		FillRound(g, RectF(x + 28, rowY, w - 56, 94), 8, C(darkMode, 255, 255, 255, 38, 45, 42));
-		FillRound(g, RectF(x + 46, rowY + 25, 44, 44), 22, C(darkMode, 183, 232, 222, 42, 79, 72));
-		Text(g, steps[i * 3], x + 46, rowY + 35, 44, 24, 12, FontStyleBold, C(darkMode, 0, 81, 72, 156, 240, 225), StringAlignmentCenter);
-		Text(g, steps[i * 3 + 1], x + 112, rowY + 19, w - 170, 24, 13, FontStyleBold, C(darkMode, 37, 44, 41, 222, 230, 226));
-		Text(g, steps[i * 3 + 2], x + 112, rowY + 50, w - 170, 34, 10, FontStyleRegular, C(darkMode, 91, 99, 95, 166, 177, 171));
+		const float rowY = stepsTop + i * (stepH + stepGap);
+		// 步骤卡原来是白底画在同一张白卡上，边界完全看不见，三步像是直接浮着。
+		FillRound(g, RectF(x + 28, rowY, w - 56, stepH), 12, C(darkMode, 246, 250, 247, 30, 36, 34));
+		StrokeRound(g, RectF(x + 28, rowY, w - 56, stepH), 12, C(darkMode, 228, 236, 231, 46, 54, 50));
+		// 序号改实心主色圆 + 白字，原来淡青底配青字几乎读不出来。
+		const float badgeY = rowY + (stepH - 44.0f) / 2.0f;
+		FillRound(g, RectF(x + 48, badgeY, 44, 44), 22, C(darkMode, 0, 121, 107, 130, 213, 199));
+		wchar_t number[8];
+		swprintf_s(number, L"%d", i + 1);
+		Text(g, number, x + 48, badgeY + 11, 44, 22, 15, FontStyleBold,
+			C(darkMode, 255, 255, 255, 0, 55, 49), StringAlignmentCenter);
+		// 标题和说明并排：卡片有 860px 宽，堆成两行会让右侧空掉一大片。
+		const float lineY = rowY + stepH / 2.0f - 12.0f;
+		Text(g, stepTitles[i], x + 112, lineY, 168, 24, 14, FontStyleBold,
+			C(darkMode, 26, 32, 29, 224, 231, 227));
+		Text(g, stepDetails[i], x + 292, lineY + 3.0f, w - 340, 22, 11, FontStyleRegular,
+			C(darkMode, 88, 97, 92, 170, 181, 175));
+	}
+	// 下半截原来是空白，补一张当前生效的快捷键卡：正好把"高级配置里改过什么"
+	// 在帮助页也看得见，不用来回切页。
+	const float infoY = stepsTop + 3.0f * stepH + 2.0f * stepGap + 16.0f;
+	const float infoH = static_cast<float>(height) - 24.0f - infoY;
+	if (infoH >= 96.0f) {
+		const Color body = C(darkMode, 88, 97, 92, 170, 181, 175);
+		FillRound(g, RectF(x + 28, infoY, w - 56, infoH), 12, C(darkMode, 246, 250, 247, 30, 36, 34));
+		StrokeRound(g, RectF(x + 28, infoY, w - 56, infoH), 12, C(darkMode, 228, 236, 231, 46, 54, 50));
+		Text(g, L"\u5f53\u524d\u5feb\u6377\u952e", x + 48, infoY + 18, 220, 24, 13, FontStyleBold,
+			C(darkMode, 26, 32, 29, 224, 231, 227));
+		const wchar_t* hotkeyLabels[] = { L"\u5207\u5230\u66ff\u6362\u753b\u9762", L"\u663e\u793a / \u9690\u85cf\u4e3b\u7a97\u53e3" };
+		const int hotkeyValues[] = { hotkeyFakeFullValue, hotkeyShowHideValue };
+		for (int i = 0; i < 2; ++i) {
+			const float rowY = infoY + 52.0f + i * 30.0f;
+			if (rowY + 22.0f > infoY + infoH) break;
+			Text(g, hotkeyLabels[i], x + 48, rowY, 240, 20, 11, FontStyleRegular, body);
+			const std::wstring value = HotkeyDisplayText(hotkeyValues[i]);
+			FillRound(g, RectF(x + 300, rowY - 3, 140, 24), 8, C(darkMode, 255, 255, 255, 34, 41, 38));
+			Text(g, value.c_str(), x + 300, rowY, 140, 20, 10, FontStyleBold,
+				C(darkMode, 34, 42, 39, 224, 232, 228), StringAlignmentCenter);
+		}
+		Text(g, L"\u53ef\u5728\u201c\u9ad8\u7ea7\u914d\u7f6e \u00b7 \u5e38\u89c4\u4e0e\u5feb\u6377\u952e\u201d\u91cc\u4fee\u6539\uff0c\u4fdd\u5b58\u540e\u91cd\u542f\u751f\u6548\u3002",
+			x + 48, infoY + infoH - 34.0f, w - 96, 20, 10, FontStyleRegular, body);
 	}
 }
 
@@ -3586,49 +4417,70 @@ void MainWindow::PaintNetwork(Graphics& g, int width, int height, int offsetY)
 	const float h = static_cast<float>(height) - y - 20;
 	// The original Teacher GUI is hosted as a child window inside this shell.
 	{
-		const Color surface = C(darkMode, 237, 242, 239, 31, 37, 34);
+		const Color surface = C(darkMode, 255, 255, 255, 33, 40, 37);
 		const Color title = C(darkMode, 35, 42, 39, 222, 230, 226);
 		const Color secondary = C(darkMode, 91, 99, 95, 166, 177, 171);
-		FillRound(g, RectF(x, y, w, h), 8, surface);
+		SoftShadow(g, RectF(x, y, w, h), 12, darkMode);
+		FillRound(g, RectF(x, y, w, h), 12, surface);
 		const int hostX = 264;
 		const int hostY = 170;
-		const int hostW = std::max(560, width - hostX - 24);
+		// hostX 是卡片左内边距 16 处的 264，右边缘也要留同样的 16，
+		// 原来减 24 会让宿主区比卡片宽出 4px，右上角露出一道白缝。
+		const int hostW = std::max(560, width - hostX - 44);
 		const int hostH = std::max(320, height - hostY - 24);
 		teacherLaunchRect = { hostX, 120, hostX + 144, 154 };
-		FillRound(g, RectF(static_cast<float>(hostX), static_cast<float>(hostY), static_cast<float>(hostW), static_cast<float>(hostH)), 8,
-			C(darkMode, 255, 255, 255, 38, 45, 42));
+		FillRound(g, RectF(static_cast<float>(hostX), static_cast<float>(hostY), static_cast<float>(hostW), static_cast<float>(hostH)), 12 ,
+			C(darkMode, 248, 251, 249, 31, 37, 35));
 		const bool teacherRunning = teacherProcess != nullptr && teacherChildWindow != nullptr;
-		Text(g, teacherRunning ? L"\u5df2\u5d4c\u5165\u539f\u6559\u5e08\u7aef\u7a97\u53e3" : L"\u539f\u6559\u5e08\u7aef\u5c1a\u672a\u542f\u52a8", hostX + 168, 126, w - 192, 24, 10, FontStyleBold, title);
-		Text(g, teacherRunning ? L"\u4e0b\u65b9\u533a\u57df\u4e3a\u539f\u7a97\u53e3\u5185\u5bb9\uff0c\u53ef\u76f4\u63a5\u64cd\u4f5c\u3002" : L"\u70b9\u51fb\u4e0a\u65b9\u6309\u94ae\u5f00\u59cb\u5d4c\u5165\u3002", hostX + 168, 148, w - 192, 20, 9, FontStyleRegular, secondary);
+		if (teacherRunning) {
+			Text(g, L"\u5df2\u5d4c\u5165\u539f\u6559\u5e08\u7aef\u7a97\u53e3", hostX + 168, 126, w - 192, 24, 11, FontStyleBold, title);
+			Text(g, L"\u4e0b\u65b9\u533a\u57df\u4e3a\u539f\u7a97\u53e3\u5185\u5bb9\uff0c\u53ef\u76f4\u63a5\u64cd\u4f5c\u3002", hostX + 168, 148, w - 192, 20, 10, FontStyleRegular, secondary);
+		}
+		else {
+			// 宿主区没嵌入窗口时是一大片空白，这里补一个居中的空状态，
+			// 否则整个页面看起来像加载失败。按钮旁边不再重复写一遍，
+			// 否则同一句话在页面上出现两次。
+			const float hostCenterX = hostX + hostW / 2.0f;
+			const float hostCenterY = hostY + hostH / 2.0f;
+			FillRound(g, RectF(hostCenterX - 34, hostCenterY - 86, 68, 68), 20,
+				C(darkMode, 232, 241, 236, 41, 48, 44));
+			DrawIcon(g, 5, hostCenterX - 15, hostCenterY - 67,
+				C(darkMode, 96, 118, 110, 140, 156, 148), 30);
+			Text(g, L"\u539f\u6559\u5e08\u7aef\u5df2\u5c31\u7eea\uff0c\u7b49\u5f85\u542f\u52a8",
+				hostCenterX - 220, hostCenterY, 440, 28, 15, FontStyleBold, title, StringAlignmentCenter);
+			Text(g, L"\u70b9\u51fb\u5de6\u4e0a\u89d2\u7684\u300c\u542f\u52a8\u6559\u5e08\u670d\u52a1\u300d\uff0c\u539f\u7aef\u7a97\u53e3\u4f1a\u5d4c\u5165\u5230\u8fd9\u4e2a\u533a\u57df",
+				hostCenterX - 260, hostCenterY + 32, 520, 22, 11, FontStyleRegular, secondary, StringAlignmentCenter);
+		}
 		return;
 	}
 	// The teacher endpoint is rendered by this GDI+ page; its service is only a
 	// native backend and never creates a second window.
 	{
-		const Color surface = C(darkMode, 237, 242, 239, 31, 37, 34);
-		const Color field = C(darkMode, 255, 255, 255, 38, 45, 42);
+		const Color surface = C(darkMode, 255, 255, 255, 33, 40, 37);
+		const Color field = C(darkMode, 248, 251, 249, 31, 37, 35);
 		const Color title = C(darkMode, 35, 42, 39, 222, 230, 226);
 		const Color secondary = C(darkMode, 91, 99, 95, 166, 177, 171);
-		FillRound(g, RectF(x, y, w, h), 8, surface);
+		SoftShadow(g, RectF(x, y, w, h), 12, darkMode);
+		FillRound(g, RectF(x, y, w, h), 12, surface);
 		const int topY = static_cast<int>(y + 78);
-		FillRound(g, RectF(x + 16, static_cast<float>(topY), w - 32, 54), 8, field);
+		FillRound(g, RectF(x + 16, static_cast<float>(topY), w - 32, 54), 12, field);
 		const bool teacherRunning = teacherBackend && teacherBackend->running;
 		Text(g, teacherRunning ? L"\u6559\u5e08\u670d\u52a1\u8fd0\u884c\u4e2d" : L"\u6559\u5e08\u670d\u52a1\u672a\u542f\u52a8", x + 32, static_cast<float>(topY + 12), 180, 22, 11, FontStyleBold, title);
-		Text(g, teacherRunning ? L"\u5df2\u76d1\u542c 4705 / \u4f1a\u8bdd\u7ec4\u64ad\uff0c\u6b63\u5728\u63a5\u6536\u5b66\u751f\u5217\u8868" : L"\u70b9\u51fb\u542f\u52a8\u6559\u5e08\u670d\u52a1\u5f00\u59cb\u81ea\u52a8\u53d1\u73b0", x + 220, static_cast<float>(topY + 14), w - 360, 20, 9, FontStyleRegular, secondary);
+		Text(g, teacherRunning ? L"\u5df2\u76d1\u542c 4705 / \u4f1a\u8bdd\u7ec4\u64ad\uff0c\u6b63\u5728\u63a5\u6536\u5b66\u751f\u5217\u8868" : L"\u70b9\u51fb\u542f\u52a8\u6559\u5e08\u670d\u52a1\u5f00\u59cb\u81ea\u52a8\u53d1\u73b0", x + 220, static_cast<float>(topY + 14), w - 360, 20, 10, FontStyleRegular, secondary);
 		const float cardY = y + 148;
 		const float listW = std::min(520.0f, w * 0.46f);
-		FillRound(g, RectF(x + 16, cardY, listW, h - 170), 8, field);
-		FillRound(g, RectF(x + 28 + listW, cardY, w - listW - 44, h - 170), 8, field);
+		FillRound(g, RectF(x + 16, cardY, listW, h - 170), 12, field);
+		FillRound(g, RectF(x + 28 + listW, cardY, w - listW - 44, h - 170), 12, field);
 		Text(g, L"\u5b66\u751f\u5217\u8868", x + 32, cardY + 14, 180, 22, 11, FontStyleBold, title);
-		Text(g, L"\u81ea\u52a8\u53d1\u73b0\u3001\u9884\u89c8\u3001\u4fe1\u606f\u3001\u804a\u5929\u548c\u8fdc\u7a0b\u63a7\u5236", x + 32, cardY + 38, listW - 32, 18, 9, FontStyleRegular, secondary);
+		Text(g, L"\u81ea\u52a8\u53d1\u73b0\u3001\u9884\u89c8\u3001\u4fe1\u606f\u3001\u804a\u5929\u548c\u8fdc\u7a0b\u63a7\u5236", x + 32, cardY + 38, listW - 32, 18, 10, FontStyleRegular, secondary);
 		Text(g, L"\u5b66\u751f\u64cd\u4f5c", x + 44 + listW, cardY + 14, 180, 22, 11, FontStyleBold, title);
-		Text(g, L"\u9009\u62e9\u5de6\u4fa7\u5b66\u751f\u540e\u53d1\u9001\u64cd\u4f5c", x + 44 + listW, cardY + 38, w - listW - 76, 18, 9, FontStyleRegular, secondary);
+		Text(g, L"\u9009\u62e9\u5de6\u4fa7\u5b66\u751f\u540e\u53d1\u9001\u64cd\u4f5c", x + 44 + listW, cardY + 38, w - listW - 76, 18, 10, FontStyleRegular, secondary);
 		const float previewX = x + 44 + listW;
 		const float previewY = cardY + 252;
 		const float previewW = std::max(260.0f, w - listW - 76.0f);
 		const float previewH = std::max(132.0f, h - 170.0f - (previewY - cardY) - 16.0f);
-		FillRound(g, RectF(previewX, previewY, previewW, previewH), 8, C(darkMode, 20, 25, 23, 255, 28, 25));
-		Text(g, L"\u5c4f\u5e55\u9884\u89c8", previewX + 14, previewY + 12, 120, 20, 10, FontStyleBold, C(darkMode, 210, 218, 214, 190, 199, 194));
+		FillRound(g, RectF(previewX, previewY, previewW, previewH), 12, C(darkMode, 20, 25, 23, 255, 28, 25));
+		Text(g, L"\u5c4f\u5e55\u9884\u89c8", previewX + 14, previewY + 12, 120, 20, 11, FontStyleBold, C(darkMode, 210, 218, 214, 190, 199, 194));
 		Bitmap* preview = nullptr;
 		if (teacherBackend) {
 			if (teacherBackend->remote_bitmap && teacherBackend->remote_ip == teacherBackend->selected_ip) preview = teacherBackend->remote_bitmap.get();
@@ -3646,7 +4498,7 @@ void MainWindow::PaintNetwork(Graphics& g, int width, int height, int offsetY)
 			const float drawH = preview->GetHeight() * std::max(0.05f, scale);
 			g.DrawImage(preview, RectF(previewX + (previewW - drawW) * 0.5f, previewY + 38.0f + (previewH - 38.0f - drawH) * 0.5f, drawW, drawH));
 		}
-		else Text(g, L"\u9009\u62e9\u5b66\u751f\u540e\u70b9\u51fb\u5237\u65b0\u9884\u89c8", previewX + 16, previewY + previewH * 0.5f - 8, previewW - 32, 24, 10, FontStyleRegular,
+		else Text(g, L"\u9009\u62e9\u5b66\u751f\u540e\u70b9\u51fb\u5237\u65b0\u9884\u89c8", previewX + 16, previewY + previewH * 0.5f - 8, previewW - 32, 24, 11, FontStyleRegular,
 			C(darkMode, 142, 151, 146, 150, 161, 155), StringAlignmentCenter);
 		return;
 	}
@@ -3656,65 +4508,66 @@ void MainWindow::PaintNetwork(Graphics& g, int width, int height, int offsetY)
 	const float innerX = x + 32;
 	const float innerW = w - 64;
 	const float fieldW = std::max(174.0f, innerW - 422.0f);
-	const Color surface = C(darkMode, 237, 242, 239, 31, 37, 34);
-	const Color field = C(darkMode, 255, 255, 255, 38, 45, 42);
+	const Color surface = C(darkMode, 255, 255, 255, 33, 40, 37);
+	const Color field = C(darkMode, 248, 251, 249, 31, 37, 35);
 	const Color outline = C(darkMode, 116, 124, 120, 101, 113, 107);
 	const Color title = C(darkMode, 35, 42, 39, 222, 230, 226);
 	const Color secondary = C(darkMode, 91, 99, 95, 166, 177, 171);
-	FillRound(g, RectF(x, y, w, h), 8, surface);
+	SoftShadow(g, RectF(x, y, w, h), 12, darkMode);
+	FillRound(g, RectF(x, y, w, h), 12, surface);
 	Text(g, L"\u7f51\u7edc\u8bca\u65ad\u4e0e\u6d88\u606f", innerX, y + 18, 300, 28, 17, FontStyleBold, title);
-	Text(g, L"\u4f7f\u7528\u5c40\u57df\u7f51\u626b\u63cf\u3001\u7aef\u53e3\u68c0\u6d4b\u548c UDP \u5de5\u5177", innerX, y + 48, 420, 18, 9, FontStyleRegular, secondary);
+	Text(g, L"\u4f7f\u7528\u5c40\u57df\u7f51\u626b\u63cf\u3001\u7aef\u53e3\u68c0\u6d4b\u548c UDP \u5de5\u5177", innerX, y + 48, 420, 18, 10, FontStyleRegular, secondary);
 
-	FillRound(g, RectF(panelX, y + 76, panelW, 72), 8, field);
-	Text(g, L"\u76ee\u6807 IP", innerX, y + 100, 64, 20, 10, FontStyleBold, title);
-	FillRound(g, RectF(innerX + 70, y + 91, fieldW + 8, 38), 8, field);
-	StrokeRound(g, RectF(innerX + 70, y + 91, fieldW + 8, 38), 8, outline);
-	Text(g, L"\u7aef\u53e3", innerX + 88 + fieldW, y + 100, 42, 20, 10, FontStyleBold, title);
-	FillRound(g, RectF(innerX + 132 + fieldW, y + 91, 80, 38), 8, field);
-	StrokeRound(g, RectF(innerX + 132 + fieldW, y + 91, 80, 38), 8, outline);
+	FillRound(g, RectF(panelX, y + 76, panelW, 72), 12, field);
+	Text(g, L"\u76ee\u6807 IP", innerX, y + 100, 64, 20, 11, FontStyleBold, title);
+	FillRound(g, RectF(innerX + 70, y + 91, fieldW + 8, 38), 12, field);
+	StrokeRound(g, RectF(innerX + 70, y + 91, fieldW + 8, 38), 12, outline);
+	Text(g, L"\u7aef\u53e3", innerX + 88 + fieldW, y + 100, 42, 20, 11, FontStyleBold, title);
+	FillRound(g, RectF(innerX + 132 + fieldW, y + 91, 80, 38), 12, field);
+	StrokeRound(g, RectF(innerX + 132 + fieldW, y + 91, 80, 38), 12, outline);
 
-	FillRound(g, RectF(panelX, y + 156, panelW, 58), 8, field);
-	Text(g, L"\u6d88\u606f", innerX, y + 177, 64, 20, 10, FontStyleBold, title);
-	FillRound(g, RectF(innerX + 70, y + 166, innerW - 180, 38), 8, field);
-	StrokeRound(g, RectF(innerX + 70, y + 166, innerW - 180, 38), 8, outline);
+	FillRound(g, RectF(panelX, y + 156, panelW, 58), 12, field);
+	Text(g, L"\u6d88\u606f", innerX, y + 177, 64, 20, 11, FontStyleBold, title);
+	FillRound(g, RectF(innerX + 70, y + 166, innerW - 180, 38), 12, field);
+	StrokeRound(g, RectF(innerX + 70, y + 166, innerW - 180, 38), 12, outline);
 
-	FillRound(g, RectF(panelX, y + 222, panelW, 58), 8, field);
-	Text(g, L"\u547d\u4ee4", innerX, y + 243, 64, 20, 10, FontStyleBold, title);
-	FillRound(g, RectF(innerX + 70, y + 232, innerW - 180, 38), 8, field);
-	StrokeRound(g, RectF(innerX + 70, y + 232, innerW - 180, 38), 8, outline);
+	FillRound(g, RectF(panelX, y + 222, panelW, 58), 12, field);
+	Text(g, L"\u547d\u4ee4", innerX, y + 243, 64, 20, 11, FontStyleBold, title);
+	FillRound(g, RectF(innerX + 70, y + 232, innerW - 180, 38), 12, field);
+	StrokeRound(g, RectF(innerX + 70, y + 232, innerW - 180, 38), 12, outline);
 
-	Text(g, L"\u5feb\u6377\u64cd\u4f5c", innerX, y + 300, 120, 20, 10, FontStyleBold, title);
+	Text(g, L"\u5feb\u6377\u64cd\u4f5c", innerX, y + 300, 120, 20, 11, FontStyleBold, title);
 	Text(g, L"\u8fd0\u884c\u7ed3\u679c", innerX, y + 356, 120, 20, 11, FontStyleBold, title);
-	FillRound(g, RectF(panelX, y + 382, panelW, std::max(72.0f, h - 398)), 8, field);
-	StrokeRound(g, RectF(panelX, y + 382, panelW, std::max(72.0f, h - 398)), 8, C(darkMode, 199, 205, 201, 67, 75, 71));
+	FillRound(g, RectF(panelX, y + 382, panelW, std::max(72.0f, h - 398)), 12, field);
+	StrokeRound(g, RectF(panelX, y + 382, panelW, std::max(72.0f, h - 398)), 12, C(darkMode, 199, 205, 201, 67, 75, 71));
 
-	FillRound(g, RectF(x + 8, y + 8, w - 16, h - 16), 8,
+	FillRound(g, RectF(x + 8, y + 8, w - 16, h - 16), 12 ,
 		darkMode ? Color(232, 17, 20, 19) : Color(232, 246, 248, 246));
 	const float centerY = y + h * 0.5f - 82.0f;
-	FillRound(g, RectF(x + w * 0.5f - 28, centerY, 56, 56), 8, C(darkMode, 219, 238, 232, 43, 76, 69));
+	FillRound(g, RectF(x + w * 0.5f - 28, centerY, 56, 56), 12, C(darkMode, 219, 238, 232, 43, 76, 69));
 	DrawIcon(g, 6, x + w * 0.5f - 10, centerY + 18, C(darkMode, 0, 81, 72, 177, 239, 228), 20);
 	Text(g, L"\u65b0\u7248\u53cd\u63a7\u5de5\u5177\u6b63\u5728\u5f00\u53d1\u4e2d", x + 40, centerY + 76, w - 80, 34, 20, FontStyleBold,
 		C(darkMode, 35, 42, 39, 222, 230, 226), StringAlignmentCenter);
-	Text(g, L"\u8bf7\u524d\u5f80 GitHub \u9879\u76ee\u67e5\u770b\u5f00\u53d1\u8fdb\u5ea6\u4e0e\u72ec\u7acb\u7248\u672c", x + 40, centerY + 116, w - 80, 24, 10, FontStyleRegular,
+	Text(g, L"\u8bf7\u524d\u5f80 GitHub \u9879\u76ee\u67e5\u770b\u5f00\u53d1\u8fdb\u5ea6\u4e0e\u72ec\u7acb\u7248\u672c", x + 40, centerY + 116, w - 80, 24, 11, FontStyleRegular,
 		C(darkMode, 91, 99, 95, 166, 177, 171), StringAlignmentCenter);
 	const float linkW = std::min(360.0f, w - 80.0f);
 	const float linkX = x + (w - linkW) * 0.5f;
 	networkProjectRect = { static_cast<LONG>(linkX), static_cast<LONG>(centerY + 158), static_cast<LONG>(linkX + linkW), static_cast<LONG>(centerY + 202) };
 	FillRound(g, RectF(linkX, centerY + 158, linkW, 44), 22,
 		Blend(C(darkMode, 183, 232, 222, 42, 79, 72), C(darkMode, 157, 220, 207, 55, 96, 87), hoverProgress[72]));
-	Text(g, L"GitHub  /  yunsjxh/Third-party-JiYu-Teacher-Endpoint", linkX + 16, centerY + 170, linkW - 32, 20, 10, FontStyleBold,
+	Text(g, L"GitHub  /  yunsjxh/Third-party-JiYu-Teacher-Endpoint", linkX + 16, centerY + 170, linkW - 32, 20, 11, FontStyleBold,
 		C(darkMode, 0, 81, 72, 177, 239, 228), StringAlignmentCenter);
 	const int hostX = 264;
 		const int hostY = 170;
 	const int hostW = std::max(560, width - hostX - 24);
 	const int hostH = std::max(320, height - hostY - 24);
-	FillRound(g, RectF(static_cast<float>(hostX), static_cast<float>(hostY), static_cast<float>(hostW), static_cast<float>(hostH)), 8,
-		C(darkMode, 255, 255, 255, 38, 45, 42));
+	FillRound(g, RectF(static_cast<float>(hostX), static_cast<float>(hostY), static_cast<float>(hostW), static_cast<float>(hostH)), 12 ,
+		C(darkMode, 248, 251, 249, 31, 37, 35));
 	teacherLaunchRect = { hostX, 120, hostX + 144, 154 };
 	const bool teacherRunning = teacherProcess != nullptr && teacherChildWindow != nullptr;
-	Text(g, teacherRunning ? L"\u6559\u5e08\u7aef\u5df2\u5d4c\u5165\u8fd0\u884c" : L"\u6559\u5e08\u7aef\u5c1a\u672a\u542f\u52a8", hostX + 168, 126, w - 192, 24, 10, FontStyleBold,
+	Text(g, teacherRunning ? L"\u6559\u5e08\u7aef\u5df2\u5d4c\u5165\u8fd0\u884c" : L"\u6559\u5e08\u7aef\u5c1a\u672a\u542f\u52a8", hostX + 168, 126, w - 192, 24, 11, FontStyleBold,
 		C(darkMode, 35, 42, 39, 222, 230, 226));
-	Text(g, teacherRunning ? L"\u7a97\u53e3\u548c\u7f51\u7edc\u670d\u52a1\u5728\u6b64\u533a\u57df\u5185\u8fd0\u884c\u3002" : L"\u70b9\u51fb\u4e0a\u65b9\u6309\u94ae\u542f\u52a8\u5e76\u5d4c\u5165 cpp-gui\u3002", hostX + 168, 148, w - 192, 20, 9, FontStyleRegular,
+	Text(g, teacherRunning ? L"\u7a97\u53e3\u548c\u7f51\u7edc\u670d\u52a1\u5728\u6b64\u533a\u57df\u5185\u8fd0\u884c\u3002" : L"\u70b9\u51fb\u4e0a\u65b9\u6309\u94ae\u542f\u52a8\u5e76\u5d4c\u5165 cpp-gui\u3002", hostX + 168, 148, w - 192, 20, 10, FontStyleRegular,
 	C(darkMode, 91, 99, 95, 166, 177, 171));
 #endif
 }
@@ -3725,26 +4578,23 @@ void MainWindow::PaintDiagnostics(Graphics& g, int width, int height, int offset
 	const float y = 94.0f + offsetY;
 	const float w = static_cast<float>(width - 276);
 	const float h = static_cast<float>(height) - y - 20;
-	const Color surface = C(darkMode, 237, 242, 239, 31, 37, 34);
-	const Color field = C(darkMode, 255, 255, 255, 38, 45, 42);
+	const Color surface = C(darkMode, 255, 255, 255, 33, 40, 37);
+	const Color field = C(darkMode, 248, 251, 249, 31, 37, 35);
 	const Color title = C(darkMode, 35, 42, 39, 222, 230, 226);
 	const Color secondary = C(darkMode, 91, 99, 95, 166, 177, 171);
-	FillRound(g, RectF(x, y, w, h), 8, surface);
+	SoftShadow(g, RectF(x, y, w, h), 12, darkMode);
+	FillRound(g, RectF(x, y, w, h), 12, surface);
 	Text(g, L"网络与 USB 阻断诊断", x + 20, y + 18, 330, 26, 17, FontStyleBold, title);
-	Text(g, L"选择驱动查看位置、签名、服务和筛选依据；手动卸载前会要求确认。", x + 20, y + 50, w - 190, 20, 10, FontStyleRegular, secondary);
+	Text(g, L"选择驱动查看位置、签名、服务和筛选依据；手动卸载前会要求确认。", x + 20, y + 50, w - 190, 20, 11, FontStyleRegular, secondary);
 	diagnosticsHideOwnRect = { static_cast<LONG>(x + w - 326), static_cast<LONG>(y + 16),
 		static_cast<LONG>(x + w - 172), static_cast<LONG>(y + 50) };
-	FillRound(g, RectF(x + w - 326, y + 16, 154, 34), 17,
-		diagnosticsHideOwnDrivers ? C(darkMode, 183, 232, 222, 42, 79, 72) : C(darkMode, 235, 240, 237, 48, 56, 52));
-	Text(g, diagnosticsHideOwnDrivers ? L"显示本程序条目" : L"隐藏本程序条目",
-		x + w - 326, y + 25, 154, 18, 9, FontStyleBold,
-		diagnosticsHideOwnDrivers ? C(darkMode, 0, 81, 72, 177, 239, 228) : secondary, StringAlignmentCenter);
+	PaintButton(g, RectF(x + w - 326, y + 16, 154, 34),
+		diagnosticsHideOwnDrivers ? L"显示本程序条目" : L"隐藏本程序条目", 92,
+		diagnosticsHideOwnDrivers ? ButtonStyle::Tonal : ButtonStyle::Ghost, 17);
 	diagnosticsScanRect = { static_cast<LONG>(x + w - 152), static_cast<LONG>(y + 16),
 		static_cast<LONG>(x + w - 20), static_cast<LONG>(y + 50) };
-	FillRound(g, RectF(x + w - 152, y + 16, 132, 34), 17,
-		C(darkMode, 0, 107, 95, 130, 213, 199));
-	Text(g, diagnosticsRunning ? L"正在检查..." : L"开始诊断", x + w - 152, y + 25, 132, 18, 10,
-		FontStyleBold, C(darkMode, 255, 255, 255, 0, 55, 49), StringAlignmentCenter);
+	PaintButton(g, RectF(x + w - 152, y + 16, 132, 34),
+		diagnosticsRunning ? L"正在检查..." : L"开始诊断", 90, ButtonStyle::Primary, 17);
 
 	const float metricY = y + 78;
 	const float metricW = (w - 32 - 36) / 4.0f;
@@ -3756,8 +4606,8 @@ void MainWindow::PaintDiagnostics(Graphics& g, int width, int height, int offset
 	}};
 	for (size_t i = 0; i < metrics.size(); ++i) {
 		const float cardX = x + 16 + static_cast<float>(i) * (metricW + 12);
-		FillRound(g, RectF(cardX, metricY, metricW, 60), 8, field);
-		Text(g, metrics[i].first.c_str(), cardX + 14, metricY + 12, metricW - 28, 16, 9, FontStyleRegular, secondary);
+		FillRound(g, RectF(cardX, metricY, metricW, 60), 12, field);
+		Text(g, metrics[i].first.c_str(), cardX + 14, metricY + 12, metricW - 28, 16, 10, FontStyleRegular, secondary);
 		Text(g, metrics[i].second.c_str(), cardX + 14, metricY + 32, metricW - 28, 18, 11, FontStyleBold, title);
 	}
 
@@ -3767,12 +4617,12 @@ void MainWindow::PaintDiagnostics(Graphics& g, int width, int height, int offset
 	const float detailX = listX + listW + 16;
 	const float detailW = x + w - 16 - detailX;
 	const float panelH = std::max(150.0f, y + h - panelY - 16);
-	FillRound(g, RectF(listX, panelY, listW, panelH), 8, field);
-	FillRound(g, RectF(detailX, panelY, detailW, panelH), 8, field);
+	FillRound(g, RectF(listX, panelY, listW, panelH), 12, field);
+	FillRound(g, RectF(detailX, panelY, detailW, panelH), 12, field);
 	diagnosticsListRect = { static_cast<LONG>(listX), static_cast<LONG>(panelY),
 		static_cast<LONG>(listX + listW), static_cast<LONG>(panelY + panelH) };
 	Text(g, L"已加载驱动", listX + 16, panelY + 14, 130, 20, 12, FontStyleBold, title);
-	Text(g, std::to_wstring(diagnosticsDrivers.size()).c_str(), listX + listW - 48, panelY + 15, 32, 18, 10, FontStyleBold, secondary, StringAlignmentFar);
+	Text(g, std::to_wstring(diagnosticsDrivers.size()).c_str(), listX + listW - 48, panelY + 15, 32, 18, 11, FontStyleBold, secondary, StringAlignmentFar);
 
 	const std::array<const wchar_t*, 4> filterNames = { L"全部", L"高风险", L"已签名", L"待核查" };
 	const float filterY = panelY + 42;
@@ -3781,9 +4631,10 @@ void MainWindow::PaintDiagnostics(Graphics& g, int width, int height, int offset
 		const float buttonX = listX + 16 + static_cast<float>(i) * (filterW + 6);
 		diagnosticsFilterRects[i] = { static_cast<LONG>(buttonX), static_cast<LONG>(filterY), static_cast<LONG>(buttonX + filterW), static_cast<LONG>(filterY + 28) };
 		const bool active = static_cast<int>(diagnosticsFilter) == static_cast<int>(i);
-		FillRound(g, RectF(buttonX, filterY, filterW, 28), 14,
-			active ? C(darkMode, 183, 232, 222, 42, 79, 72) : C(darkMode, 235, 240, 237, 48, 56, 52));
-		Text(g, filterNames[i], buttonX, filterY + 7, filterW, 16, 9, active ? FontStyleBold : FontStyleRegular,
+		FillRound(g, RectF(buttonX, filterY + (pressTarget == static_cast<int>(93 + i) ? 1.0f : 0.0f), filterW, 28), 14,
+			active ? C(darkMode, 183, 232, 222, 42, 79, 72)
+				: Blend(C(darkMode, 235, 240, 237, 48, 56, 52), C(darkMode, 214, 232, 224, 56, 76, 69), hoverProgress[93 + static_cast<int>(i)]));
+		Text(g, filterNames[i], buttonX, filterY + 7, filterW, 16, 10, active ? FontStyleBold : FontStyleRegular,
 			active ? C(darkMode, 0, 81, 72, 177, 239, 228) : secondary, StringAlignmentCenter);
 	}
 
@@ -3804,10 +4655,10 @@ void MainWindow::PaintDiagnostics(Graphics& g, int width, int height, int offset
 	const int maxOffset = std::max(0, static_cast<int>(diagnosticsVisibleDrivers.size()) - visibleRows);
 	diagnosticsListOffset = std::max(0, std::min(diagnosticsListOffset, maxOffset));
 	if (diagnosticsDrivers.empty()) {
-		Text(g, L"点击“开始诊断”收集已加载驱动。", listX + 20, rowY + 16, listW - 40, 22, 10, FontStyleRegular, secondary);
+		Text(g, L"点击“开始诊断”收集已加载驱动。", listX + 20, rowY + 16, listW - 40, 22, 11, FontStyleRegular, secondary);
 	}
 	else if (diagnosticsVisibleDrivers.empty()) {
-		Text(g, L"当前筛选没有匹配的驱动。", listX + 20, rowY + 16, listW - 40, 22, 10, FontStyleRegular, secondary);
+		Text(g, L"当前筛选没有匹配的驱动。", listX + 20, rowY + 16, listW - 40, 22, 11, FontStyleRegular, secondary);
 	}
 	else {
 		for (int row = 0; row < visibleRows && diagnosticsListOffset + row < static_cast<int>(diagnosticsVisibleDrivers.size()); ++row) {
@@ -3818,11 +4669,12 @@ void MainWindow::PaintDiagnostics(Graphics& g, int width, int height, int offset
 			const Color statusColor = driver.highRisk ? C(darkMode, 213, 83, 83, 244, 149, 149) :
 				(driver.needsReview ? C(darkMode, 184, 130, 23, 239, 198, 101) : C(darkMode, 0, 127, 112, 130, 213, 199));
 			FillRound(g, RectF(listX + 10, itemY, listW - 20, 46), 6,
-				selected ? C(darkMode, 218, 239, 233, 46, 65, 60) : C(darkMode, 245, 248, 246, 43, 49, 46));
+				selected ? C(darkMode, 218, 239, 233, 46, 65, 60)
+					: Blend(C(darkMode, 245, 248, 246, 43, 49, 46), C(darkMode, 232, 240, 236, 50, 58, 54), hoverProgress[100 + row]));
 			FillRound(g, RectF(listX + 22, itemY + 16, 12, 12), 6, statusColor);
-			Text(g, driver.name.c_str(), listX + 46, itemY + 8, listW - 170, 16, 10, FontStyleBold, title);
-			Text(g, driver.path.c_str(), listX + 46, itemY + 26, listW - 64, 14, 8, FontStyleRegular, secondary);
-			Text(g, driver.highRisk ? L"高风险" : (driver.needsReview ? L"核查" : L"已签名"), listX + listW - 90, itemY + 14, 58, 16, 9, FontStyleBold, statusColor, StringAlignmentFar);
+			Text(g, driver.name.c_str(), listX + 46, itemY + 8, listW - 170, 16, 11, FontStyleBold, title);
+			Text(g, driver.path.c_str(), listX + 46, itemY + 26, listW - 64, 14, 10, FontStyleRegular, secondary);
+			Text(g, driver.highRisk ? L"高风险" : (driver.needsReview ? L"核查" : L"已签名"), listX + listW - 90, itemY + 14, 58, 16, 10, FontStyleBold, statusColor, StringAlignmentFar);
 			diagnosticsDriverRects[static_cast<size_t>(row)] = { static_cast<LONG>(listX + 10), static_cast<LONG>(itemY), static_cast<LONG>(listX + listW - 10), static_cast<LONG>(itemY + 46) };
 		}
 		if (maxOffset > 0) {
@@ -3835,7 +4687,7 @@ void MainWindow::PaintDiagnostics(Graphics& g, int width, int height, int offset
 			const std::wstring range = std::to_wstring(diagnosticsListOffset + 1) + L"-" +
 				std::to_wstring(std::min(static_cast<int>(diagnosticsVisibleDrivers.size()), diagnosticsListOffset + visibleRows)) +
 				L" / " + std::to_wstring(diagnosticsVisibleDrivers.size());
-			Text(g, range.c_str(), listX + listW - 110, panelY + 15, 56, 18, 8, FontStyleRegular, secondary, StringAlignmentFar);
+			Text(g, range.c_str(), listX + listW - 110, panelY + 15, 56, 18, 10, FontStyleRegular, secondary, StringAlignmentFar);
 		}
 	}
 
@@ -3844,21 +4696,19 @@ void MainWindow::PaintDiagnostics(Graphics& g, int width, int height, int offset
 	const DiagnosticDriver* selectedDriver = diagnosticsSelectedDriver >= 0 && diagnosticsSelectedDriver < static_cast<int>(diagnosticsDrivers.size())
 		? &diagnosticsDrivers[static_cast<size_t>(diagnosticsSelectedDriver)] : nullptr;
 	if (!selectedDriver) {
-		Text(g, L"从左侧选择一项驱动查看证据。", detailX + 18, panelY + 58, detailW - 36, 22, 10, FontStyleRegular, secondary);
-		Text(g, L"诊断只给出风险线索，不对驱动功能或意图下结论。", detailX + 18, panelY + 86, detailW - 36, 38, 10, FontStyleRegular, secondary);
+		Text(g, L"从左侧选择一项驱动查看证据。", detailX + 18, panelY + 58, detailW - 36, 22, 11, FontStyleRegular, secondary);
+		Text(g, L"诊断只给出风险线索，不对驱动功能或意图下结论。", detailX + 18, panelY + 86, detailW - 36, 38, 11, FontStyleRegular, secondary);
 	}
 	else {
 		const Color detailStatus = selectedDriver->highRisk ? C(darkMode, 213, 83, 83, 244, 149, 149) :
 			(selectedDriver->needsReview ? C(darkMode, 184, 130, 23, 239, 198, 101) : C(darkMode, 0, 127, 112, 130, 213, 199));
 		FillRound(g, RectF(detailX + 18, panelY + 50, detailW - 36, 30), 6, C(darkMode, 245, 248, 246, 43, 49, 46));
-		Text(g, selectedDriver->rating.c_str(), detailX + 30, panelY + 58, detailW - 60, 16, 9, FontStyleBold, detailStatus);
+		Text(g, selectedDriver->rating.c_str(), detailX + 30, panelY + 58, detailW - 60, 16, 10, FontStyleBold, detailStatus);
 		diagnosticsUnloadRect = { static_cast<LONG>(detailX + detailW - 132), static_cast<LONG>(panelY + 88),
 			static_cast<LONG>(detailX + detailW - 18), static_cast<LONG>(panelY + 120) };
-		FillRound(g, RectF(detailX + detailW - 132, panelY + 88, 114, 32), 16,
-			selectedDriver->canUnload ? C(darkMode, 213, 83, 83, 219, 139, 130) : C(darkMode, 220, 225, 222, 70, 78, 74));
-		Text(g, selectedDriver->canUnload ? L"停止并卸载" : L"不可操作",
-			detailX + detailW - 132, panelY + 97, 114, 18, 9, FontStyleBold,
-			selectedDriver->canUnload ? C(darkMode, 255, 255, 255, 80, 88, 84) : secondary, StringAlignmentCenter);
+		PaintButton(g, RectF(detailX + detailW - 132, panelY + 88, 114, 32),
+			selectedDriver->canUnload ? L"停止并卸载" : L"不可操作", 91,
+			ButtonStyle::Danger, 16, -1, selectedDriver->canUnload);
 		const std::array<std::pair<const wchar_t*, const std::wstring*>, 5> fields = {{
 			{ L"文件名", &selectedDriver->name }, { L"发布者", &selectedDriver->signer },
 			{ L"加载路径", &selectedDriver->path }, { L"服务", &selectedDriver->service },
@@ -3866,8 +4716,8 @@ void MainWindow::PaintDiagnostics(Graphics& g, int width, int height, int offset
 		}};
 		for (size_t i = 0; i < fields.size(); ++i) {
 			const float fieldY = panelY + 132 + static_cast<float>(i) * 52;
-			Text(g, fields[i].first, detailX + 18, fieldY, detailW - 36, 15, 9, FontStyleBold, secondary);
-			Text(g, fields[i].second->c_str(), detailX + 18, fieldY + 19, detailW - 36, 28, 9, FontStyleRegular, title);
+			Text(g, fields[i].first, detailX + 18, fieldY, detailW - 36, 15, 10, FontStyleBold, secondary);
+			Text(g, fields[i].second->c_str(), detailX + 18, fieldY + 19, detailW - 36, 28, 10, FontStyleRegular, title);
 		}
 	}
 }
@@ -4221,22 +5071,52 @@ void MainWindow::PaintLogs(Graphics& g, int width, int height, int offsetY)
 	const float y = 94.0f + offsetY;
 	const float w = static_cast<float>(width - 276);
 	const float h = static_cast<float>(height) - y - 20;
-	FillRound(g, RectF(x, y, w, h), 8, C(darkMode, 31, 36, 34, 25, 30, 28));
-	Text(g, L"\u5b9e\u65f6\u8f93\u51fa", x + 20, y + 18, 160, 20, 11, FontStyleBold, C(darkMode, 177, 231, 220, 130, 213, 199));
+	SoftShadow(g, RectF(x, y, w, h), 12, darkMode);
+	// 日志面板原来是纯深色，浅色主题里像贴了一块黑板。改成浅色"纸面"卡片，
+	// 深色主题下才用深底，四档日志颜色按各自主题给。
+	FillRound(g, RectF(x, y, w, h), 12, C(darkMode, 246, 250, 247, 25, 30, 28));
+	StrokeRound(g, RectF(x, y, w, h), 12, C(darkMode, 228, 236, 231, 44, 52, 48));
+	Text(g, L"\u5b9e\u65f6\u8f93\u51fa", x + 20, y + 18, 160, 20, 11, FontStyleBold, C(darkMode, 0, 107, 95, 130, 213, 199));
 	exportLogRect = { static_cast<LONG>(x + w - 134), static_cast<LONG>(y + 12), static_cast<LONG>(x + w - 18), static_cast<LONG>(y + 44) };
-	FillRound(g, RectF(x + w - 134, y + 12, 116, 32), 16,
-		Blend(C(darkMode, 185, 232, 223, 43, 76, 69), C(darkMode, 161, 221, 210, 55, 91, 83), hoverProgress[40]));
-	Text(g, L"\u5bfc\u51fa\u65e5\u5fd7", x + w - 134, y + 20, 116, 18, 10, FontStyleBold,
-		C(darkMode, 0, 81, 72, 177, 239, 228), StringAlignmentCenter);
-	const int visible = std::max(1, static_cast<int>((h - 58) / 24));
-	const int start = std::max(0, static_cast<int>(logs.size()) - visible);
-	for (int i = start; i < static_cast<int>(logs.size()); ++i) {
-		const float rowY = y + 50 + (i - start) * 24.0f;
-		Color color = C(darkMode, 209, 216, 212, 197, 207, 202);
-		if (logs[i].level == LogLevelInfo) color = C(darkMode, 65, 135, 120, 130, 213, 199);
-		else if (logs[i].level == LogLevelWarn) color = C(darkMode, 151, 108, 10, 241, 194, 98);
-		else if (logs[i].level == LogLevelError) color = C(darkMode, 186, 26, 26, 255, 180, 171);
-		Text(g, logs[i].text.c_str(), x + 20, rowY, w - 40, 22, 10, FontStyleRegular, color);
+	PaintButton(g, RectF(x + w - 134, y + 12, 116, 32), L"\u5bfc\u51fa\u65e5\u5fd7", 40, ButtonStyle::Tonal, 16);
+	// 一条日志里可能自带换行（例如 "… (2)\r\n[In] xxx.cpp (704) : 函数名"）。
+	// 原来整条丢给 DrawString，22px 行高里会被压成两行，和下一行叠在一起。
+	// 这里先摊平成「显示行」再按固定行高排版。缓存只在条目数变化时重建。
+	static std::vector<std::wstring> rowText;
+	static std::vector<int> rowLevel;
+	static size_t builtCount = static_cast<size_t>(-1);
+	if (builtCount != logs.size()) {
+		rowText.clear();
+		rowLevel.clear();
+		rowText.reserve(logs.size() + 8);
+		rowLevel.reserve(logs.size() + 8);
+		for (const auto& entry : logs) {
+			const std::wstring& line = entry.text;
+			size_t begin = 0;
+			while (true) {
+				size_t end = line.find(L'\n', begin);
+				const bool last = end == std::wstring::npos;
+				if (last) end = line.size();
+				size_t stop = end;
+				if (stop > begin && line[stop - 1] == L'\r') --stop;
+				rowText.push_back(line.substr(begin, stop - begin));
+				rowLevel.push_back(static_cast<int>(entry.level));
+				if (last) break;
+				begin = end + 1;
+			}
+		}
+		builtCount = logs.size();
+	}
+	const int rowCount = static_cast<int>(rowText.size());
+	const int visible = std::max(1, static_cast<int>((h - 58) / 20));
+	const int start = std::max(0, rowCount - visible);
+	for (int i = start; i < rowCount; ++i) {
+		const float rowY = y + 50 + (i - start) * 20.0f;
+		Color color = C(darkMode, 74, 84, 80, 197, 207, 202);
+		if (rowLevel[i] == static_cast<int>(LogLevelInfo)) color = C(darkMode, 0, 118, 104, 130, 213, 199);
+		else if (rowLevel[i] == static_cast<int>(LogLevelWarn)) color = C(darkMode, 146, 102, 0, 241, 194, 98);
+		else if (rowLevel[i] == static_cast<int>(LogLevelError)) color = C(darkMode, 186, 34, 30, 255, 180, 171);
+		TextSingleLine(g, rowText[i].c_str(), x + 20, rowY, w - 40, 20, 11, FontStyleRegular, color);
 	}
 }
 
@@ -4248,57 +5128,256 @@ void MainWindow::PaintAbout(Graphics& g, int width, int height, int offsetY)
 	const float h = static_cast<float>(height) - y - 20;
 	const Color titleColor = C(darkMode, 30, 36, 33, 225, 233, 229);
 	const Color bodyColor = C(darkMode, 81, 91, 86, 171, 183, 177);
-	const Color surface = C(darkMode, 255, 255, 255, 38, 45, 42);
-	FillRound(g, RectF(x, y, w, h), 8, C(darkMode, 237, 242, 239, 31, 37, 34));
-	FillRound(g, RectF(x + 42, y + 42, 84, 84), 8, C(darkMode, 0, 107, 95, 130, 213, 199));
+	const Color surface = C(darkMode, 248, 251, 249, 31, 37, 35);
+	SoftShadow(g, RectF(x, y, w, h), 12, darkMode);
+	FillRound(g, RectF(x, y, w, h), 12, C(darkMode, 255, 255, 255, 33, 40, 37));
+	FillRound(g, RectF(x + 42, y + 42, 84, 84), 12, C(darkMode, 0, 107, 95, 130, 213, 199));
 	Text(g, L"J", x + 42, y + 56, 84, 62, 40, FontStyleBold, C(darkMode, 255, 255, 255, 0, 55, 49), StringAlignmentCenter);
 	Text(g, L"Dzjs Trainer", x + 154, y + 46, 420, 40, 27, FontStyleBold, titleColor);
 	Text(g, L"Windows \u8bbe\u5907\u9632\u62a4\u4e2d\u5fc3", x + 154, y + 89, 420, 24, 12, FontStyleRegular, C(darkMode, 84, 93, 88, 171, 183, 177));
-	Text(g, L"\u7531\u8001 JiYu Trainer \u5347\u7ea7\u800c\u6765\u3002\u4f5c\u8005\uff1a\u4e91\u6563\u7686\u661f\u6cb3 & \u5feb\u4e50\u7684\u68a6\u9c7c\uff08\u539f\u4f5c\u8005\uff09", x + 154, y + 116, 520, 22, 10, FontStyleRegular, bodyColor);
+	Text(g, L"\u7531\u8001 JiYu Trainer \u5347\u7ea7\u800c\u6765\u3002\u4f5c\u8005\uff1a\u4e91\u6563\u7686\u661f\u6cb3 & \u5feb\u4e50\u7684\u68a6\u9c7c\uff08\u539f\u4f5c\u8005\uff09", x + 154, y + 116, 520, 22, 11, FontStyleRegular, bodyColor);
 	FillRound(g, RectF(x + 42, y + 158, 142, 30), 15, C(darkMode, 219, 238, 232, 43, 76, 69));
-	Text(g, AboutVersionLine().c_str(), x + 42, y + 166, 142, 18, 10, FontStyleBold, C(darkMode, 0, 81, 72, 177, 239, 228), StringAlignmentCenter);
+	Text(g, AboutVersionLine().c_str(), x + 42, y + 166, 142, 18, 11, FontStyleBold, C(darkMode, 0, 81, 72, 177, 239, 228), StringAlignmentCenter);
 	aboutUpdateRect = { static_cast<LONG>(x + 204), static_cast<LONG>(y + 153), static_cast<LONG>(x + 354), static_cast<LONG>(y + 193) };
-	FillRound(g, RectF(x + 204, y + 153, 150, 40), 20,
-		Blend(C(darkMode, 219, 238, 232, 43, 76, 69), C(darkMode, 183, 232, 222, 55, 106, 96), hoverProgress[74]));
-	DrawIcon(g, 2, x + 220, y + 164, C(darkMode, 0, 81, 72, 156, 240, 225), 17);
-	Text(g, L"\u68c0\u67e5\u66f4\u65b0", x + 244, y + 162, 96, 22, 11, FontStyleBold,
-		C(darkMode, 0, 81, 72, 156, 240, 225), StringAlignmentCenter);
+	PaintButton(g, RectF(x + 204, y + 153, 150, 40), L"\u68c0\u67e5\u66f4\u65b0", 74, ButtonStyle::Tonal, 20, 2);
 	Text(g, L"\u9762\u5411 Windows \u8bbe\u5907\u7684\u672c\u5730\u9632\u62a4\u4e0e\u8fd0\u7ef4\u5de5\u5177\uff0c\u96c6\u4e2d\u63d0\u4f9b\u72b6\u6001\u76d1\u63a7\u3001\u8fdc\u7a0b\u884c\u4e3a\u63a7\u5236\u548c\u8bbe\u5907\u8bca\u65ad\u3002", x + 42, y + 215, w - 84, 38, 11, FontStyleRegular, bodyColor);
 
 	const float columnGap = 14.0f;
 	const float columnW = (w - 84.0f - columnGap) * 0.5f;
 	const float cardsY = y + 274.0f;
-	FillRound(g, RectF(x + 42, cardsY, columnW, 154), 8, surface);
-	FillRound(g, RectF(x + 42 + columnW + columnGap, cardsY, columnW, 154), 8, surface);
+	FillRound(g, RectF(x + 42, cardsY, columnW, 154), 12, surface);
+	FillRound(g, RectF(x + 42 + columnW + columnGap, cardsY, columnW, 154), 12, surface);
 	Text(g, L"\u6838\u5fc3\u529f\u80fd", x + 62, cardsY + 18, columnW - 40, 22, 12, FontStyleBold, titleColor);
-	Text(g, L"\u2022 \u5b9e\u65f6\u663e\u793a\u5b66\u751f\u7aef\u8fd0\u884c\u72b6\u6001", x + 62, cardsY + 53, columnW - 40, 20, 10, FontStyleRegular, bodyColor);
-	Text(g, L"\u2022 \u8fdc\u7a0b\u64cd\u4f5c\u3001\u7a97\u53e3\u548c\u8f93\u5165\u9632\u62a4", x + 62, cardsY + 82, columnW - 40, 20, 10, FontStyleRegular, bodyColor);
-	Text(g, L"\u2022 \u89c6\u9891\u6d41\u7167\u7247 / \u89c6\u9891\u66ff\u6362\u6a21\u5f0f", x + 62, cardsY + 111, columnW - 40, 20, 10, FontStyleRegular, bodyColor);
+	Text(g, L"\u2022 \u5b9e\u65f6\u663e\u793a\u5b66\u751f\u7aef\u8fd0\u884c\u72b6\u6001", x + 62, cardsY + 53, columnW - 40, 20, 11, FontStyleRegular, bodyColor);
+	Text(g, L"\u2022 \u8fdc\u7a0b\u64cd\u4f5c\u3001\u7a97\u53e3\u548c\u8f93\u5165\u9632\u62a4", x + 62, cardsY + 82, columnW - 40, 20, 11, FontStyleRegular, bodyColor);
+	Text(g, L"\u2022 \u89c6\u9891\u6d41\u7167\u7247 / \u89c6\u9891\u66ff\u6362\u6a21\u5f0f", x + 62, cardsY + 111, columnW - 40, 20, 11, FontStyleRegular, bodyColor);
 	const float rightX = x + 42 + columnW + columnGap;
 	Text(g, L"\u8fd0\u884c\u65b9\u5f0f", rightX + 20, cardsY + 18, columnW - 40, 22, 12, FontStyleBold, titleColor);
-	Text(g, L"\u2022 \u539f\u751f Win32 \u754c\u9762\uff0c\u4f4e\u5360\u7528\u3001\u5feb\u901f\u54cd\u5e94", rightX + 20, cardsY + 53, columnW - 40, 20, 10, FontStyleRegular, bodyColor);
-	Text(g, L"\u2022 JiYuAvKernel \u63d0\u4f9b\u8fdb\u7a0b\u7279\u5f81\u626b\u63cf\u4e0e\u8bbe\u5907\u8bca\u65ad", rightX + 20, cardsY + 82, columnW - 40, 20, 10, FontStyleRegular, bodyColor);
-	Text(g, L"\u2022 \u9632\u62a4\u7b56\u7565\u53ef\u5728\u8fd0\u884c\u4e2d\u4fdd\u5b58\u5e76\u5e94\u7528", rightX + 20, cardsY + 111, columnW - 40, 20, 10, FontStyleRegular, bodyColor);
+	Text(g, L"\u2022 \u539f\u751f Win32 \u754c\u9762\uff0c\u4f4e\u5360\u7528\u3001\u5feb\u901f\u54cd\u5e94", rightX + 20, cardsY + 53, columnW - 40, 20, 11, FontStyleRegular, bodyColor);
+	Text(g, L"\u2022 JiYuAvKernel \u63d0\u4f9b\u8fdb\u7a0b\u7279\u5f81\u626b\u63cf\u4e0e\u8bbe\u5907\u8bca\u65ad", rightX + 20, cardsY + 82, columnW - 40, 20, 11, FontStyleRegular, bodyColor);
+	Text(g, L"\u2022 \u9632\u62a4\u7b56\u7565\u53ef\u5728\u8fd0\u884c\u4e2d\u4fdd\u5b58\u5e76\u5e94\u7528", rightX + 20, cardsY + 111, columnW - 40, 20, 11, FontStyleRegular, bodyColor);
 
-	FillRound(g, RectF(x + 42, y + 452, w - 84, 74), 8, C(darkMode, 255, 243, 205, 64, 53, 28));
+	FillRound(g, RectF(x + 42, y + 452, w - 84, 74), 12, C(darkMode, 255, 243, 205, 64, 53, 28));
 	Text(g, L"\u4f7f\u7528\u63d0\u793a", x + 64, y + 468, 120, 22, 12, FontStyleBold, C(darkMode, 91, 66, 0, 255, 220, 141));
-	Text(g, L"\u8bf7\u4ec5\u5728\u5408\u6cd5\u3001\u6388\u6743\u7684\u73af\u5883\u4e2d\u4f7f\u7528\uff0c\u64cd\u4f5c\u524d\u8bf7\u9605\u8bfb\u5e2e\u52a9\u548c\u5f53\u524d\u65e5\u5fd7\u3002", x + 64, y + 500, w - 128, 22, 10, FontStyleRegular, C(darkMode, 91, 70, 20, 232, 211, 162));
+	Text(g, L"\u8bf7\u4ec5\u5728\u5408\u6cd5\u3001\u6388\u6743\u7684\u73af\u5883\u4e2d\u4f7f\u7528\uff0c\u64cd\u4f5c\u524d\u8bf7\u9605\u8bfb\u5e2e\u52a9\u548c\u5f53\u524d\u65e5\u5fd7\u3002", x + 64, y + 500, w - 128, 22, 11, FontStyleRegular, C(darkMode, 91, 70, 20, 232, 211, 162));
 
 	aboutExitRect = { static_cast<LONG>(x + w - 184), static_cast<LONG>(y + h - 56), static_cast<LONG>(x + w - 42), static_cast<LONG>(y + h - 14) };
-	FillRound(g, RectF(x + w - 184, y + h - 56, 142, 42), 21,
-		Blend(C(darkMode, 255, 231, 226, 83, 45, 41), C(darkMode, 244, 198, 190, 109, 61, 55), hoverProgress[73]));
-	DrawIcon(g, 5, x + w - 168, y + h - 45, C(darkMode, 155, 45, 36, 244, 178, 165), 18);
-	Text(g, L"\u9000\u51fa\u8f6f\u4ef6", x + w - 140, y + h - 45, 92, 20, 10, FontStyleBold,
-		C(darkMode, 155, 45, 36, 244, 178, 165), StringAlignmentCenter);
+	PaintButton(g, RectF(x + w - 184, y + h - 56, 142, 42), L"\u9000\u51fa\u8f6f\u4ef6", 73, ButtonStyle::Danger, 21, 5);
 }
 
-void MainWindow::PaintToast(Graphics& g, int width)
+void MainWindow::PaintToast(Graphics& g, int width, int height)
 {
-	if (toastText.empty() || GetTickCount64() > toastUntil) return;
-	const float w = std::min(520.0f, static_cast<float>(width - 320));
+	const ULONGLONG now = GetTickCount64();
+	if (toastText.empty() || now > toastUntil) return;
+	// 淡入 130 ms、最后 260 ms 淡出，同时从上方 8px 处滑下来。
+	const float fadeIn = static_cast<float>((std::min)(1.0, static_cast<double>(now - toastStart) / 130.0));
+	const float fadeOut = static_cast<float>((std::min)(1.0,
+		static_cast<double>(toastUntil > now ? toastUntil - now : 0) / 260.0));
+	const float alpha = (std::max)(0.0f, (std::min)(fadeIn, fadeOut));
+	if (alpha <= 0.0f) return;
+	auto faded = [alpha](const Color& color) {
+		return Color(static_cast<BYTE>(color.GetA() * alpha), color.GetR(), color.GetG(), color.GetB());
+	};
+	// 提示条放底部居中（MD3 的 snackbar 位置）。原来贴在顶部，
+	// 正好压住高级配置页的两个标签，提示一出现就没法点标签。
+	const float w = (std::min)(520.0f, static_cast<float>(width - 320));
 	const float x = 220.0f + (static_cast<float>(width - 220) - w) / 2.0f;
-	FillRound(g, RectF(x, 84, w, 46), 8, C(darkMode, 47, 54, 51, 218, 226, 222, 248));
-	Text(g, toastText.c_str(), x + 18, 97, w - 36, 22, 10, FontStyleRegular, C(darkMode, 255, 255, 255, 36, 43, 40), StringAlignmentCenter);
+	const float y = static_cast<float>(height) - 62.0f + (1.0f - fadeIn) * 10.0f;
+	FillRound(g, RectF(x, y, w, 44), 22, faded(C(darkMode, 44, 51, 48, 214, 222, 218, 246)));
+	Text(g, toastText.c_str(), x + 18, y + 12, w - 36, 22, 11, FontStyleRegular,
+		faded(C(darkMode, 255, 255, 255, 36, 43, 40)), StringAlignmentCenter);
+}
+
+// 更新对话框 —— 按 MD3 规范重做：
+// 容器 surfaceContainerHigh / 28 圆角 / 24 内边距 / 全窗 32% scrim /
+// headlineSmall 标题 + bodyMedium 正文 / 动作区右对齐（主操作 Filled，次操作 Text）。
+// 四种形态共用同一套骨架，只换正文区。
+void MainWindow::PaintUpdateDialog(Graphics& g, int width, int height)
+{
+	if (!UpdateDialogVisible()) return;
+	const bool d = darkMode;
+	const float appear = (std::max)(0.0f, (std::min)(1.0f, updateDialog.appear));
+	auto fade = [appear](const Color& color) {
+		return Color(static_cast<BYTE>(color.GetA() * appear), color.GetR(), color.GetG(), color.GetB());
+	};
+	const UpdateDialogMode mode = updateDialog.mode;
+
+	// M3 颜色角色，跟主界面同一套 teal 种子色。
+	const Color onSurface = C(d, 26, 30, 28, 232, 238, 235);
+	const Color onSurfaceVariant = C(d, 96, 104, 100, 168, 179, 174);
+	const Color outline = C(d, 130, 139, 134, 138, 149, 144);
+	const Color primary = C(d, 0, 107, 95, 130, 213, 199);
+	const Color container = C(d, 243, 247, 245, 38, 45, 42);
+
+	// MD3 scrim：整窗一层，不再分区压暗。
+	{
+		SolidBrush veil(Color(static_cast<BYTE>((d ? 115.0f : 82.0f) * appear), 0, 0, 0));
+		g.FillRectangle(&veil, 0, 0, width, height);
+	}
+
+	const bool hasActions = mode == UpdateDialogMode::Confirm || mode == UpdateDialogMode::Failed;
+	float bodyH = 66.0f;
+	if (mode == UpdateDialogMode::Confirm) bodyH = 18.0f + 60.0f + 12.0f + 16.0f;
+	else if (mode == UpdateDialogMode::Download) bodyH = 36.0f + 20.0f + 16.0f + 22.0f + 16.0f;
+	else if (mode == UpdateDialogMode::Done) bodyH = 36.0f + 20.0f + 16.0f;
+
+	const float cardH = 24.0f + 26.0f + 4.0f + 16.0f + 16.0f + bodyH +
+		(hasActions ? 20.0f + 40.0f : 0.0f) + 24.0f;
+	float cardW = (std::min)(560.0f, static_cast<float>(width) - 96.0f);
+	cardW = (std::max)(cardW, 360.0f);
+	const float cardX = (static_cast<float>(width) - cardW) / 2.0f;
+	const float cardY = (static_cast<float>(height) - cardH) / 2.0f + (1.0f - appear) * 10.0f;
+
+	// elevation level 3：靠多层低透明度外扩模拟。
+	SoftShadow(g, RectF(cardX, cardY, cardW, cardH), 28.0f, d, 1.6f * appear);
+	FillRound(g, RectF(cardX, cardY, cardW, cardH), 28.0f, fade(container));
+
+	// 头部：24px 图标 + 标题 + 副标题。
+	const int icon = mode == UpdateDialogMode::Failed ? 12 : (mode == UpdateDialogMode::Done ? 11 : 10);
+	DrawIcon(g, icon, cardX + 24.0f, cardY + 26.0f, fade(primary), 24);
+	LPCWSTR title = L"发现新版本";
+	if (mode == UpdateDialogMode::Download) title = L"正在下载更新";
+	else if (mode == UpdateDialogMode::Done) title = L"更新完成";
+	else if (mode == UpdateDialogMode::Failed) title = L"更新失败";
+	const std::wstring current = updateDialog.currentVersion.empty() ? L"未知" : updateDialog.currentVersion;
+	std::wstring subtitle;
+	if (mode == UpdateDialogMode::Confirm || mode == UpdateDialogMode::Download) {
+		subtitle = current + L"  →  " + updateDialog.version;
+	}
+	else if (mode == UpdateDialogMode::Done) {
+		subtitle = L"已切换到 " + updateDialog.version + L"，正在重启";
+	}
+	else {
+		subtitle = L"下载或替换没有完成";
+	}
+	Text(g, title, cardX + 58.0f, cardY + 24.0f, cardW - 82.0f, 26.0f, 20, FontStyleBold, fade(onSurface));
+	Text(g, subtitle.c_str(), cardX + 24.0f, cardY + 54.0f, cardW - 48.0f, 18.0f, 12, FontStyleRegular,
+		fade(onSurfaceVariant));
+
+	const float contentX = cardX + 24.0f;
+	const float contentW = cardW - 48.0f;
+	const float contentTop = cardY + 86.0f;
+
+	if (mode == UpdateDialogMode::Confirm) {
+		Text(g, L"更新说明", contentX, contentTop, 200.0f, 14.0f, 11, FontStyleBold, fade(onSurfaceVariant));
+		// 说明可能很长，只留三行位置；多的裁掉，别顶到动作区。
+		Region clip(Rect(static_cast<INT>(contentX), static_cast<INT>(contentTop + 18.0f),
+			static_cast<INT>(contentW), 60));
+		g.SetClip(&clip, CombineModeIntersect);
+		const wchar_t* notes = updateDialog.notes.empty() ? L"这次更新没有附带说明。" : updateDialog.notes.c_str();
+		Text(g, notes, contentX, contentTop + 18.0f, contentW, 60.0f, 12, FontStyleRegular,
+			fade(onSurfaceVariant));
+		g.ResetClip();
+		Text(g, L"下载完成后会自动替换并重启程序", contentX, contentTop + 90.0f, contentW, 16.0f, 11,
+			FontStyleRegular, fade(outline));
+	}
+	else if (mode == UpdateDialogMode::Download || mode == UpdateDialogMode::Done) {
+		const bool indeterminate = mode == UpdateDialogMode::Download && updateDialog.percent < 0;
+		const float ratio = (std::max)(0.0f, (std::min)(1.0f, updateDialog.progress));
+		if (mode == UpdateDialogMode::Done || updateDialog.percent >= 0) {
+			wchar_t percentText[16] = {};
+			swprintf_s(percentText, L"%d%%", mode == UpdateDialogMode::Done ? 100 : updateDialog.percent);
+			Text(g, percentText, contentX, contentTop - 2.0f, 160.0f, 34.0f, 24, FontStyleBold, fade(onSurface));
+			if (updateDialog.total > 0) {
+				const unsigned long long shown = mode == UpdateDialogMode::Done
+					? updateDialog.total : updateDialog.done;
+				const std::wstring bytes = FormatByteSize(shown) + L" / " + FormatByteSize(updateDialog.total);
+				Text(g, bytes.c_str(), cardX + cardW - 24.0f - 220.0f, contentTop + 10.0f, 220.0f, 16.0f, 11,
+					FontStyleRegular, fade(onSurfaceVariant), StringAlignmentFar);
+			}
+		}
+		else {
+			Text(g, L"准备中…", contentX, contentTop, 160.0f, 30.0f, 18, FontStyleBold, fade(outline));
+			Text(g, L"总大小未知", cardX + cardW - 24.0f - 220.0f, contentTop + 10.0f, 220.0f, 16.0f, 11,
+				FontStyleRegular, fade(onSurfaceVariant), StringAlignmentFar);
+		}
+
+		// MD3 linear progress indicator：track 与 indicator 同高，两端全圆角。
+		const float barY = contentTop + 36.0f;
+		const float barH = 6.0f;
+		FillRound(g, RectF(contentX, barY, contentW, barH), 3.0f, fade(C(d, 226, 232, 229, 58, 68, 63)));
+		if (indeterminate) {
+			// 总长度未知时一段高光来回走，段宽 34%。
+			const float piece = contentW * 0.34f;
+			const float origin = contentX + (contentW - piece) * updateDialog.sweep;
+			FillRound(g, RectF(origin, barY, piece, barH), 3.0f, fade(primary));
+		}
+		else if (ratio > 0.0f) {
+			const float piece = (std::max)(barH, contentW * ratio);
+			FillRound(g, RectF(contentX, barY, piece, barH), 3.0f, fade(primary));
+		}
+
+		if (mode == UpdateDialogMode::Done) {
+			Text(g, L"安装包已校验，正在切换到新版本", contentX, barY + 20.0f, contentW, 16.0f, 12,
+				FontStyleRegular, fade(onSurfaceVariant));
+		}
+		else {
+			Text(g, updateDialog.status.c_str(), contentX, barY + 20.0f, contentW, 16.0f, 12,
+				FontStyleRegular, fade(onSurfaceVariant));
+			Text(g, L"期间请不要关闭程序", contentX, barY + 44.0f, contentW, 16.0f, 11,
+				FontStyleRegular, fade(outline));
+		}
+	}
+	else {
+		Region clip(Rect(static_cast<INT>(contentX), static_cast<INT>(contentTop),
+			static_cast<INT>(contentW), 66));
+		g.SetClip(&clip, CombineModeIntersect);
+		Text(g, updateDialog.status.c_str(), contentX, contentTop, contentW, 66.0f, 12, FontStyleRegular,
+			fade(onSurfaceVariant));
+		g.ResetClip();
+	}
+
+	// 动作区：右对齐，主操作在最右。120/121 两种 id 已在 hoverProgress 里留位。
+	updateDialogPrimaryRect = {};
+	updateDialogSecondaryRect = {};
+	const float buttonH = 40.0f;
+	const float buttonY = cardY + cardH - 24.0f - buttonH;
+	auto setRect = [&](int id, const RectF& rect) {
+		const RECT hit = { static_cast<LONG>(rect.X), static_cast<LONG>(rect.Y),
+			static_cast<LONG>(rect.X + rect.Width), static_cast<LONG>(rect.Y + rect.Height) };
+		if (id == kUpdateDialogPrimary) updateDialogPrimaryRect = hit;
+		else updateDialogSecondaryRect = hit;
+	};
+	// 次操作按 MD3 text button：无底色，悬停 8%、按下 12% 主色蒙层。
+	auto placeTextButton = [&](float right, float w, LPCWSTR label, int id) {
+		const RectF rect(right - w, buttonY, w, buttonH);
+		const float press = pressTarget == id ? 1.0f : 0.0f;
+		const float overlay = press > 0.0f ? 0.12f : 0.08f * hoverProgress[id];
+		if (overlay > 0.003f) {
+			FillRound(g, rect, 20.0f, Color(static_cast<BYTE>(255.0f * overlay * appear),
+				primary.GetR(), primary.GetG(), primary.GetB()));
+		}
+		Text(g, label, rect.X, rect.Y + (buttonH - 20.0f) / 2.0f, rect.Width, 20.0f, 12, FontStyleBold,
+			fade(primary), StringAlignmentCenter);
+		setRect(id, rect);
+		return right - w - 8.0f;
+	};
+	auto placeFilledButton = [&](float right, float w, LPCWSTR label, int id) {
+		const RectF rect(right - w, buttonY, w, buttonH);
+		PaintButton(g, rect, label, id, ButtonStyle::Primary, 20.0f);
+		setRect(id, rect);
+		return right - w - 8.0f;
+	};
+
+	if (mode == UpdateDialogMode::Confirm) {
+		const float right = placeFilledButton(cardX + cardW - 24.0f, 108.0f, L"立即更新", kUpdateDialogPrimary);
+		placeTextButton(right, 76.0f, L"稍后", kUpdateDialogSecondary);
+	}
+	else if (mode == UpdateDialogMode::Failed) {
+		const float right = placeFilledButton(cardX + cardW - 24.0f, 148.0f, L"改用独立更新器", kUpdateDialogPrimary);
+		placeTextButton(right, 76.0f, L"关闭", kUpdateDialogSecondary);
+	}
+
+	if (focusTarget == kUpdateDialogPrimary || focusTarget == kUpdateDialogSecondary) {
+		const RECT& ringSource = focusTarget == kUpdateDialogPrimary
+			? updateDialogPrimaryRect : updateDialogSecondaryRect;
+		if (!IsRectEmpty(&ringSource)) {
+			StrokeRound(g, RectF(static_cast<REAL>(ringSource.left) - 3.0f, static_cast<REAL>(ringSource.top) - 3.0f,
+				static_cast<REAL>(ringSource.right - ringSource.left) + 6.0f,
+				static_cast<REAL>(ringSource.bottom - ringSource.top) + 6.0f), 23.0f,
+				fade(primary), 2.0f);
+		}
+	}
 }
 
 DWORD WINAPI MainWindow::AvScanThreadProc(LPVOID parameter)
@@ -4631,7 +5710,7 @@ void MainWindow::UnloadAvDriver()
 	InvalidateRect(_hWnd, nullptr, FALSE);
 }
 
-void MainWindow::UpdateHover(POINT point)
+int MainWindow::HitTargetAt(POINT point)
 {
 	int target = -1;
 	for (int i = 0; i < 10; ++i) if (Hit(navRects[i], point)) target = i;
@@ -4649,7 +5728,7 @@ void MainWindow::UpdateHover(POINT point)
 	}
 	if (page == Page::Logs && Hit(exportLogRect, point)) target = 40;
 	if (Hit(themeRect, point)) target = 41;
-	if (page == Page::Protection && Hit(advancedSettingsRect, point)) target = 42;
+	if ((page == Page::Protection || page == Page::Replacement) && Hit(advancedSettingsRect, point)) target = 42;
 	if (page == Page::Protection && Hit(driverLoadRect, point)) target = 43;
 	if (page == Page::Protection && Hit(driverUnloadRect, point)) target = 44;
 	if (page == Page::Antivirus) {
@@ -4664,6 +5743,8 @@ void MainWindow::UpdateHover(POINT point)
 		for (int i = 0; i < 12; ++i) if (Hit(advancedToggleRects[i], point)) target = 50 + i;
 		for (int i = 0; i < 3; ++i) if (Hit(advancedKillRects[i], point)) target = 64 + i;
 		for (int i = 0; i < 2; ++i) if (Hit(advancedInjectRects[i], point)) target = 67 + i;
+		if (Hit(advancedTabRects[0], point)) target = 70;
+		if (Hit(advancedTabRects[1], point)) target = 71;
 		if (Hit(advancedSaveRect, point)) target = 69;
 	}
 	if (page == Page::Network && Hit(networkProjectRect, point)) target = 72;
@@ -4671,15 +5752,231 @@ void MainWindow::UpdateHover(POINT point)
 		if (Hit(aboutUpdateRect, point)) target = 74;
 		if (Hit(aboutExitRect, point)) target = 73;
 	}
+	if (page == Page::Diagnostics) {
+		if (Hit(diagnosticsScanRect, point)) target = 90;
+		if (Hit(diagnosticsUnloadRect, point)) target = 91;
+		if (Hit(diagnosticsHideOwnRect, point)) target = 92;
+		for (int i = 0; i < 4; ++i) if (Hit(diagnosticsFilterRects[i], point)) target = 93 + i;
+		for (int i = 0; i < 8; ++i) if (Hit(diagnosticsDriverRects[i], point)) target = 100 + i;
+	}
+	if ((page == Page::Protection || page == Page::Replacement) && Hit(temporaryVideoPreviewRect, point)) target = 85;
+	return target;
+}
+
+bool MainWindow::TargetRect(int target, RECT* rect) const
+{
+	RECT found{};
+	switch (target) {
+	case 80: found = superTopMostRect; break;
+	// 更新弹窗的两个按钮。Tab/Enter 走的是同一套命中判断，加进来就自动可用。
+	case kUpdateDialogPrimary: found = updateDialogPrimaryRect; break;
+	case kUpdateDialogSecondary: found = updateDialogSecondaryRect; break;
+	case 0: case 1: case 2: case 3: case 4:
+	case 5: case 6: case 7: case 8: case 9:
+		found = navRects[target];
+		break;
+	case 10: case 11: case 12: case 13: case 14:
+		found = actionRects[target - 10];
+		break;
+	case 20: case 21: case 22: case 23: case 24: case 25: case 26:
+		found = toggleRects[target - 20];
+		break;
+	case 40: found = exportLogRect; break;
+	case 41: found = themeRect; break;
+	case 42: found = advancedSettingsRect; break;
+	case 43: found = driverLoadRect; break;
+	case 44: found = driverUnloadRect; break;
+	case 45: found = avScanRect; break;
+	case 46: found = avImportRect; break;
+	case 47: found = avCopyRect; break;
+	case 48: found = avCancelRect; break;
+	case 49: found = avUnloadRect; break;
+	case 50:
+		// 50 在特征扫描页是"输入特征码"，在高级配置页是第一个开关。
+		found = page == Page::Advanced ? advancedToggleRects[0] : avInputRect;
+		break;
+	case 51: case 52: case 53: case 54: case 55: case 56:
+	case 57: case 58: case 59: case 60: case 61:
+		found = advancedToggleRects[target - 50];
+		break;
+	case 64: case 65: case 66: found = advancedKillRects[target - 64]; break;
+	case 67: case 68: found = advancedInjectRects[target - 67]; break;
+	case 69: found = advancedSaveRect; break;
+	case 70: case 71: found = advancedTabRects[target - 70]; break;
+	case 72: found = networkProjectRect; break;
+	case 73: found = aboutExitRect; break;
+	case 74: found = aboutUpdateRect; break;
+	case 75: found = temporaryVideoEnableRect; break;
+	case 76: found = temporaryVideoImageModeRect; break;
+	case 77: found = temporaryVideoFileModeRect; break;
+	case 78: found = temporaryVideoImagePickerRect; break;
+	case 79: found = temporaryVideoFilePickerRect; break;
+	case 81: found = restoreTeacherViewRect; break;
+	case 85: found = temporaryVideoPreviewRect; break;
+	case 90: found = diagnosticsScanRect; break;
+	case 91: found = diagnosticsUnloadRect; break;
+	case 92: found = diagnosticsHideOwnRect; break;
+	case 93: case 94: case 95: case 96: found = diagnosticsFilterRects[target - 93]; break;
+	case 100: case 101: case 102: case 103:
+	case 104: case 105: case 106: case 107:
+		found = diagnosticsDriverRects[target - 100];
+		break;
+	default: return false;
+	}
+	if (IsRectEmpty(&found)) return false;
+	if (rect) *rect = found;
+	return true;
+}
+
+std::vector<int> MainWindow::FocusableTargets() const
+{
+	std::vector<int> list;
+	// 弹窗是模态的：Tab 只在它自己的按钮之间转。
+	if (UpdateDialogVisible()) {
+		if (TargetRect(kUpdateDialogPrimary, nullptr)) list.push_back(kUpdateDialogPrimary);
+		if (TargetRect(kUpdateDialogSecondary, nullptr)) list.push_back(kUpdateDialogSecondary);
+		return list;
+	}
+	for (int i = 0; i < 10; ++i) list.push_back(i);
+	list.push_back(80);   // 超级置顶
+	list.push_back(41);   // 明暗主题
+	auto push = [this, &list](int id) {
+		if (TargetRect(id, nullptr)) list.push_back(id);
+	};
+	switch (page) {
+	case Page::Overview:
+		for (int i = 0; i < 5; ++i) push(10 + i);
+		break;
+	case Page::Protection:
+	case Page::Replacement:
+		for (int i = 0; i < 7; ++i) push(20 + i);
+		push(42);
+		push(44);
+		push(75);
+		push(76);
+		push(77);
+		push(78);
+		push(79);
+		push(81);
+		push(85);
+		break;
+	case Page::Antivirus:
+		push(45); push(46); push(50); push(47); push(49); push(48);
+		break;
+	case Page::Advanced:
+		push(70); push(71);
+		if (advancedTab == 0) {
+			for (int i = 0; i < 6; ++i) push(50 + i);
+		}
+		else {
+			for (int i = 0; i < 3; ++i) push(64 + i);
+			for (int i = 0; i < 2; ++i) push(67 + i);
+			for (int i = 0; i < 6; ++i) push(50 + i);
+		}
+		push(69);
+		break;
+	case Page::Network:
+		push(72);
+		break;
+	case Page::Diagnostics:
+		push(92); push(90);
+		for (int i = 0; i < 4; ++i) push(93 + i);
+		push(91);
+		for (int i = 0; i < 8; ++i) push(100 + i);
+		break;
+	case Page::Logs:
+		push(40);
+		break;
+	case Page::About:
+		push(74); push(73);
+		break;
+	default:
+		break;
+	}
+	return list;
+}
+
+void MainWindow::MoveFocus(bool backwards)
+{
+	const std::vector<int> list = FocusableTargets();
+	if (list.empty()) return;
+	int index = -1;
+	for (size_t i = 0; i < list.size(); ++i) if (list[i] == focusTarget) { index = static_cast<int>(i); break; }
+	if (index < 0) index = backwards ? 0 : -1;
+	const int count = static_cast<int>(list.size());
+	index = backwards ? (index - 1 + count) % count : (index + 1) % count;
+	focusTarget = list[static_cast<size_t>(index)];
+	SetFocus(_hWnd);
+	InvalidateRect(_hWnd, nullptr, FALSE);
+}
+
+bool MainWindow::ActivateFocus()
+{
+	if (focusTarget < 0) return false;
+	RECT rect{};
+	if (!TargetRect(focusTarget, &rect)) return false;
+	// 直接复用鼠标点击那条路径：命中判断本来就是按坐标做的。
+	POINT point{ (rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2 };
+	HandleClick(point);
+	return true;
+}
+
+float MainWindow::AnimateToggle(int index, bool on)
+{
+	if (index < 0 || index >= static_cast<int>(toggleMotion.size())) return on ? 1.0f : 0.0f;
+	float& value = toggleMotion[static_cast<size_t>(index)];
+	const float target = on ? 1.0f : 0.0f;
+	if (std::fabs(value - target) > 0.004f) {
+		// 时间常数 70ms：约 150ms 走完，和网页里的开关一个手感。
+		const float k = static_cast<float>(1.0 - std::exp(-frameDelta / 0.07));
+		value += (target - value) * k;
+		if (std::fabs(value - target) <= 0.004f) value = target;
+		toggleAnimating = true;
+		EnsureAnimationTimer();
+	}
+	else {
+		value = target;
+	}
+	return value;
+}
+
+void MainWindow::UpdateHover(POINT point)
+{
+	// 弹窗期间只认弹窗里的两个按钮，底下的界面不该再跟着鼠标亮。
+	if (UpdateDialogVisible()) {
+		const int dialogTarget = HitUpdateDialogAt(point);
+		SetCursor(LoadCursorW(nullptr, dialogTarget >= 0 ? IDC_HAND : IDC_ARROW));
+		if (dialogTarget != hoverTarget) {
+			hoverTarget = dialogTarget;
+			EnsureAnimationTimer();
+			InvalidateRect(_hWnd, nullptr, FALSE);
+		}
+		return;
+	}
+	const int target = HitTargetAt(point);
+	// 输入类区域给 I 形光标，其余可点区域给手形 —— 和浏览器里的习惯一致。
+	const bool textTarget = page == Page::Advanced && advancedTab == 0 &&
+		(Hit(advancedHotkeyRect[0], point) || Hit(advancedHotkeyRect[1], point));
+	SetCursor(LoadCursorW(nullptr, textTarget ? IDC_IBEAM : (target >= 0 ? IDC_HAND : IDC_ARROW)));
 	if (target != hoverTarget) {
 		hoverTarget = target;
-		SetCursor(LoadCursorW(nullptr, target >= 0 ? IDC_HAND : IDC_ARROW));
+		EnsureAnimationTimer();
 		InvalidateRect(_hWnd, nullptr, FALSE);
 	}
 }
 
 void MainWindow::HandleClick(POINT point)
 {
+	// 模态弹窗吃掉所有点击，连空白处也不往下传。
+	if (UpdateDialogVisible()) {
+		HandleUpdateDialogClick(point);
+		return;
+	}
+	// 点到别处就结束快捷键录制，避免键盘一直被这个框吃掉。
+	if (hotkeyCaptureIndex >= 0) {
+		hotkeyCaptureIndex = -1;
+		InvalidateRect(_hWnd, nullptr, FALSE);
+	}
 	if (Hit(superTopMostRect, point)) {
 		RequestSuperTopmost();
 		return;
@@ -4688,6 +5985,8 @@ void MainWindow::HandleClick(POINT point)
 		darkMode = !darkMode;
 		if (controlSurfaceBrush) DeleteObject(controlSurfaceBrush);
 		controlSurfaceBrush = CreateSolidBrush(darkMode ? RGB(38, 45, 42) : RGB(255, 255, 255));
+		if (advancedFieldBrush) DeleteObject(advancedFieldBrush);
+		advancedFieldBrush = CreateSolidBrush(darkMode ? RGB(26, 33, 30) : RGB(255, 255, 255));
 		for (HWND control : networkControls) if (control) InvalidateRect(control, nullptr, TRUE);
 		InvalidateRect(_hWnd, nullptr, FALSE);
 		return;
@@ -4813,6 +6112,15 @@ void MainWindow::HandleClick(POINT point)
 			InvalidateRect(_hWnd, nullptr, FALSE);
 			return;
 		}
+		if (advancedTab == 0) {
+			for (int i = 0; i < 2; ++i) if (Hit(advancedHotkeyRect[i], point)) {
+				hotkeyCaptureIndex = i;
+				SetFocus(_hWnd);
+				ShowFastTip(L"\u76f4\u63a5\u6309\u4e0b\u7ec4\u5408\u952e\uff0cEsc \u6e05\u9664");
+				InvalidateRect(_hWnd, nullptr, FALSE);
+				return;
+			}
+		}
 		const int toggleCount = 6;
 		for (int i = 0; i < toggleCount; ++i) if (Hit(advancedToggleRects[i], point)) {
 			if (advancedTab == 0) {
@@ -4914,10 +6222,312 @@ void MainWindow::CheckForUpdate(bool byUser)
 }
 
 // 探测结果回到 UI 线程后在这里处理：比对版本、弹确认框、必要时启动更新器。
+DWORD WINAPI MainWindow::UpdateDownloadThreadProc(LPVOID parameter)
+{
+	std::unique_ptr<UpdateDownloadContext> context(static_cast<UpdateDownloadContext*>(parameter));
+	if (!context) return 1;
+
+	auto fail = [&](const std::wstring& reason) {
+		auto* message = new std::wstring(reason);
+		PostMessageW(context->window, WM_UPDATE_DOWNLOAD_STATE, 3, reinterpret_cast<LPARAM>(message));
+		return 1UL;
+	};
+
+	bool downloaded = false;
+	if (!g_httpInProcessBroken) {
+		downloaded = JUpdater_DownloadPackage(context->url.c_str(), context->packagePath.c_str(),
+			UpdateProgressCallback, context.get()) != FALSE;
+		if (!downloaded) g_httpInProcessBroken = true;
+	}
+	if (!downloaded) {
+		// 进程内 TLS 不通时的退路：交给子进程下载。子进程不给进度，
+		// 这边只报一个"总长度未知"（percent = -1），进度条改画来回走的高光。
+		// 注意这里同样要传堆上的结构体：UI 线程统一按指针接管并释放。
+		auto* pending = new (std::nothrow) UpdateProgressPayload{ -1, 0, 0 };
+		if (pending && !PostMessageW(context->window, WM_UPDATE_DOWNLOAD_STATE, 1,
+			reinterpret_cast<LPARAM>(pending))) {
+			delete pending;
+		}
+		downloaded = JUpdater_LaunchDownload(context->url.c_str(), context->packagePath.c_str(),
+			context->sha256.c_str(), 300000, context->window) != FALSE;
+	}
+	if (!downloaded) {
+		return fail(L"下载失败，请检查网络或稍后重试");
+	}
+
+	if (!context->sha256.empty()) {
+		WCHAR actual[65] = {};
+		if (!JUpdater_FileSha256(context->packagePath.c_str(), actual, _countof(actual))) {
+			// 把现场写进提示里：文件在不在、多少字节、Win32 错误码，
+			// 省得下次只能靠猜。
+			const DWORD openError = GetLastError();
+			WIN32_FILE_ATTRIBUTE_DATA info{};
+			const BOOL exists = GetFileAttributesExW(context->packagePath.c_str(),
+				GetFileExInfoStandard, &info);
+			const unsigned long long size = exists
+				? (static_cast<unsigned long long>(info.nFileSizeHigh) << 32) | info.nFileSizeLow : 0ULL;
+			DeleteFileW(context->packagePath.c_str());
+			wchar_t detail[160] = {};
+			swprintf_s(detail, L"无法计算更新包校验值（错误 %lu，文件%s，%llu 字节）",
+				static_cast<unsigned long>(openError), exists ? L"存在" : L"不存在", size);
+			return fail(detail);
+		}
+		std::wstring expected = context->sha256;
+		std::wstring got = actual;
+		std::transform(expected.begin(), expected.end(), expected.begin(), towlower);
+		std::transform(got.begin(), got.end(), got.begin(), towlower);
+		if (expected != got) {
+			DeleteFileW(context->packagePath.c_str());
+			return fail(L"更新包校验失败（SHA-256 不匹配），已丢弃");
+		}
+	}
+
+	// 先在本进程里换：只需要两次改名，不用拉第二个进程、也不用等谁退出。
+	// 失败（文件被扫描器/调试器占着、目录不可写）再退回独立更新器 —— 那条路
+	// 会先等本进程退出，退出后占用自然消失，所以两条路是互补的。
+	WCHAR inPlaceError[512] = {};
+	if (JUpdater_ApplyPackageInPlace(context->packagePath.c_str(), context->sha256.c_str(),
+		inPlaceError, _countof(inPlaceError))) {
+		DeleteFileW(context->packagePath.c_str());
+		// 新版本已经起来了，本进程收尾退出即可。
+		PostMessageW(context->window, WM_UPDATE_DOWNLOAD_STATE, 2, 0);
+		return 0;
+	}
+	if (!JUpdater_LaunchApply(context->packagePath.c_str(), context->sha256.c_str())) {
+		return fail(std::wstring(L"替换新版本失败：") +
+			(inPlaceError[0] ? inPlaceError : L"未知原因"));
+	}
+	// 交给更新器等本进程退出；一退它就能动手。
+	PostMessageW(context->window, WM_UPDATE_DOWNLOAD_STATE, 2, 0);
+	return 0;
+}
+
+void MainWindow::OnUpdateDownloadState(WPARAM wParam, LPARAM lParam)
+{
+	switch (wParam) {
+	case 1: {
+		// 防呆：lParam 必须是堆上的载荷指针。历史上有一版把百分比直接塞在
+		// lParam 里（-1），照指针接管就会去 delete 0xffffffff —— 直接 AV。
+		std::unique_ptr<UpdateProgressPayload> payload;
+		if (lParam > 0x10000) payload.reset(reinterpret_cast<UpdateProgressPayload*>(lParam));
+		// 失败或已经收尾之后才到的进度消息直接丢掉（它只负责画进度条）。
+		if (updateDialog.mode != UpdateDialogMode::Download) break;
+		if (payload) {
+			updateDialog.percent = payload->percent;
+			updateDialog.done = payload->done;
+			updateDialog.total = payload->total;
+		}
+		updateDialog.status = updateDialog.percent >= 100
+			? L"下载完成，正在校验更新包…" : L"正在下载更新包…";
+		EnsureAnimationTimer();
+		InvalidateRect(_hWnd, nullptr, FALSE);
+		break;
+	}
+	case 2:
+		// 文件已经换好，新实例正在等互斥体。留一帧「更新完成」再退出，
+		// 否则窗口突然消失，用户会以为程序崩了。
+		updateDialog.mode = UpdateDialogMode::Done;
+		updateDialog.percent = 100;
+		updateDialog.progress = 1.0f;
+		focusTarget = -1;
+		hoverTarget = -1;
+		EnsureAnimationTimer();
+		InvalidateRect(_hWnd, nullptr, FALSE);
+		SetTimer(_hWnd, TIMER_UPDATE_RESTART, 900, nullptr);
+		break;
+	case 3: {
+		std::unique_ptr<std::wstring> reason(reinterpret_cast<std::wstring*>(lParam));
+		std::wstring text = L"未知原因";
+		if (reason && !reason->empty()) text = *reason;
+		FailUpdateDialog(text);
+		break;
+	}
+	default:
+		break;
+	}
+}
+
+void MainWindow::OnChildDownloadProgress(WPARAM wParam, LPARAM lParam)
+{
+	// 弹窗已经关掉／收尾之后再来的进度直接丢掉。
+	if (updateDialog.mode != UpdateDialogMode::Download) return;
+	const unsigned long long total = static_cast<unsigned long long>(wParam);
+	const unsigned long long done = static_cast<unsigned long long>(lParam);
+	updateDialog.total = total;
+	updateDialog.done = done;
+	updateDialog.percent = total ? static_cast<int>(done * 100 / total) : -1;
+	updateDialog.status = updateDialog.percent >= 100
+		? L"下载完成，正在校验更新包…" : L"正在下载更新包…";
+	EnsureAnimationTimer();
+	InvalidateRect(_hWnd, nullptr, FALSE);
+}
+
+void MainWindow::ShowUpdateConfirm(const UpdateProbeContext& probe, const std::wstring& currentVersion)
+{
+	const JUpdaterManifestInfo& manifest = probe.manifest;
+	updateDialog.mode = UpdateDialogMode::Confirm;
+	updateDialog.url = manifest.url;
+	updateDialog.version = manifest.version;
+	updateDialog.currentVersion = currentVersion;
+	updateDialog.notes = manifest.notes;
+	updateDialog.sha256 = manifest.sha256;
+	updateDialog.status.clear();
+	updateDialog.percent = -1;
+	updateDialog.done = 0;
+	updateDialog.total = 0;
+	updateDialog.progress = 0.0f;
+	updateDialog.appear = 0.0f;
+	// 焦点默认落在「立即更新」上：回车继续，Esc 等同「稍后」。
+	focusTarget = kUpdateDialogPrimary;
+	hoverTarget = -1;
+	pressTarget = -1;
+	ApplyDialogOcclusion();
+	SetForegroundWindow(_hWnd);
+	SetFocus(_hWnd);
+	EnsureAnimationTimer();
+	InvalidateRect(_hWnd, nullptr, FALSE);
+}
+
+void MainWindow::CloseUpdateDialog()
+{
+	updateDialog.mode = UpdateDialogMode::None;
+	updateDialog.appear = 0.0f;
+	updateDialog.progress = 0.0f;
+	focusTarget = -1;
+	hoverTarget = -1;
+	pressTarget = -1;
+	ApplyDialogOcclusion();
+	InvalidateRect(_hWnd, nullptr, FALSE);
+}
+
+void MainWindow::FailUpdateDialog(const std::wstring& reason)
+{
+	updateDialog.mode = UpdateDialogMode::Failed;
+	updateDialog.status = reason;
+	updateDialog.percent = -1;
+	focusTarget = kUpdateDialogPrimary;
+	hoverTarget = -1;
+	EnsureAnimationTimer();
+	InvalidateRect(_hWnd, nullptr, FALSE);
+}
+
+int MainWindow::HitUpdateDialogAt(POINT point) const
+{
+	if (!UpdateDialogVisible()) return -1;
+	if (!IsRectEmpty(&updateDialogPrimaryRect) && Hit(updateDialogPrimaryRect, point)) return kUpdateDialogPrimary;
+	if (!IsRectEmpty(&updateDialogSecondaryRect) && Hit(updateDialogSecondaryRect, point)) return kUpdateDialogSecondary;
+	return -1;
+}
+
+bool MainWindow::HandleUpdateDialogClick(POINT point)
+{
+	if (!UpdateDialogVisible()) return false;
+	const int target = HitUpdateDialogAt(point);
+	if (updateDialog.mode == UpdateDialogMode::Confirm) {
+		if (target == kUpdateDialogPrimary) {
+			StartUpdateDownload();
+			return true;
+		}
+		if (target == kUpdateDialogSecondary) {
+			CloseUpdateDialog();
+			ShowFastTip(L"已取消更新");
+			return true;
+		}
+	}
+	else if (updateDialog.mode == UpdateDialogMode::Failed) {
+		if (target == kUpdateDialogPrimary) {
+			// 内置这条路走不通了：交给独立更新器从下载开始重做一遍。
+			CloseUpdateDialog();
+			if (JUpdater_LaunchUpdater()) ShowFastTip(L"已启动独立更新程序");
+			else ShowFastTip(L"无法启动更新程序");
+			return true;
+		}
+		if (target == kUpdateDialogSecondary) {
+			CloseUpdateDialog();
+			return true;
+		}
+	}
+	// 下载中没有任何可点的东西，但点击也不能漏到底下的页面去 —— 弹窗是模态的。
+	return true;
+}
+
+void MainWindow::StartUpdateDownload()
+{
+	WCHAR resolvedUrl[1024] = {};
+	if (!JUpdater_ResolveUrl(updateDialog.url.c_str(), resolvedUrl, _countof(resolvedUrl))) {
+		FailUpdateDialog(L"更新地址不被信任（只接受 https 和官方域名）");
+		return;
+	}
+	WCHAR tempDir[MAX_PATH] = {};
+	if (!GetTempPathW(_countof(tempDir), tempDir)) {
+		FailUpdateDialog(L"无法取得临时目录");
+		return;
+	}
+	const std::wstring packagePath = std::wstring(tempDir) +
+		L"DzjsTrainer-" + updateDialog.version + L"-update.exe";
+	DeleteFileW(packagePath.c_str());
+
+	auto* context = new (std::nothrow) UpdateDownloadContext();
+	if (!context) {
+		FailUpdateDialog(L"内存不足，无法开始下载");
+		return;
+	}
+	context->window = _hWnd;
+	context->url = resolvedUrl;
+	context->packagePath = packagePath;
+	context->sha256 = updateDialog.sha256;
+
+	updateDialog.mode = UpdateDialogMode::Download;
+	updateDialog.percent = -1;
+	updateDialog.done = 0;
+	updateDialog.total = 0;
+	updateDialog.progress = 0.0f;
+	updateDialog.status = L"正在建立连接…";
+	focusTarget = -1;
+	hoverTarget = -1;
+	pressTarget = -1;
+
+	HANDLE thread = CreateThread(nullptr, 0, UpdateDownloadThreadProc, context, 0, nullptr);
+	if (!thread) {
+		delete context;
+		FailUpdateDialog(L"无法启动下载线程");
+		return;
+	}
+	CloseHandle(thread);
+	EnsureAnimationTimer();
+	InvalidateRect(_hWnd, nullptr, FALSE);
+}
+
+// 原生子窗口不会跟着主窗口的位图一起被遮住：它们各自有 HWND，系统单独合成，
+// 所以弹窗期间先全部藏起来，关掉后再让各页面按自己的状态恢复可见性。
+void MainWindow::ApplyDialogOcclusion()
+{
+	if (!UpdateDialogVisible()) {
+		LayoutEmbeddedWindows();
+		return;
+	}
+	for (HWND control : advancedControls) if (control) ShowWindow(control, SW_HIDE);
+	for (HWND control : networkControls) if (control) ShowWindow(control, SW_HIDE);
+	for (HWND control : { teacherHostWindow, teacherLaunchButton, teacherRefreshButton, teacherViewButton,
+		teacherStudentList, teacherChatInput, teacherChatButton, teacherBlackButton, teacherUnlockButton,
+		teacherShutdownButton, teacherRebootButton }) {
+		if (control) ShowWindow(control, SW_HIDE);
+	}
+}
+
 void MainWindow::FinishUpdateProbe(const UpdateProbeContext& probe)
 {
 	if (!probe.ok) {
-		if (probe.byUser) ShowFastTip(L"\u65e0\u6cd5\u83b7\u53d6\u66f4\u65b0\u4fe1\u606f");
+		// 一句"无法获取更新信息"会把三种完全不同的失败混成同一个现象：
+		// 网络不通、服务器没给时效票据、本机时间和服务器差太多。
+		// 有具体原因就直接摆在卡片上，用户才好判断是等一会儿再试还是去对时。
+		const std::wstring reason = probe.manifest.error;
+		if (!reason.empty()) {
+			FailUpdateDialog(L"无法获取更新信息：" + reason);
+		}
+		else if (probe.byUser) {
+			ShowFastTip(L"\u65e0\u6cd5\u83b7\u53d6\u66f4\u65b0\u4fe1\u606f");
+		}
 		return;
 	}
 	const JUpdaterManifestInfo& manifest = probe.manifest;
@@ -4928,47 +6538,26 @@ void MainWindow::FinishUpdateProbe(const UpdateProbeContext& probe)
 		return;
 	}
 
-	std::wstring message;
-	message += L"\u53d1\u73b0\u65b0\u7248\u672c\n\n";
-	message += L"\u5f53\u524d\u7248\u672c\uff1a";
-	message += current.empty() ? L"\u672a\u77e5" : current;
-	message += L"\n\u6700\u65b0\u7248\u672c\uff1a";
-	message += manifest.version;
-	if (manifest.notes[0] != L'\0') {
-		message += L"\n\n\u66f4\u65b0\u8bf4\u660e\uff1a\n";
-		message += manifest.notes;
-	}
-	if (manifest.sha256[0] != L'\0') {
-		message += L"\n\n\u5b89\u88c5\u5305 SHA-256\uff1a\n";
-		message += manifest.sha256;
-	}
-	message += L"\n\n\u662f\u5426\u73b0\u5728\u66f4\u65b0\uff1f\n"
-		L"\uff08\u66f4\u65b0\u7a0b\u5e8f\u4f1a\u63d0\u793a\u4f60\u5148\u5173\u95ed\u672c\u7a0b\u5e8f\uff0c\u518d\u66ff\u6362\u6587\u4ef6\uff09";
-
-	// 主窗口是置顶的，弹窗必须带 MB_TOPMOST，否则会被压在下面。
-	if (MessageBoxW(_hWnd, message.c_str(), L"Dzjs Trainer \u66f4\u65b0",
-		MB_YESNO | MB_ICONINFORMATION | MB_TOPMOST) != IDYES) {
-		if (probe.byUser) ShowFastTip(L"\u5df2\u53d6\u6d88\u66f4\u65b0");
+	// 没有哈希就不更新：清单只要漏掉 sha256，等于「下载什么就装什么」。
+	if (manifest.sha256[0] == L'\0') {
+		FailUpdateDialog(L"更新清单缺少 sha256 校验值，已拒绝本次更新");
 		return;
 	}
 
-	// The standalone updater owns the rest: download, verification and replacement.
-	// It asks the user to close this program before it swaps the executable, so the
-	// main program never waits on or exits for it.
-	if (!JUpdater_LaunchUpdater()) {
-		ShowFastTip(L"\u65e0\u6cd5\u542f\u52a8\u66f4\u65b0\u7a0b\u5e8f");
-		return;
-	}
-	ShowFastTip(L"\u5df2\u542f\u52a8\u66f4\u65b0\u7a0b\u5e8f\uff0c\u8bf7\u5728\u63d0\u793a\u540e\u5173\u95ed\u672c\u7a0b\u5e8f");
+	// 确认框也自己画：版本、更新说明、两个按钮都在窗口里的卡片上，
+	// 用户点「立即更新」之后同一张卡片原地变成下载进度。
+	ShowUpdateConfirm(probe, current);
 }
 
 void MainWindow::SelectPage(Page target)
 {
 	if (page == target) return;
 	page = target;
-	// The network page contains a real child HWND; keep its shell and child in
-	// one coordinate frame instead of animating the painted shell underneath it.
-	pageMotion = target == Page::Network ? 1.0 : 0.0;
+	// 网络页里有真实的子窗口（教师端宿主），高级配置页里有原生热键控件：
+	// 这些 HWND 不会跟着自绘内容一起平移，所以这两页直接跳过入场位移。
+	pageMotion = (target == Page::Network || target == Page::Advanced) ? 1.0 : 0.0;
+	pressTarget = -1;
+	EnsureAnimationTimer();
 	LayoutEmbeddedWindows();
 	InvalidateRect(_hWnd, nullptr, FALSE);
 }
@@ -4983,33 +6572,63 @@ void MainWindow::LayoutEmbeddedWindows()
 void MainWindow::CreateAdvancedControls()
 {
 	HINSTANCE instance = JTAppGetInstanceDirect();
-	advancedControls[0] = CreateWindowExW(WS_EX_CLIENTEDGE, HOTKEY_CLASSW, nullptr,
-		WS_CHILD | WS_TABSTOP, 0, 0, 10, 10, _hWnd, reinterpret_cast<HMENU>(IDC_ADV_HOTKEY_FAKE), instance, nullptr);
-	advancedControls[1] = CreateWindowExW(WS_EX_CLIENTEDGE, HOTKEY_CLASSW, nullptr,
-		WS_CHILD | WS_TABSTOP, 0, 0, 10, 10, _hWnd, reinterpret_cast<HMENU>(IDC_ADV_HOTKEY_SHOW), instance, nullptr);
-	advancedControls[2] = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"3100",
-		WS_CHILD | WS_TABSTOP | ES_NUMBER | ES_AUTOHSCROLL, 0, 0, 10, 10, _hWnd,
+	// 两个快捷键框已经改成自绘（见 PaintAdvanced / HandleHotkeyKey），
+	// 原生 HOTKEY 控件会画自己的直角黑边，和圆角风格冲突，这里不再创建。
+	advancedControls[2] = CreateWindowExW(0, L"EDIT", L"3100",
+		WS_CHILD | WS_TABSTOP | ES_NUMBER | ES_AUTOHSCROLL | ES_CENTER, 0, 0, 10, 10, _hWnd,
 		reinterpret_cast<HMENU>(IDC_ADV_INTERVAL), instance, nullptr);
-	for (HWND control : advancedControls)
-		SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(controlFont), TRUE);
+	for (HWND control : advancedControls) {
+		if (control) SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(controlFont), TRUE);
+	}
 	LoadAdvancedSettings();
 	LayoutAdvancedControls();
 }
 
 void MainWindow::LayoutAdvancedControls()
 {
-	if (!advancedControls[0]) return;
+	if (!advancedControls[2]) return;
 	RECT client{};
 	GetClientRect(_hWnd, &client);
-	const bool showBasic = page == Page::Advanced && advancedTab == 0;
 	const bool showCompat = page == Page::Advanced && advancedTab == 1;
-	const int contentW = client.right - 276;
-	MoveWindow(advancedControls[0], 272, 430, std::max(160, contentW / 2 - 42), 32, TRUE);
-	MoveWindow(advancedControls[1], 254 + contentW / 2, 430, std::max(160, contentW / 2 - 42), 32, TRUE);
-	MoveWindow(advancedControls[2], client.right - 184, 296, 132, 32, TRUE);
-	ShowWindow(advancedControls[0], showBasic ? SW_SHOW : SW_HIDE);
-	ShowWindow(advancedControls[1], showBasic ? SW_SHOW : SW_HIDE);
+	// 和 PaintAdvanced 用同一组公式；输入框缩进圆角框内 4px。
+	MoveWindow(advancedControls[2], client.right - 238, 286, 182, 30, TRUE);
 	ShowWindow(advancedControls[2], showCompat ? SW_SHOW : SW_HIDE);
+}
+
+void MainWindow::SetHotkeyValue(int index, int value)
+{
+	if (index == 0) hotkeyFakeFullValue = value;
+	else hotkeyShowHideValue = value;
+}
+
+void MainWindow::HandleHotkeyKey(UINT virtualKey)
+{
+	if (hotkeyCaptureIndex < 0) return;
+	const int index = hotkeyCaptureIndex;
+	if (virtualKey == VK_ESCAPE) {
+		SetHotkeyValue(index, 0);
+		hotkeyCaptureIndex = -1;
+		ShowFastTip(L"\u5df2\u6e05\u9664\u8be5\u5feb\u6377\u952e");
+		InvalidateRect(_hWnd, nullptr, FALSE);
+		return;
+	}
+	// 只按下修饰键不算一个组合，继续等主键；IME 的 ProcessKey 也忽略。
+	if (virtualKey == VK_SHIFT || virtualKey == VK_CONTROL || virtualKey == VK_MENU ||
+		virtualKey == VK_LSHIFT || virtualKey == VK_RSHIFT || virtualKey == VK_LCONTROL ||
+		virtualKey == VK_RCONTROL || virtualKey == VK_LMENU || virtualKey == VK_RMENU ||
+		virtualKey == VK_LWIN || virtualKey == VK_RWIN || virtualKey == VK_PROCESSKEY) {
+		return;
+	}
+	int mods = 0;
+	if (GetKeyState(VK_SHIFT) & 0x8000) mods |= 0x01;
+	if (GetKeyState(VK_CONTROL) & 0x8000) mods |= 0x02;
+	if (GetKeyState(VK_MENU) & 0x8000) mods |= 0x04;
+	const int value = (mods << 8) | static_cast<int>(virtualKey & 0xFF);
+	SetHotkeyValue(index, value);
+	hotkeyCaptureIndex = -1;
+	const std::wstring message = L"\u5feb\u6377\u952e\u5df2\u8bbe\u4e3a " + HotkeyDisplayText(value);
+	ShowFastTip(message.c_str());
+	InvalidateRect(_hWnd, nullptr, FALSE);
 }
 
 void MainWindow::LoadAdvancedSettings()
@@ -5028,8 +6647,8 @@ void MainWindow::LoadAdvancedSettings()
 	advDisableWatchdog = settings->GetSettingBool(L"ForceDisableWatchDog", false);
 	advInjectMaster = settings->GetSettingBool(L"InjectMasterHelper", false);
 	advInject64 = settings->GetSettingBool(L"InjectProcHelper64", false);
-	SendMessageW(advancedControls[0], HKM_SETHOTKEY, settings->GetSettingInt(L"HotKeyFakeFull", 1606), 0);
-	SendMessageW(advancedControls[1], HKM_SETHOTKEY, settings->GetSettingInt(L"HotKeyShowHide", 1604), 0);
+	hotkeyFakeFullValue = settings->GetSettingInt(L"HotKeyFakeFull", 1606);
+	hotkeyShowHideValue = settings->GetSettingInt(L"HotKeyShowHide", 1604);
 	auto killMode = settings->GetSettingStrPtr(L"KillProcess", L"NtTerminateProcess");
 	advancedKillMode = *killMode == L"TerminateProcess" ? 0 : (*killMode == L"KernelMode" ? 2 : 1);
 	FreeStringPtr(killMode);
@@ -5059,8 +6678,8 @@ void MainWindow::SaveAdvancedSettings()
 	// Apply driver/self-protection switches immediately instead of leaving the
 	// already-running process on its previous startup state.
 	JTAppRunOperationDirect(AppOperationForceLoadDriver);
-	settings->SetSettingInt(L"HotKeyFakeFull", static_cast<int>(SendMessageW(advancedControls[0], HKM_GETHOTKEY, 0, 0)));
-	settings->SetSettingInt(L"HotKeyShowHide", static_cast<int>(SendMessageW(advancedControls[1], HKM_GETHOTKEY, 0, 0)));
+	settings->SetSettingInt(L"HotKeyFakeFull", hotkeyFakeFullValue);
+	settings->SetSettingInt(L"HotKeyShowHide", hotkeyShowHideValue);
 	settings->SetSettingStr(L"KillProcess", advancedKillMode == 0 ? L"TerminateProcess" : advancedKillMode == 2 ? L"KernelMode" : L"NtTerminateProcess");
 	settings->SetSettingStr(L"InjectMode", advancedInjectMode == 1 ? L"HookDllStub" : L"RemoteThread");
 	wchar_t intervalText[16]{};
@@ -5092,6 +6711,7 @@ void MainWindow::SaveAdvancedSettings()
 void MainWindow::CreateNetworkControls()
 {
 	controlSurfaceBrush = CreateSolidBrush(RGB(255, 255, 255));
+	advancedFieldBrush = CreateSolidBrush(RGB(255, 255, 255));
 	controlFont = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
 		OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
 		DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
@@ -5099,6 +6719,7 @@ void MainWindow::CreateNetworkControls()
 		networkControls[index] = CreateWindowExW(exStyle, cls, text, WS_CHILD | style,
 			0, 0, 10, 10, _hWnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), JTAppGetInstanceDirect(), nullptr);
 		SendMessageW(networkControls[index], WM_SETFONT, reinterpret_cast<WPARAM>(controlFont), TRUE);
+		if (style & BS_OWNERDRAW) EnableNativeButtonHover(networkControls[index]);
 	};
 	make(0, L"STATIC", L"\u76ee\u6807 IP", SS_LEFT, 0);
 	make(1, L"EDIT", L"127.0.0.1", ES_AUTOHSCROLL | WS_TABSTOP, IDC_NET_IP);
@@ -5122,6 +6743,7 @@ void MainWindow::CreateNetworkControls()
 		WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 10, 10, _hWnd,
 		reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_NET_TEACHER)), JTAppGetInstanceDirect(), nullptr);
 	SendMessageW(teacherLaunchButton, WM_SETFONT, reinterpret_cast<WPARAM>(controlFont), TRUE);
+	EnableNativeButtonHover(teacherLaunchButton);
 	teacherRefreshButton = CreateWindowExW(0, L"BUTTON", L"\u5237\u65b0\u5217\u8868", WS_CHILD | WS_TABSTOP | BS_OWNERDRAW,
 		0, 0, 10, 10, _hWnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TEACHER_REFRESH)), JTAppGetInstanceDirect(), nullptr);
 	teacherViewButton = CreateWindowExW(0, L"BUTTON", L"\u5b9e\u65f6\u753b\u9762", WS_CHILD | WS_TABSTOP | BS_OWNERDRAW,
@@ -5144,6 +6766,9 @@ void MainWindow::CreateNetworkControls()
 	for (HWND control : { teacherRefreshButton, teacherViewButton, teacherStudentList, teacherChatInput, teacherChatButton, teacherBlackButton,
 		teacherUnlockButton, teacherShutdownButton, teacherRebootButton })
 		SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(controlFont), TRUE);
+	for (HWND button : { teacherRefreshButton, teacherViewButton, teacherChatButton, teacherBlackButton,
+		teacherUnlockButton, teacherShutdownButton, teacherRebootButton })
+		EnableNativeButtonHover(button);
 	SendMessageW(teacherChatInput, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(10, 10));
 	for (int index : { 1, 3, 6, 9 })
 		SendMessageW(networkControls[index], EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(10, 10));
@@ -5194,7 +6819,10 @@ void MainWindow::LayoutTeacherControls()
 	const int hostH = std::max(320, static_cast<int>(client.bottom) - hostY - 24);
 	if (teacherHostWindow) {
 		MoveWindow(teacherHostWindow, hostX, hostY, hostW, hostH, TRUE);
-		ShowWindow(teacherHostWindow, visible ? SW_SHOW : SW_HIDE);
+		// 只在真正嵌入原教师端窗口时才显示宿主框。没有嵌入时它是一个空的
+		// WS_EX_CLIENTEDGE STATIC，会盖住 PaintNetwork 画好的圆角卡片。
+		const bool hostVisible = visible && teacherChildWindow != nullptr && IsWindow(teacherChildWindow);
+		ShowWindow(teacherHostWindow, hostVisible ? SW_SHOW : SW_HIDE);
 	}
 	MoveWindow(teacherLaunchButton, hostX, 120, 144, 34, TRUE);
 	ShowWindow(teacherLaunchButton, visible ? SW_SHOW : SW_HIDE);
@@ -5421,6 +7049,9 @@ void MainWindow::LayoutEmbeddedTeacherGui()
 	SetWindowPos(teacherChildWindow, HWND_TOP, 0, 0,
 		std::max(1L, client.right - client.left), std::max(1L, client.bottom - client.top),
 		SWP_NOACTIVATE | SWP_SHOWWINDOW);
+	// 宿主框默认是隐藏的（见 LayoutTeacherControls），嵌入成功后要显式打开，
+	// 且只在网络页打开，避免轮询把它在别的页面上又翻出来。
+	if (page == Page::Network) ShowWindow(teacherHostWindow, SW_SHOW);
 }
 
 bool MainWindow::AttachEmbeddedTeacherGui()
@@ -5788,9 +7419,13 @@ bool MainWindow::ChooseTemporaryVideoMedia(bool image)
 
 void MainWindow::ShowFastTip(LPCWSTR text)
 {
-	std::lock_guard<std::mutex> guard(stateMutex);
-	toastText = StripMarkup(text);
-	toastUntil = GetTickCount64() + 4000;
+	{
+		std::lock_guard<std::mutex> guard(stateMutex);
+		toastText = StripMarkup(text);
+		toastStart = GetTickCount64();
+		toastUntil = toastStart + 4000;
+	}
+	EnsureAnimationTimer();
 	PostMessageW(_hWnd, WM_NATIVE_REFRESH, 0, 0);
 }
 
@@ -5800,7 +7435,7 @@ void MainWindow::OnUpdateStudentMainInfo(bool running, LPCWSTR fullPath, DWORD p
 		std::lock_guard<std::mutex> guard(stateMutex);
 		studentRunning = running;
 		studentPid = running ? pid : 0;
-		studentPath = running && fullPath ? fullPath : L"Not detected";
+		studentPath = running && fullPath ? fullPath : L"未检测到";
 	}
 	PostMessageW(_hWnd, WM_NATIVE_REFRESH, 0, 0);
 }
@@ -5811,7 +7446,7 @@ void MainWindow::OnUpdateState(TrainerStatus status, LPCWSTR textMain, LPCWSTR t
 		std::lock_guard<std::mutex> guard(stateMutex);
 		currentStatus = status;
 		currentControlled = status == TrainerStatusControlled || status == TrainerStatusControlledAndUnLocked;
-		statusTitle = textMain ? textMain : L"Unknown status";
+		statusTitle = textMain ? textMain : L"未知状态";
 		statusDetail = StripMarkup(textMore);
 	}
 	if (status == TrainerStatusControlled || status == TrainerStatusControlledAndUnLocked)
@@ -5982,29 +7617,89 @@ void MainWindow::OnWmCommand(WPARAM wParam)
 	}
 }
 
+void MainWindow::EnsureAnimationTimer()
+{
+	if (!_hWnd || animationTimerRunning) return;
+	lastAnimationTick = GetTickCount64();
+	animationTimerRunning = SetTimer(_hWnd, TIMER_ANIMATION, 16, nullptr) != 0;
+}
+
 void MainWindow::OnWmTimer(WPARAM timer)
 {
-	if (timer == TIMER_ANIMATION) {
+	if (timer == TIMER_SERVICE_POLL) {
 		PollEmbeddedTeacherGui();
 		PollTeacherService();
+		return;
+	}
+	if (timer == TIMER_ANIMATION) {
+		// 按真实时间推进，而不是每 tick 固定加一个量：定时器抖动时动画速度不变，
+		// 从别的窗口切回来也不会突然"跳"一大步。
+		const ULONGLONG now = GetTickCount64();
+		const double delta = static_cast<double>(now - lastAnimationTick) / 1000.0;
+		lastAnimationTick = now;
+		const double dt = (std::max)(0.001, (std::min)(0.05, delta));
 		bool needsPaint = false;
+
+		auto approach = [dt](float& value, float target, double timeConstant) {
+			const float k = static_cast<float>(1.0 - std::exp(-dt / timeConstant));
+			const float diff = target - value;
+			if (std::fabs(diff) <= 0.002f) {
+				const bool changed = value != target;
+				value = target;
+				return changed;
+			}
+			value += diff * k;
+			return true;
+		};
+
 		if (pageMotion < 1.0) {
-			pageMotion = std::min(1.0, pageMotion + 0.045);
+			pageMotion = (std::min)(1.0, pageMotion + dt / 0.26);
 			needsPaint = true;
 		}
+		if (approach(navIndicator, static_cast<float>(static_cast<int>(page)), 0.075)) needsPaint = true;
+
+		// 开关滑块还在路上就继续重绘；具体步进由 AnimateToggle 用 frameDelta 算。
+		if (toggleAnimating) {
+			toggleAnimating = false;
+			needsPaint = true;
+		}
+
 		for (int i = 0; i < static_cast<int>(hoverProgress.size()); ++i) {
 			const float target = hoverTarget == i ? 1.0f : 0.0f;
-			if (fabs(hoverProgress[i] - target) >= 0.002f) {
-				hoverProgress[i] += (target - hoverProgress[i]) * 0.24f;
-				needsPaint = true;
-			}
-			else hoverProgress[i] = target;
+			if (approach(hoverProgress[i], target, 0.055)) needsPaint = true;
 		}
-		if (!toastText.empty() && GetTickCount64() > toastUntil) {
+
+		// 更新弹窗：入场淡入 + 进度条追赶目标值。目标由下载线程报回来，
+		// 这里只做插值，进度条就不会一格一格地跳。
+		if (UpdateDialogVisible()) {
+			if (approach(updateDialog.appear, 1.0f, 0.06)) needsPaint = true;
+			const float targetProgress = updateDialog.percent < 0
+				? updateDialog.progress
+				: (std::min)(1.0f, static_cast<float>(updateDialog.percent) / 100.0f);
+			if (approach(updateDialog.progress, targetProgress, 0.09)) needsPaint = true;
+			updateDialog.sweep += static_cast<float>(dt) * 0.55f;
+			if (updateDialog.sweep >= 1.0f) updateDialog.sweep -= 1.0f;
+			// 总长度未知时没有别的动画源，得自己续上重绘，否则高光停在原地。
+			if (updateDialog.mode == UpdateDialogMode::Download && updateDialog.percent < 0) needsPaint = true;
+		}
+
+		const bool toastAlive = !toastText.empty() && now <= toastUntil;
+		if (!toastText.empty() && !toastAlive) {
 			toastText.clear();
 			needsPaint = true;
 		}
-		if (needsPaint && IsWindowVisible(_hWnd) && !IsIconic(_hWnd))
+		else if (toastAlive) {
+			// 淡入和淡出都要逐帧重绘，最后 260 ms 才算结束。
+			if (now < toastStart + 130 || now + 260 >= toastUntil) needsPaint = true;
+		}
+
+		if (!needsPaint) {
+			// 没有任何动画在跑，停掉定时器；下次有交互动效时再开。
+			KillTimer(_hWnd, TIMER_ANIMATION);
+			animationTimerRunning = false;
+			return;
+		}
+		if (IsWindowVisible(_hWnd) && !IsIconic(_hWnd))
 			InvalidateRect(_hWnd, nullptr, FALSE);
 	}
 	else if (timer == TIMER_RERUN) {
@@ -6017,6 +7712,11 @@ void MainWindow::OnWmTimer(WPARAM timer)
 	}
 	else if (timer == TIMER_TRAY_REPAIR) {
 		EnsureTrayIcon();
+	}
+	else if (timer == TIMER_UPDATE_RESTART) {
+		// 「更新完成」露过一帧了，可以退场：新版本实例正等着互斥体接手。
+		KillTimer(_hWnd, TIMER_UPDATE_RESTART);
+		DestroyWindow(_hWnd);
 	}
 }
 
@@ -6046,6 +7746,8 @@ void MainWindow::OnWmDestroy()
 	RemoveInputOriginHooks();
 	SaveSettingsOnQuit();
 	KillTimer(_hWnd, TIMER_ANIMATION);
+	KillTimer(_hWnd, TIMER_SERVICE_POLL);
+	animationTimerRunning = false;
 	KillTimer(_hWnd, TIMER_TRAY_REPAIR);
 	UnregisterHotKey(_hWnd, hotkeyShowHide);
 	UnregisterHotKey(_hWnd, hotkeySwFull);

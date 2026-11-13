@@ -1,4 +1,4 @@
-#pragma once
+ï»¿#pragma once
 #include "stdafx.h"
 #include <list>
 #include <string>
@@ -90,17 +90,17 @@ public:
 
 	static JyUdpAttack* currentJyUdpAttack;
 
-	//É¨Ãè¾ÖÓòÍøIP
+	//æ‰«æå±€åŸŸç½‘IP
 	void ScanNetworkIP(HWND hWnd, std::wstring &start, std::wstring &end, std::wstring& host, std::wstring& current);
-	//¼ì²â¼«ÓòµÄTCP¶Ë¿Ú
+	//æ£€æµ‹æåŸŸçš„TCPç«¯å£
 	void CheckStudentMainTCPPort(HWND hWnd);
-	//·¢ËÍcmd
+	//å‘é€cmd
 	void SendCommand(std::wstring& ip, DWORD port, std::wstring& cmd);
-	//·¢ËÍĞÅÏ¢
+	//å‘é€ä¿¡æ¯
 	void SendText(std::wstring& ip, DWORD port, std::wstring& cmd);
-	//·¢ËÍ¹Ø»úÖ¸Áî
+	//å‘é€å…³æœºæŒ‡ä»¤
 	void SendShutdown(std::wstring& ip, DWORD port);
-	//·¢ËÍÖØÆôÖ¸Áî
+	//å‘é€é‡å¯æŒ‡ä»¤
 	void SendReboot(std::wstring& ip, DWORD port);
 
 private:

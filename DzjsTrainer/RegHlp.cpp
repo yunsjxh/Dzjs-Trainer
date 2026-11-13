@@ -1,4 +1,4 @@
-#include "stdafx.h"
+﻿#include "stdafx.h"
 #include "RegHlp.h"
 #include "AppPublic.h"
 #include "PathHelper.h"
@@ -8,7 +8,7 @@
 extern JTApp * currentApp;
 extern LoggerInternal * currentLogger;
 
-//ɾ��ע������Լ��Ӽ�
+//删除注册表键以及子键
 BOOL MRegDeleteKey(HKEY hRootKey, LPWSTR path) {
 
 	DWORD lastErr = SHDeleteKey(hRootKey, path);
@@ -24,7 +24,12 @@ BOOL MRegForceDeleteServiceRegkey(LPWSTR lpszDriverName)
 {
 	BOOL rs = FALSE;
 	wchar_t regPath[MAX_PATH];
-	wsprintf(regPath, L"SYSTEM\\CurrentControlSet\\services\\%s", lpszDriverName);
+	// wsprintf 不做边界检查，驱动名超长会写穿 regPath。改用带长度的版本。
+	if (swprintf_s(regPath, _countof(regPath), L"SYSTEM\\CurrentControlSet\\services\\%s", lpszDriverName) < 0) {
+		currentLogger->LogError(L"Service reg path too long for driver name: %s", lpszDriverName);
+		SetLastError(ERROR_BUFFER_OVERFLOW);
+		return FALSE;
+	}
 	rs = MRegDeleteKey(HKEY_LOCAL_MACHINE, regPath);
 
 	if (!rs) currentLogger->LogWarn2(L"RegDeleteTree failed : %d in delete key HKEY_LOCAL_MACHINE\\%s", GetLastError(), regPath);
@@ -33,7 +38,10 @@ BOOL MRegForceDeleteServiceRegkey(LPWSTR lpszDriverName)
 	wchar_t regName[MAX_PATH];
 	wcscpy_s(regName, lpszDriverName);
 	_wcsupr_s(regName);
-	wsprintf(regPath, L"SYSTEM\\CurrentControlSet\\Enum\\Root\\LEGACY_%s", regName);
+	if (swprintf_s(regPath, _countof(regPath), L"SYSTEM\\CurrentControlSet\\Enum\\Root\\LEGACY_%s", regName) < 0) {
+		SetLastError(ERROR_BUFFER_OVERFLOW);
+		return FALSE;
+	}
 	rs = MRegDeleteKey(HKEY_LOCAL_MACHINE, regPath);
 
 	if (!rs) {
