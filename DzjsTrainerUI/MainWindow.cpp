@@ -32,18 +32,32 @@ std::wstring ReadOwnFileVersion()
 	if (!VerQueryValueW(data.data(), L"\\", reinterpret_cast<LPVOID*>(&info), &length) || !info)
 		return std::wstring();
 	WCHAR buffer[32] = {};
-	// Three components, matching how the version is written elsewhere in the UI.
-	swprintf_s(buffer, L"%u.%u.%u",
+	// All four components. This value is also what the update check compares
+	// against the manifest, so dropping the build field used to make a 1.0.4.1
+	// binary report itself as 1.0.4 and offer the same update forever.
+	// Display code trims the trailing ".0" instead (see DisplayVersion).
+	swprintf_s(buffer, L"%u.%u.%u.%u",
 		HIWORD(info->dwFileVersionMS), LOWORD(info->dwFileVersionMS),
-		HIWORD(info->dwFileVersionLS));
+		HIWORD(info->dwFileVersionLS), LOWORD(info->dwFileVersionLS));
 	return buffer;
+}
+
+// Drops the build field when it is zero: "1.0.4.0" reads better as "1.0.4",
+// while a meaningful fourth component such as "1.0.4.1" stays visible.
+std::wstring DisplayVersion(const std::wstring& version)
+{
+	std::wstring out = version;
+	while (out.size() > 3 && out.compare(out.size() - 2, 2, L".0") == 0) {
+		out.erase(out.size() - 2);
+	}
+	return out;
 }
 
 // Cached because PaintAbout runs from the animation timer.
 const std::wstring& AboutVersionLine()
 {
 	static const std::wstring line = [] {
-		std::wstring version = ReadOwnFileVersion();
+		std::wstring version = DisplayVersion(ReadOwnFileVersion());
 		if (version.empty()) version = L"\u672a\u77e5";
 		return std::wstring(L"\u7248\u672c  ") + version;
 	}();
@@ -56,7 +70,7 @@ const std::wstring& AboutVersionLine()
 const std::wstring& NavVersionLine()
 {
 	static const std::wstring line = [] {
-		std::wstring version = ReadOwnFileVersion();
+		std::wstring version = DisplayVersion(ReadOwnFileVersion());
 		if (version.empty()) version = L"\u672a\u77e5";
 		return std::wstring(L"v") + version + L"  \u00b7  \u672c\u673a";
 	}();
@@ -6602,6 +6616,8 @@ void MainWindow::FinishUpdateProbe(const UpdateProbeContext& probe)
 	}
 	const JUpdaterManifestInfo& manifest = probe.manifest;
 
+	// 比较用完整四段版本（与清单同格式），显示再用去掉尾部 .0 的写法：
+	// 两者混用会让 1.0.4.1 自认为 1.0.4，于是每次检查都提示同一个更新。
 	const std::wstring current = ReadOwnFileVersion();
 	if (!current.empty() && JUpdater_CompareVersion(manifest.version, current.c_str()) <= 0) {
 		if (probe.byUser) ShowFastTip(L"\u5f53\u524d\u5df2\u662f\u6700\u65b0\u7248\u672c");
@@ -6616,7 +6632,7 @@ void MainWindow::FinishUpdateProbe(const UpdateProbeContext& probe)
 
 	// 确认框也自己画：版本、更新说明、两个按钮都在窗口里的卡片上，
 	// 用户点「立即更新」之后同一张卡片原地变成下载进度。
-	ShowUpdateConfirm(probe, current);
+	ShowUpdateConfirm(probe, DisplayVersion(current));
 }
 
 void MainWindow::SelectPage(Page target)

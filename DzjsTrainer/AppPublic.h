@@ -5,7 +5,7 @@
 #include "TrainerWorker.h" 
 #include "JyUdpAttack.h" 
 
-#define CURRENT_VERSION "1.0.4.1"
+#define CURRENT_VERSION "1.0.4.2"
 
 // 进程启动最早期（wWinMain 里、任何驱动加载与权限提升之前）那一次 SSPI 预热的
 // 返回值，0xFFFFFFFF 表示没跑过。那行日志写在日志文件打开之前，落不了盘，

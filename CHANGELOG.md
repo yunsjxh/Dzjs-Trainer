@@ -22,6 +22,18 @@ All notable changes to Dzjs Trainer are documented in this file.
 - The in-app download window, its progress reporting, and the payload/parent-pid helper path.
 - The `AutoUpdate` setting and the startup update timer. The new flow requires the user to close the main program, so an unattended check cannot work.
 
+## [1.0.4.2] - 2026-11-14
+
+### Fixed
+
+- The update check no longer offers the same version forever on a build whose fourth
+  version component is non-zero. `ReadOwnFileVersion` formatted the running binary's
+  version as three components, so a `1.0.4.1` executable reported itself as `1.0.4`
+  while the manifest said `1.0.4.1`; `CompareVersions` pads the missing component with
+  zero, concluded the remote copy was newer, and every check re-downloaded the exact
+  same package. The reader now returns all four components, and the UI trims a
+  trailing `.0` only for display, so `1.0.4.0` still reads as `1.0.4`.
+
 ## [1.0.4.1] - 2026-11-14
 
 ### Fixed
