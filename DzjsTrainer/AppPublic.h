@@ -5,7 +5,13 @@
 #include "TrainerWorker.h" 
 #include "JyUdpAttack.h" 
 
-#define CURRENT_VERSION "1.0.4"
+#define CURRENT_VERSION "1.0.4.1"
+
+// 进程启动最早期（wWinMain 里、任何驱动加载与权限提升之前）那一次 SSPI 预热的
+// 返回值，0xFFFFFFFF 表示没跑过。那行日志写在日志文件打开之前，落不了盘，
+// 所以结果留在这里，等更新探测线程连同它自己的复测一起记下来。
+extern unsigned g_sspiEarlySchannel;
+extern unsigned g_sspiEarlyNegotiate;
 
 #define FAST_STR_BINDER(str, fstr, size, ...) WCHAR str[size]; swprintf_s(str, fstr, __VA_ARGS__)
 

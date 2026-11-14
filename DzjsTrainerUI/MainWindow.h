@@ -11,6 +11,7 @@
 #include <objidl.h>
 #include <gdiplus.h>
 #include <array>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -24,6 +25,13 @@ struct UpdateProbeContext {
 	HWND window = nullptr;
 	bool byUser = false;
 	bool ok = false;
+	// 探测开始时刻（GetTickCount64）。结果日志里要记总耗时 —— 「点了没反应」
+	// 这类描述只有配上毫秒数才能分清是慢在进程内握手、子进程启动，还是读文件。
+	unsigned long long startedAt = 0;
+	// 走的是子进程回退路径。主程序进程里的 TLS 是坏的，正常情况下都是 true。
+	bool viaSubprocess = false;
+	// 连"有没有网络"这一关都没过，没发出任何请求。
+	bool offline = false;
 	JUpdaterManifestInfo manifest = {};
 };
 
@@ -348,6 +356,9 @@ private:
 	RECT updateDialogPrimaryRect{};
 	RECT updateDialogSecondaryRect{};
 	bool UpdateDialogVisible() const { return updateDialog.mode != UpdateDialogMode::None; }
+	// 一次探测还没回来时不再起第二次。两次并行探测会各弹一次结果，谁先到不确定；
+	// 用户看到的就是「点了没动静，再点一下突然说已是最新版本」。
+	std::atomic<bool> updateProbeInFlight{ false };
 	void PaintUpdateDialog(Gdiplus::Graphics& g, int width, int height);
 	void ShowUpdateConfirm(const UpdateProbeContext& probe, const std::wstring& currentVersion);
 	void StartUpdateDownload();

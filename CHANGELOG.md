@@ -22,6 +22,29 @@ All notable changes to Dzjs Trainer are documented in this file.
 - The in-app download window, its progress reporting, and the payload/parent-pid helper path.
 - The `AutoUpdate` setting and the startup update timer. The new flow requires the user to close the main program, so an unattended check cannot work.
 
+## [1.0.4.1] - 2026-11-14
+
+### Fixed
+
+- In-process update checks no longer fail every time with `SEC_E_SECPKG_NOT_FOUND`
+  (`0x80090305`). The security package list is a per-process cache inside `secur32`,
+  filled on first use; when that first enumeration failed the cache stayed empty for
+  the rest of the process, so every later `AcquireCredentialsHandle` — including the
+  one WinHTTP makes inside `WinHttpSendRequest` — returned the same code. The process
+  now acquires Schannel and Negotiate credentials in `wWinMain`, before any driver is
+  loaded or privileges are raised, which populates the cache correctly. Measured on
+  the user's machine: `路径=进程内 ... 耗时=594 ms`, full TLS handshake and ticket
+  verification, no more fallback to the updater subprocess.
+- The `请求发送失败 err=183` line no longer reports a stale Win32 error.
+  `WinHttpSendRequest` does not set the last error when it fails, so the old log line
+  was printing whatever an earlier call had left behind; it now reuses the status
+  captured at the failing call.
+
+### Changed
+
+- The early-warmup result is carried in process globals and logged together with the
+  pre-probe retest, because the log file is not open yet when `wWinMain` runs.
+
 ## [1.0.4] - 2026-11-14
 
 ### Security

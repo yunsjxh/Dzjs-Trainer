@@ -23,6 +23,21 @@ struct JUpdaterManifestInfo {
 
 UPEXPORT_CFUNC(BOOL) JUpdater_CheckInternet();
 
+// 启动最早期调一次，在任何驱动加载 / 自保护建立之前：先把 Schannel 和
+// Negotiate 的出站凭据各取一遍，让 secur32 的进程本地包列表提前初始化。
+//
+// 背景：主程序进程里 WinHttpSendRequest 一直返回 SEC_E_SECPKG_NOT_FOUND
+// (0x80090305)，而同一份代码在独立进程里正常。包列表是 secur32 的进程本地
+// 缓存、只初始化一次，所以这里的结果有两种解读：
+//   返回 TRUE  —— 预热成功。若之后进程内 TLS 仍然失败，说明是启动期某个动作
+//                 把已建好的状态又破坏了（需要看 DiagnoseSspi 的输出定位）。
+//   返回 FALSE —— 进程一出生就没有可用的 Schannel，与后续动作无关。
+UPEXPORT_CFUNC(BOOL) JUpdater_WarmupSspi();
+
+// 分层自检：包枚举 / 每包凭据 / CNG 提供程序 / 模块加载状态，结果写日志。
+// 每进程只跑一次；在进程内 TLS 失败时调用。
+UPEXPORT_CFUNC(VOID) JUpdater_DiagnoseSspi();
+
 // 探测远端清单。成功（拿到 version 与 url）返回 TRUE。
 // 内部按 "随机子域 x2 -> 顶点域名" 依次尝试，JSON 清单不可用时回退旧的纯文本接口。
 // 这是只读操作，不会下载或替换任何文件。

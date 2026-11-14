@@ -196,18 +196,49 @@ DWORD WINAPI UpdateProbeThread(LPVOID parameter)
 	// 就会失败并返回 ERROR_BAD_IMPERSONATION_LEVEL(1346)。
 	// 本线程只做只读探测、不需要任何模拟身份，先撤掉。线程用完即退，无需恢复。
 	RevertToSelf();
+	context->startedAt = GetTickCount64();
+	context->ok = false;
+	// 和启动时那一次预热对照：启动成功、这时失败说明中间某个启动动作把
+	// SSPI 弄坏了；两次都失败则是进程一出生就不行。两条线索指向完全不同的
+	// 修法，所以必须分开记。
+	const BOOL sspiNow = JUpdater_WarmupSspi();
+	if (currentLogger) {
+		// 两行对照：启动时那次（写不进日志文件，靠全局带过来）和现在这次。
+		// 启动成功 + 现在失败 = 启动期有动作破坏了已建好的状态；
+		// 两次都失败 = 进程一出生就没有可用 Schannel。0xFFFFFFFF 表示启动那次没跑。
+		currentLogger->LogInfo(L"更新探测：SSPI 复测=%s（启动预热 schannel=0x%08X negotiate=0x%08X）",
+			sspiNow ? L"可用" : L"不可用",
+			g_sspiEarlySchannel, g_sspiEarlyNegotiate);
+	}
+	// 联网预检搬到这里。原来是 UI 线程上直接调 JUpdater_CheckInternet()，那个函数
+	// 走的是 WinINet —— 而本进程里 WinINet 本身就是坏的（见下面 g_httpInProcessBroken），
+	// 它卡多久、点完到出现任何反应就有多久的空白。耗时单独记一行，好和子进程那段区分。
+	const ULONGLONG netCheckStart = GetTickCount64();
+	const bool online = JUpdater_CheckInternet() != FALSE;
+	if (currentLogger) {
+		currentLogger->LogInfo(L"更新探测：联网预检=%d 耗时=%llu ms", online ? 1 : 0,
+			static_cast<unsigned long long>(GetTickCount64() - netCheckStart));
+	}
+	if (!online) {
+		context->offline = true;
+		if (!PostMessageW(context->window, WM_UPDATE_PROBE_DONE, context->byUser ? 1 : 0,
+			reinterpret_cast<LPARAM>(context))) {
+			delete context;
+		}
+		return 0;
+	}
 	// 先在本进程里直接取清单（WinHTTP）。历史上这里只能让独立更新器代取，
 	// 因为 WinINet 在 GUI 进程里会 ERROR_INTERNET_CANNOT_CONNECT；而那个更新器
 	// 是控制台程序，代取时会 AllocConsole 弹一个黑窗口 —— 用户看到的就是它。
 	// 清单获取改成 WinHTTP 后这条路不再需要子进程，取不到才退回更新器。
 	// 线程本身不碰界面，只把结果投回 UI 线程。
-	context->ok = false;
 	if (!g_httpInProcessBroken) {
 		context->ok = JUpdater_FetchManifest(&context->manifest) != FALSE;
 		if (!context->ok) g_httpInProcessBroken = true;
 	}
 	if (!context->ok) {
 		// 进程内 TLS 不通（或已知不通）时才退回子进程；更新器已被要求不建控制台。
+		context->viaSubprocess = true;
 		context->ok = JUpdater_ProbeManifest(&context->manifest) != FALSE;
 	}
 	// 线程本身不碰界面，只把结果投回 UI 线程。
@@ -5139,7 +5170,12 @@ void MainWindow::PaintAbout(Graphics& g, int width, int height, int offsetY)
 	FillRound(g, RectF(x + 42, y + 158, 142, 30), 15, C(darkMode, 219, 238, 232, 43, 76, 69));
 	Text(g, AboutVersionLine().c_str(), x + 42, y + 166, 142, 18, 11, FontStyleBold, C(darkMode, 0, 81, 72, 177, 239, 228), StringAlignmentCenter);
 	aboutUpdateRect = { static_cast<LONG>(x + 204), static_cast<LONG>(y + 153), static_cast<LONG>(x + 354), static_cast<LONG>(y + 193) };
-	PaintButton(g, RectF(x + 204, y + 153, 150, 40), L"\u68c0\u67e5\u66f4\u65b0", 74, ButtonStyle::Tonal, 20, 2);
+	// 探测期间按钮改成「检查中…」并置灰。浮层只活 4 秒，而一次探测最坏要走一遍
+	// 子进程；中间这段时间如果没有持续可见的状态，看起来就是点了没反应。
+	const bool probing = updateProbeInFlight.load();
+	PaintButton(g, RectF(x + 204, y + 153, 150, 40),
+		probing ? L"\u68c0\u67e5\u4e2d\u2026" : L"\u68c0\u67e5\u66f4\u65b0",
+		74, ButtonStyle::Tonal, 20, 2, !probing);
 	Text(g, L"\u9762\u5411 Windows \u8bbe\u5907\u7684\u672c\u5730\u9632\u62a4\u4e0e\u8fd0\u7ef4\u5de5\u5177\uff0c\u96c6\u4e2d\u63d0\u4f9b\u72b6\u6001\u76d1\u63a7\u3001\u8fdc\u7a0b\u884c\u4e3a\u63a7\u5236\u548c\u8bbe\u5907\u8bca\u65ad\u3002", x + 42, y + 215, w - 84, 38, 11, FontStyleRegular, bodyColor);
 
 	const float columnGap = 14.0f;
@@ -6191,10 +6227,16 @@ void MainWindow::HandleClick(POINT point)
 
 void MainWindow::CheckForUpdate(bool byUser)
 {
-	if (!JUpdater_CheckInternet()) {
-		if (byUser) ShowFastTip(L"\u5f53\u524d\u6ca1\u6709\u53ef\u7528\u7684\u7f51\u7edc\u8fde\u63a5");
+	// 并发门。原子交换保证只有第一次点击会起线程：第二次点击如果探测还在跑，
+	// 直接提示并返回，而不是再起一个线程 —— 两个线程各自弹一次结果，先后无法
+	// 保证，表现出来就是「点了没反应，再点一下忽然说已是最新版本」。
+	if (updateProbeInFlight.exchange(true)) {
+		if (byUser) ShowFastTip(L"\u6b63\u5728\u68c0\u67e5\u66f4\u65b0\uff0c\u8bf7\u7a0d\u5019");
 		return;
 	}
+
+	// 联网预检曾经放在这里，走的是 WinINet；本进程里 WinINet 是坏的，它可能卡住
+	// UI 线程好几秒。现在挪进探测线程（见 UpdateProbeThread），点下去立刻有反应。
 
 	// 探测放到**工作线程**里跑，原因有两条：
 	//
@@ -6205,6 +6247,7 @@ void MainWindow::CheckForUpdate(bool byUser)
 	// 2) 体验。探测最坏要等几秒，放在 UI 线程会把界面冻住。
 	UpdateProbeContext* context = new (std::nothrow) UpdateProbeContext();
 	if (!context) {
+		updateProbeInFlight = false;
 		if (byUser) ShowFastTip(L"\u5185\u5b58\u4e0d\u8db3\uff0c\u65e0\u6cd5\u68c0\u67e5\u66f4\u65b0");
 		return;
 	}
@@ -6214,10 +6257,15 @@ void MainWindow::CheckForUpdate(bool byUser)
 	HANDLE thread = CreateThread(nullptr, 0, UpdateProbeThread, context, 0, nullptr);
 	if (!thread) {
 		delete context;
+		updateProbeInFlight = false;
 		if (byUser) ShowFastTip(L"\u65e0\u6cd5\u542f\u52a8\u66f4\u65b0\u68c0\u67e5");
 		return;
 	}
 	CloseHandle(thread);
+	// 按钮立刻换成「检查中…」并置灰，这是唯一能一直撑到结果回来的视觉反馈：
+	// 浮层只有 4 秒，而一次探测最坏要走一遍子进程，中间那段原本是一片空白，
+	// 看上去就是卡死。
+	InvalidateRect(_hWnd, nullptr, FALSE);
 	if (byUser) ShowFastTip(L"\u6b63\u5728\u68c0\u67e5\u66f4\u65b0\u2026");
 }
 
@@ -6517,16 +6565,38 @@ void MainWindow::ApplyDialogOcclusion()
 
 void MainWindow::FinishUpdateProbe(const UpdateProbeContext& probe)
 {
+	// 第一件事永远是解锁并发门并重绘按钮。放在最前面是因为下面每条路径都可能
+	// 提前 return —— 漏掉一处，按钮就会永久停在「检查中…」，那比没有状态更糟。
+	updateProbeInFlight = false;
+	InvalidateRect(_hWnd, nullptr, FALSE);
+
+	// 把这一轮的结果和耗时落进日志。之前这条链路只有失败才写日志，成功静默；
+	// 于是「第一次点没反应」只能靠猜是握手慢、子进程慢还是读文件慢。
+	if (currentLogger) {
+		currentLogger->LogInfo(L"更新探测完成：ok=%d 路径=%s version=\"%s\" 耗时=%llu ms",
+			probe.ok ? 1 : 0,
+			probe.offline ? L"未联网" : (probe.viaSubprocess ? L"子进程" : L"进程内"),
+			probe.manifest.version,
+			static_cast<unsigned long long>(probe.startedAt ? GetTickCount64() - probe.startedAt : 0));
+	}
+
+	if (probe.offline) {
+		if (probe.byUser) ShowFastTip(L"\u5f53\u524d\u6ca1\u6709\u53ef\u7528\u7684\u7f51\u7edc\u8fde\u63a5");
+		return;
+	}
 	if (!probe.ok) {
 		// 一句"无法获取更新信息"会把三种完全不同的失败混成同一个现象：
 		// 网络不通、服务器没给时效票据、本机时间和服务器差太多。
 		// 有具体原因就直接摆在卡片上，用户才好判断是等一会儿再试还是去对时。
+		// 用户主动点的这次一律用卡片：浮层 4 秒就没了，失败容易看着像没反应。
 		const std::wstring reason = probe.manifest.error;
 		if (!reason.empty()) {
 			FailUpdateDialog(L"无法获取更新信息：" + reason);
 		}
 		else if (probe.byUser) {
-			ShowFastTip(L"\u65e0\u6cd5\u83b7\u53d6\u66f4\u65b0\u4fe1\u606f");
+			FailUpdateDialog(probe.viaSubprocess
+				? L"无法获取更新信息：内置更新程序没有返回有效清单"
+				: L"无法获取更新信息");
 		}
 		return;
 	}

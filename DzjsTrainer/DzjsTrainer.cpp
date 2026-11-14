@@ -9,10 +9,49 @@
 #include <dbghelp.h>
 #include <exception>
 
+// SSPI 预热要用 sspi.h，而 SECURITY_WIN32 必须在它之前定义，否则头文件直接
+// 报错。只有这个翻译单元需要 SSPI，所以不放进 stdafx.h。
+#define SECURITY_WIN32
+#include <sspi.h>
+#pragma comment(lib, "Secur32.lib")
+
 extern int RunHeartbeatWatchdogMode();
 
 JTApp * currentApp = nullptr;
 LoggerInternal * currentLogger = nullptr;
+
+// 启动预热的结果。这里不能只写日志：日志文件要等 JTApp 建好、拿到运行目录之后
+// 才打开，此时写进去的内容会掉在控制台输出上（GUI 进程没有控制台），文件里
+// 一个字都不会留下。所以把状态码存进全局，由更新探测线程连同复测一起记录。
+unsigned g_sspiEarlySchannel = 0xFFFFFFFFU;
+unsigned g_sspiEarlyNegotiate = 0xFFFFFFFFU;
+
+// 启动最早期预热 SSPI —— 在加载任何驱动、建立自保护之前，先把 Schannel 和
+// Negotiate 的出站凭据各取一遍。
+//
+// 背景：本进程里 WinHttpSendRequest 一直返回 SEC_E_SECPKG_NOT_FOUND
+// (0x80090305)，而同一份代码编成独立夹具、或跑在更新器子进程里都正常。
+// secur32 的安全包列表是进程本地缓存、只在首次使用时通过 LPC 向 lsass 枚举
+// 一次，失败后不会自愈 —— 所以把那次初始化提前到一切干扰之前，并留下状态码：
+//   成功 —— 之后进程内 TLS 若仍然失败，说明是启动期某个动作把已建好的状态
+//           破坏了，可以对着 SspiDiag 的日志继续缩小范围；
+//   失败 —— 进程一出生就没有可用的 Schannel，与后续动作无关。
+static void WarmupSspiEarly()
+{
+	auto acquire = [](const wchar_t* package) -> SECURITY_STATUS {
+		CredHandle credential{};
+		TimeStamp expiry{};
+		const SECURITY_STATUS status = AcquireCredentialsHandleW(nullptr,
+			const_cast<LPWSTR>(package), SECPKG_CRED_OUTBOUND,
+			nullptr, nullptr, nullptr, nullptr, &credential, &expiry);
+		if (status == SEC_E_OK) FreeCredentialsHandle(&credential);
+		return status;
+	};
+	const SECURITY_STATUS schannel = acquire(L"Schannel");
+	const SECURITY_STATUS negotiate = acquire(L"Negotiate");
+	g_sspiEarlySchannel = static_cast<unsigned>(schannel);
+	g_sspiEarlyNegotiate = static_cast<unsigned>(negotiate);
+}
 
 BOOL GenerateCrashInfo(PEXCEPTION_POINTERS pExInfo, LPCWSTR info_file_name, LPCWSTR file_name, SYSTEMTIME tm, LPCWSTR dir) {
 	FILE*fp = NULL;
@@ -161,6 +200,8 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR 
 	currentLogger = new LoggerInternal();
 	currentLogger->SetLogOutPut(LogOutPutConsolne);
 	currentLogger->SetLogLevel(LogLevelText);
+	// 在任何驱动加载 / 自保护建立之前跑，理由见函数注释。
+	WarmupSspiEarly();
 	int rs = APP_FAIL_INSTALL;
 	try {
 		currentApp = new JTAppInternal(hInstance);

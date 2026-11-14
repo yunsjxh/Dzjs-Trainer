@@ -16,8 +16,14 @@
 #include <Wininet.h>
 #include <bcrypt.h>
 
+// SECURITY_WIN32 must be defined before sspi.h or it refuses to compile.
+// Defined here (not in stdafx.h) because nothing else in this module needs SSPI.
+#define SECURITY_WIN32
+#include <sspi.h>
+
 #pragma comment(lib, "Wininet.lib")
 #pragma comment(lib, "Bcrypt.lib")
+#pragma comment(lib, "Secur32.lib")
 
 namespace UpdaterManifest {
 
@@ -95,6 +101,108 @@ std::wstring ApexBaseUrl()
 	return ApexEndpoint();
 }
 
+// ---------------------------------------------------------------- SSPI probe
+//
+// Background: in the main program process, WinHTTP's TLS never comes up.
+// WinHttpSendRequest fails with SEC_E_SECPKG_NOT_FOUND (0x80090305) before any
+// handshake bytes are exchanged. The very same code, compiled into a standalone
+// fixture or run in the updater child process, works fine. So the fault is not
+// in the network, the certificate, or the server -- it belongs to that one
+// process's SSPI client.
+//
+// The status code alone is nearly useless: it only says "security package not
+// found". The package list is a per-process cache inside secur32, populated on
+// first use via LPC to lsass. If that first enumeration fails, the cache stays
+// empty and every later AcquireCredentialsHandle returns the same code -- which
+// looks exactly like "Schannel is broken" but is really "one init failed once".
+//
+// Hence the four layers below, probed independently, so one run tells them apart.
+
+static SECURITY_STATUS AcquireOutboundCredential(const wchar_t* package)
+{
+	CredHandle credential{};
+	TimeStamp expiry{};
+	const SECURITY_STATUS status = AcquireCredentialsHandleW(nullptr,
+		const_cast<LPWSTR>(package), SECPKG_CRED_OUTBOUND, nullptr, nullptr,
+		nullptr, nullptr, &credential, &expiry);
+	if (status == SEC_E_OK) FreeCredentialsHandle(&credential);
+	return status;
+}
+
+// Called once, as early as possible in the process lifetime -- before any
+// driver is loaded, before self-protection is armed. If this already fails, the
+// process was born without working SSPI and no amount of ordering will help.
+bool WarmupSspi()
+{
+	const SECURITY_STATUS schannel = AcquireOutboundCredential(L"Schannel");
+	const SECURITY_STATUS negotiate = AcquireOutboundCredential(L"Negotiate");
+	LogTrace(L"SspiWarmup：schannel=0x%08X negotiate=0x%08X",
+		static_cast<unsigned>(schannel), static_cast<unsigned>(negotiate));
+	return schannel == SEC_E_OK;
+}
+
+// Full layered self-check. Runs at most once per process, on the first in-process
+// TLS failure, so it never costs anything on a healthy machine.
+void DiagnoseSspi()
+{
+	static LONG reported = 0;
+	if (InterlockedExchange(&reported, 1) != 0) return;
+
+	// Layer 1: how many packages enumerate at all, and are the two we need there.
+	// An empty list means the lsass LPC never succeeded -- a process-level fault.
+	ULONG packageCount = 0;
+	PSecPkgInfoW packages = nullptr;
+	const SECURITY_STATUS enumStatus = EnumerateSecurityPackagesW(&packageCount, &packages);
+	bool hasSchannel = false;
+	bool hasNegotiate = false;
+	if (enumStatus == SEC_E_OK && packages) {
+		for (ULONG i = 0; i < packageCount; ++i) {
+			if (_wcsicmp(packages[i].Name, L"Schannel") == 0) hasSchannel = true;
+			else if (_wcsicmp(packages[i].Name, L"Negotiate") == 0) hasNegotiate = true;
+		}
+		FreeContextBuffer(packages);
+	}
+	LogTrace(L"SspiDiag：EnumeratePackages status=0x%08X count=%lu schannel=%d negotiate=%d",
+		static_cast<unsigned>(enumStatus), static_cast<unsigned long>(packageCount),
+		hasSchannel ? 1 : 0, hasNegotiate ? 1 : 0);
+
+	// Layer 2: credentials per package. Schannel failing alone points at one
+	// package; both failing points at the enumeration/LPC layer above.
+	LogTrace(L"SspiDiag：AcquireCredentialsHandle(Schannel)=0x%08X",
+		static_cast<unsigned>(AcquireOutboundCredential(L"Schannel")));
+	LogTrace(L"SspiDiag：AcquireCredentialsHandle(Negotiate)=0x%08X",
+		static_cast<unsigned>(AcquireOutboundCredential(L"Negotiate")));
+
+	// Layer 3: CNG. Schannel's primitives come from here, so a failure at this
+	// level means the problem is below SSPI, not inside the package.
+	BCRYPT_ALG_HANDLE algorithm = nullptr;
+	const NTSTATUS cryptStatus = BCryptOpenAlgorithmProvider(&algorithm,
+		BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+	LogTrace(L"SspiDiag：BCryptOpenAlgorithmProvider(sha256)=0x%08X",
+		static_cast<unsigned>(cryptStatus));
+	if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
+
+	// Layer 4: module inventory. "already loaded" and "cannot be loaded" are
+	// completely different answers and must not be folded into one line.
+	const wchar_t* const modules[] = {
+		L"secur32.dll", L"schannel.dll", L"bcrypt.dll",
+		L"bcryptprimitives.dll", L"winhttp.dll", L"sspicli.dll",
+	};
+	for (const wchar_t* module : modules) {
+		const HMODULE loaded = GetModuleHandleW(module);
+		if (loaded) {
+			LogTrace(L"SspiDiag：module %s loaded base=%p", module,
+				static_cast<void*>(loaded));
+			continue;
+		}
+		SetLastError(0);
+		const HMODULE tried = LoadLibraryW(module);
+		LogTrace(L"SspiDiag：module %s NOT loaded, LoadLibrary=%p err=%lu", module,
+			static_cast<void*>(tried), static_cast<unsigned long>(GetLastError()));
+		if (tried) FreeLibrary(tried);
+	}
+}
+
 // ---------------------------------------------------------------- HTTP
 
 // 用 WinHTTP 而不是 WinINet。
@@ -154,6 +262,10 @@ static bool HttpGetWOnce(const std::wstring& url, std::string& body, std::string
 	// 发送和接收分开记日志：合成一个条件时只能看到"请求发送失败"，无法区分是
 	// 握手失败还是 HTTP 层失败。
 	BOOL sent = FALSE;
+	// WinHttpSendRequest 失败时不设 Win32 last error，之前这里直接读 GetLastError()
+	// 记出过 err=183(ERROR_ALREADY_EXISTS) 这种纯属残留的假数字。存下来只把它
+	// 一个来源用到底。
+	DWORD sendError = 0;
 	if (request) {
 		LogTrace(L"更新探测：目标 host=%s port=%u path=%s secure=%d",
 			host, static_cast<unsigned>(parts.nPort), path,
@@ -161,7 +273,13 @@ static bool HttpGetWOnce(const std::wstring& url, std::string& body, std::string
 		sent = WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
 			WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
 		if (!sent) {
-			LogTrace(L"更新探测：SendRequest 失败 err=%lu", GetLastError());
+			sendError = GetLastError();
+			LogTrace(L"更新探测：SendRequest 失败 err=%lu", sendError);
+			// 0x80090305 = SEC_E_SECPKG_NOT_FOUND: the TLS state machine never
+			// started because the security package itself could not be resolved.
+			// Dump all four layers so the next run is actionable rather than just
+			// "it failed again".
+			if (sendError == 0x80090305UL) DiagnoseSspi();
 		}
 	}
 	BOOL received = FALSE;
@@ -223,7 +341,7 @@ static bool HttpGetWOnce(const std::wstring& url, std::string& body, std::string
 		}
 	}
 	else if (request) {
-		LogTrace(L"更新探测：请求发送失败 err=%lu url=%s", GetLastError(), url.c_str());
+		LogTrace(L"更新探测：请求发送失败 err=%lu url=%s", sendError, url.c_str());
 	}
 	if (request) WinHttpCloseHandle(request);
 	if (connection) WinHttpCloseHandle(connection);

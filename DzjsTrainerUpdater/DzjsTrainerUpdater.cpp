@@ -34,6 +34,18 @@ UPEXPORT_CFUNC(BOOL) JUpdater_CheckInternet()
 	return InternetGetConnectedState(NULL, 0);
 }
 
+// SSPI 预热与自检。两者都只在主程序进程里需要：更新器自己跑在干净进程里，
+// 从来不出现 SEC_E_SECPKG_NOT_FOUND。
+UPEXPORT_CFUNC(BOOL) JUpdater_WarmupSspi()
+{
+	return UpdaterManifest::WarmupSspi() ? TRUE : FALSE;
+}
+
+UPEXPORT_CFUNC(VOID) JUpdater_DiagnoseSspi()
+{
+	UpdaterManifest::DiagnoseSspi();
+}
+
 // 只读探测：拉清单、填进定长缓冲。不下载、不替换、无副作用。
 UPEXPORT_CFUNC(BOOL) JUpdater_FetchManifest(JUpdaterManifestInfo* info)
 {
@@ -275,6 +287,8 @@ UPEXPORT_CFUNC(BOOL) JUpdater_ProbeManifest(JUpdaterManifestInfo* info)
 
 	const LPCWSTR currentDir = JTAppGetCurrentDirDirect();
 	Logger* logger = JTAppGetLoggerDirect();
+	// 整个探测（释放更新器 + 起子进程 + 等它 + 读回清单）的起点。
+	const ULONGLONG probeStartedAt = GetTickCount64();
 
 	std::wstring updaterPath;
 	if (!ExtractBundledUpdater(currentDir, updaterPath)) {
@@ -326,13 +340,20 @@ UPEXPORT_CFUNC(BOOL) JUpdater_ProbeManifest(JUpdaterManifestInfo* info)
 
 	if (CreateProcessW(updaterPath.c_str(), commandLine.data(), nullptr, nullptr, FALSE,
 		CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
-		WaitForSingleObject(process.hProcess, 30000);
+		const ULONGLONG launchedAt = GetTickCount64();
+		const DWORD waitResult = WaitForSingleObject(process.hProcess, 30000);
 		DWORD exitCode = 1;
 		GetExitCodeProcess(process.hProcess, &exitCode);
 		CloseHandle(process.hThread);
 		CloseHandle(process.hProcess);
-		ok = exitCode == 0;
-		if (!ok && logger) logger->LogError2(L"更新器取清单失败：exit=%lu", exitCode);
+		ok = waitResult == WAIT_OBJECT_0 && exitCode == 0;
+		// 成功也要记。之前只记失败，于是"第一次点没反应"这类现象没有数据可查：
+		// 分不清是子进程起不来、跑得慢，还是跑完了但清单没读回来。
+		if (logger) {
+			logger->LogError2(L"探测子进程：wait=%lu exit=%lu 耗时=%llu ms",
+				static_cast<unsigned long>(waitResult), static_cast<unsigned long>(exitCode),
+				static_cast<unsigned long long>(GetTickCount64() - launchedAt));
+		}
 	} else if (logger) {
 		// 先把错误码存下来：后面几次调用会覆盖 GetLastError。
 		const DWORD launchError = GetLastError();
@@ -401,6 +422,10 @@ UPEXPORT_CFUNC(BOOL) JUpdater_ProbeManifest(JUpdaterManifestInfo* info)
 		HANDLE file = CreateFileW(tempFile, GENERIC_READ, FILE_SHARE_READ, nullptr,
 			OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 		if (file == INVALID_HANDLE_VALUE) {
+			if (logger) {
+				logger->LogError2(L"探测：子进程退出了但清单文件打不开 err=%lu 路径=%s",
+					static_cast<unsigned long>(GetLastError()), tempFile);
+			}
 			ok = FALSE;
 		} else {
 			std::string text;
@@ -411,10 +436,21 @@ UPEXPORT_CFUNC(BOOL) JUpdater_ProbeManifest(JUpdaterManifestInfo* info)
 			CloseHandle(file);
 			ParseManifestText(text, info);
 			ok = info->version[0] != L'\0' && info->url[0] != L'\0';
+			// 清单文件在、但解析出来是空的：把文件长度和解析到的字段一起记下来。
+			// 这条以前是静默失败，最终只表现为界面上没有结果。
+			if (!ok && logger) {
+				logger->LogError2(L"探测：清单内容不完整 文件=%llu 字节 version=\"%s\" url=\"%s\"",
+					static_cast<unsigned long long>(text.size()), info->version, info->url);
+			}
 		}
 	}
 
 	DeleteFileW(tempFile);
+	if (logger) {
+		logger->LogError2(L"探测：结束 ok=%d version=\"%s\" 总耗时=%llu ms",
+			ok ? 1 : 0, info->version,
+			static_cast<unsigned long long>(GetTickCount64() - probeStartedAt));
+	}
 	return ok ? TRUE : FALSE;
 }
 

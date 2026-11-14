@@ -35,4 +35,15 @@ std::wstring ApexBaseUrl();
 // 缺失的分量按 0 处理（1.0.5 与 1.0.5.0 视为相同）。
 int CompareVersions(const std::wstring& left, const std::wstring& right);
 
+// 启动最早期调一次：先把 Schannel/Negotiate 的出站凭据取一遍，让 secur32 的
+// 进程本地包列表在那之前就初始化好。主程序进程里的 WinHTTP TLS 一直报
+// SEC_E_SECPKG_NOT_FOUND，而同一份代码在独立进程里正常 —— 如果问题出在
+// "首次枚举被启动期的某个动作搞坏"，那提前做掉就能修好；如果这里就失败，
+// 说明进程一出生就没有可用的 SSPI，与后续动作无关。返回值即 Schannel 是否可用。
+bool WarmupSspi();
+
+// 分层自检：包枚举 / 每个包的凭据 / CNG 提供程序 / 模块加载状态。
+// 每进程只跑一次，写在进程内 TLS 失败之后调用。
+void DiagnoseSspi();
+
 } // namespace UpdaterManifest
