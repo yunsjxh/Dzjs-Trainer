@@ -25,3 +25,9 @@ ticket-sign.pub.pem
 # 更新后台的管理口令（admin.php 在 UPDATE_ADMIN_PASSWORD 缺失时读它）。
 # 它等价于"能上传更新包并改写清单"的权限，与服务端私钥同一个级别，不进版本库。
 admin-password.php
+
+# 站点同步的运行期产物。version.txt 由 sync-version.php 按 GitHub Releases 生成，
+# 放在站点根目录（不是本目录），这里忽略的是她的备份与同步日志。
+sync-version.log
+.github-token.php
+github-token.php

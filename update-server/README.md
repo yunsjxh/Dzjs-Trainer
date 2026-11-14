@@ -34,6 +34,56 @@ UPDATE_DOWNLOAD_SCHEME=https
 
 如果使用 PHP-FPM/Nginx，请确认 `releases/` 可直接下载，并将 PHP `upload_max_filesize` 和 `post_max_size` 设置为至少 `200M`。
 
+## 站点更新日志自动同步
+
+站点首页的版本号与更新日志读的是站点根目录的 `version.txt`（`script.js` 里 `fetch('version.txt')`）。
+这个文件由 `sync-version.php` 从 GitHub Releases 生成，不需要手改。
+
+```text
+格式（块之间空行分隔）：
+v1.0.4.2          ← 第 1 行版本号，第一块驱动全站版本号显示
+2026.11.14        ← 第 2 行日期（published_at 按北京时间落日期）
+版本 v1.0.4.2     ← 第 3 行标题
+- 一条更新点       ← 其余每行一条
+```
+
+| 文件 | 作用 |
+|---|---|
+| `sync-version-lib.php` | 拉 API、把 release 正文转成上述纯文本、原子写入 |
+| `sync-version.php` | 命令行入口，只允许 CLI（HTTP 访问直接 403） |
+
+```bash
+php sync-version.php              # 内容没变就不动文件
+php sync-version.php --dry-run    # 只打印，不落盘
+php sync-version.php --force      # 内容相同也重写
+```
+
+定时任务（每小时第 17 分，`flock` 防重入）：
+
+```cron
+17 * * * * flock -xn /tmp/dzjs-sync-version.lock /usr/bin/sudo -u www /www/server/php/82/bin/php "/www/wwwroot/DzjsTrainer.云散皆星河.cn/update-server/sync-version.php" >> "/www/wwwroot/DzjsTrainer.云散皆星河.cn/update-server/sync-version.log" 2>&1
+```
+
+后台 `admin.php` 也有「立即同步 GitHub 更新」按钮。它不调外部进程（宝塔默认禁用
+`exec`/`shell_exec`），而是 `require_once` 同步库在同一次请求里跑完。
+
+几个刻意的取舍：
+
+- **只同步 `version.txt`，不自动覆盖任何 PHP**。这些文件里有 `admin-password.php`、
+  `ticket-sign.php`、`manifest.json`、`releases/`，自动覆盖等于把线上发布权限交给一次误提交。
+- 正文里 markdown 的折行会按字符类型拼接：中文与中文直接相连，中英文之间补空格，
+  否则会出现「三段 （%u.%u.%u）」这种空洞。
+- 列表项不足 3 条时用段落首句补；列表项本身够多就不拿段落凑数。
+- `### 发布包说明` 里的元信息（主程序版本、目标平台、仅包含主程序…）会被过滤，
+  它们对首页读者没有意义。
+- 某个 release 正文过滤完一条不剩（`v1.0.0` 就是这种），沿用现有文件里同名版本块，
+  避免自动同步把站点上原本更详细的内容清空。
+- 非 `v` 开头的手写块（例如「项目翻新」）原样保留在末尾。
+- 内容没有变化时不写文件、不改 mtime；变化时先备份 `version.txt.bak` 再原子替换。
+
+可选：在 `github-token.php` 里 `<?php return 'ghp_xxx';`（或设环境变量 `GITHUB_TOKEN`），
+把 API 限额从 60 次/小时提到 5000。仓库是公开的，不配也能用。
+
 ## 时效票据（清单接口必需）
 
 客户端取清单时带上一次性 nonce 和本机时间戳，服务端验过格式后在响应头签回一张 5 分钟有效的票据；客户端用**内置公钥**验签，再验 nonce 回显、时间窗、正文哈希，四项全过才采信清单。所以 `?manifest=1` 不再是一个裸 GET。
