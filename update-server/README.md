@@ -69,8 +69,8 @@ php sync-version.php --force      # 内容相同也重写
 
 几个刻意的取舍：
 
-- **只同步 `version.txt`，不自动覆盖任何 PHP**。这些文件里有 `admin-password.php`、
-  `ticket-sign.php`、`manifest.json`、`releases/`，自动覆盖等于把线上发布权限交给一次误提交。
+- **这个通道只写 `version.txt`**，不碰任何 PHP 或页面文件。会覆盖 `download/index.php`
+  这类站点文件的只有下一节的 `sync-site.php`，它有独立的白名单。
 - 正文里 markdown 的折行会按字符类型拼接：中文与中文直接相连，中英文之间补空格，
   否则会出现「三段 （%u.%u.%u）」这种空洞。
 - 列表项不足 3 条时用段落首句补；列表项本身够多就不拿段落凑数。
@@ -83,6 +83,53 @@ php sync-version.php --force      # 内容相同也重写
 
 可选：在 `github-token.php` 里 `<?php return 'ghp_xxx';`（或设环境变量 `GITHUB_TOKEN`），
 把 API 限额从 60 次/小时提到 5000。仓库是公开的，不配也能用。
+
+## 站点静态文件自动部署
+
+仓库 `website/` 下的部分文件会同步到站点根目录，改 GitHub 就上线。
+
+```bash
+php sync-site.php              # 内容没变就不动文件
+php sync-site.php --dry-run    # 只列出会更新哪些文件
+php sync-site.php --force      # 内容相同也重写
+```
+
+| 文件 | 作用 |
+|---|---|
+| `sync-site-lib.php` | 拉 tree/blob、比对、原子写入、备份 |
+| `sync-site.php` | 命令行入口，只允许 CLI（HTTP 访问直接 403） |
+
+定时任务（每小时第 27 分，与 version 同步错开）：
+
+```cron
+27 * * * * flock -xn /tmp/dzjs-sync-site.lock /usr/bin/sudo -u www /www/server/php/82/bin/php "/www/wwwroot/DzjsTrainer.云散皆星河.cn/update-server/sync-site.php" >> "/www/wwwroot/DzjsTrainer.云散皆星河.cn/update-server/sync-site.log" 2>&1
+```
+
+后台 `admin.php` 也有「立即部署站点文件」按钮。
+
+### 白名单（默认拒绝，不是黑名单）
+
+| 会部署 | 不部署 |
+|---|---|
+| `script.js`、`404.html`、`download/index.php`、`assets/*` 下的图片 | `index.html`、`styles.css`、`version.txt`、`tools/`、`.verification/` |
+
+`index.html` 与 `styles.css` 是**维护者自己维护的文案版本**，跟仓库里面向开源/
+合规的措辞不是同一份 —— 自动部署绝不能把它们冲掉，所以白名单里没有它们，
+`dzjs_site_allowed()` 里还额外写了一条显式拒绝，防止将来被误加进去。
+
+将来仓库新增的文件也不会自动上线；要让它上线，必须在 `dzjs_site_allowed()` 里
+明确加一条。这个方向是刻意的：自动部署的失败方向应该是「没更新」，不是「覆盖了不该覆盖的」。
+
+### 几个实现取舍
+
+- **用 git blob SHA 判断有没有变化**，不维护状态文件：`sha1("blob <字节数>\0" + 内容)`
+  与 tree 里记的 SHA 一致就跳过。状态文件丢了也只是重算一次，不会误判。
+- 落盘前再校验一次：blob 接口给的内容算出的 SHA 必须等于 tree 里的 SHA，否则报错不写。
+- 只差换行（服务器 CRLF / 仓库 LF）时跳过。PHP、JS 执行没有区别，不值得为它改一个
+  本来跑得好好的文件。
+- 覆盖前备份到 `.site-backup/<时间戳>/`，只保留最近 5 批；nginx 侧对该目录返回 404。
+- 两个 `*-lib.php` 都带 include 守卫：直接当 URL 打会 403，只有 CLI 入口和
+  `admin.php` 能用。
 
 ## 时效票据（清单接口必需）
 

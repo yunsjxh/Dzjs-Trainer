@@ -9,6 +9,14 @@
 // 因此这里只做一件事：把 release 的 markdown 正文压成「标题 + 短条目」的纯文本。
 // 不做 HTML 渲染，前端是用 textContent 赋值的。
 
+// 只能被 CLI 入口或后台页面 include，不能当 URL 直接访问（否则是个无输出的 200 入口）。
+if (!defined('DZJS_LIB_CONTEXT')) {
+    http_response_code(403);
+    header('Content-Type: text/plain; charset=utf-8');
+    echo "Forbidden\n";
+    exit(1);
+}
+
 if (!defined('DZJS_SYNC_REPO')) define('DZJS_SYNC_REPO', 'yunsjxh/Dzjs-Trainer');
 if (!defined('DZJS_SYNC_MAX_RELEASES')) define('DZJS_SYNC_MAX_RELEASES', 20);
 if (!defined('DZJS_SYNC_MAX_ITEMS')) define('DZJS_SYNC_MAX_ITEMS', 8);

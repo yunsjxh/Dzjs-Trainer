@@ -16,6 +16,7 @@ if (PHP_SAPI !== 'cli') {
     exit(1);
 }
 
+define('DZJS_LIB_CONTEXT', 1);
 require __DIR__ . '/sync-version-lib.php';
 
 $options = getopt('', array('dry-run', 'force', 'repo:', 'target:', 'help'));

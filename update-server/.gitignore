@@ -29,5 +29,9 @@ admin-password.php
 # 站点同步的运行期产物。version.txt 由 sync-version.php 按 GitHub Releases 生成，
 # 放在站点根目录（不是本目录），这里忽略的是她的备份与同步日志。
 sync-version.log
+
+# 站点静态文件部署（sync-site.php）的日志与被覆盖文件的备份。
+sync-site.log
+.site-backup/
 .github-token.php
 github-token.php
