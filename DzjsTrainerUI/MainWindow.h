@@ -324,6 +324,8 @@ private:
 	RECT exportLogRect{};
 	RECT saveSettingsRect{};
 	RECT advancedSettingsRect{};
+	// 「防护策略」右上角那个按钮只占一块位置，按驱动状态二选一命中：
+	// 没加载时是绿色「加载主驱动」(driverLoadRect)，在跑时是「卸载主驱动」。
 	RECT driverLoadRect{};
 	RECT driverUnloadRect{};
 	DriverStatusInfo driverStatus;

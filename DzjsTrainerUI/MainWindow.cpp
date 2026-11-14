@@ -4390,16 +4390,18 @@ void MainWindow::PaintProtection(Graphics& g, int width, int height, int offsetY
 	const float toggleRowH = (std::max)(62.0f, (std::min)(80.0f, toggleSlot - 14.0f));
 	SoftShadow(g, RectF(x, y, w, protectionCardH), 12, darkMode);
 	FillRound(g, RectF(x, y, w, protectionCardH), 12, C(darkMode, 255, 255, 255, 33, 40, 37));
-	// 页面顶部这一行要放三样东西：标题 + 副标题、「驱动状态」框、「卸载主驱动」。
+	// 页面顶部这一行要放三样东西：标题 + 副标题、「驱动状态」框、驱动按钮。
+	// 按钮是个开关：驱动在跑就是「卸载主驱动」，没跑就是「加载主驱动」。
 	// 状态框贴在按钮左边，窄窗口放不下就整块收起，副标题按剩余宽度截断，
 	// 免得三块叠在一起。
-	const float unloadX = x + w - 150.0f;
-	const float unloadY = y + 20.0f;
+	const float driverBtnW = 126.0f;
+	const float driverBtnX = x + w - 24.0f - driverBtnW;
+	const float driverBtnY = y + 20.0f;
 	const float statusW = 292.0f;
-	const float statusX = unloadX - 12.0f - statusW;
+	const float statusX = driverBtnX - 12.0f - statusW;
 	// 放得下就显示，放不下整块收起；阈值按副标题还能留出一整行来定。
 	const bool showDriverStatus = statusX - (x + 24.0f) >= 300.0f;
-	const float headingRight = showDriverStatus ? statusX - 16.0f : unloadX - 16.0f;
+	const float headingRight = showDriverStatus ? statusX - 16.0f : driverBtnX - 16.0f;
 	if (!replacementPage) {
 		Text(g, L"\u884c\u4e3a\u63a7\u5236", x + 24, y + 20, 200, 28, 16, FontStyleBold, C(darkMode, 24, 30, 27, 226, 233, 229));
 		Text(g, L"\u9ed8\u8ba4\u53ea\u8bb0\u5f55\u4e0d\u62e6\u622a\uff1b\u6253\u5f00\u54ea\u4e00\u9879\uff0c\u5bf9\u5e94\u7684\u62e6\u622a\u624d\u4f1a\u751f\u6548",
@@ -4438,14 +4440,27 @@ void MainWindow::PaintProtection(Graphics& g, int width, int height, int offsetY
 		saveSettingsRect = {};
 	}
 	if (!replacementPage) {
-		driverUnloadRect = { static_cast<LONG>(unloadX), static_cast<LONG>(unloadY),
-			static_cast<LONG>(unloadX + 126), static_cast<LONG>(unloadY + 36) };
-		PaintButton(g, RectF(unloadX, unloadY, 126, 36), L"\u5378\u8f7d\u4e3b\u9a71\u52a8", 44,
-			ButtonStyle::Danger, 18);
+		const DriverStatusInfo& status = CurrentDriverStatus();
+		// 服务还在跑（哪怕句柄不在本进程）就算已加载，这时给的动作是卸载；
+		// 反过来按钮换成主色 —— 绿底一眼看出这是下一步该点的。
+		const bool driverActive = status.handleOpen || status.serviceRunning;
+		const RECT driverButton = { static_cast<LONG>(driverBtnX), static_cast<LONG>(driverBtnY),
+			static_cast<LONG>(driverBtnX + driverBtnW), static_cast<LONG>(driverBtnY + 36) };
+		if (driverActive) {
+			driverLoadRect = {};
+			driverUnloadRect = driverButton;
+			PaintButton(g, RectF(driverBtnX, driverBtnY, driverBtnW, 36), L"\u5378\u8f7d\u4e3b\u9a71\u52a8", 44,
+				ButtonStyle::Danger, 18);
+		}
+		else {
+			driverLoadRect = driverButton;
+			driverUnloadRect = {};
+			PaintButton(g, RectF(driverBtnX, driverBtnY, driverBtnW, 36), L"\u52a0\u8f7d\u4e3b\u9a71\u52a8", 43,
+				ButtonStyle::Primary, 18);
+		}
 		// 驱动状态框：跟按钮竖直居中，动手之前先看清现在到底连没连上。
 		if (showDriverStatus) {
-			const DriverStatusInfo& status = CurrentDriverStatus();
-			const float boxY = unloadY - 5.0f;
+			const float boxY = driverBtnY - 5.0f;
 			FillRound(g, RectF(statusX, boxY, statusW, 46), 10, C(darkMode, 245, 248, 246, 43, 49, 46));
 			StrokeRound(g, RectF(statusX, boxY, statusW, 46), 10, C(darkMode, 226, 234, 229, 44, 52, 48));
 			Color stateColor;
@@ -7621,16 +7636,23 @@ void MainWindow::HandleClick(POINT point)
 		}
 		if (Hit(driverLoadRect, point)) {
 			JTAppRunOperationDirect(AppOperationForceLoadDriver);
-			// 状态框有 1.5 秒缓存，这一步之后立刻重采，不然要等下一次重绘才变。
+			// 状态框有 1.5 秒缓存，这一步之后立刻重采，不然按钮要等下一次
+			// 重绘才从「加载」翻回「卸载」。
 			InvalidateDriverStatus();
-			ShowFastTip(XDriverLoaded() ? L"\u9a71\u52a8\u5df2\u52a0\u8f7d" : L"\u9a71\u52a8\u52a0\u8f7d\u5931\u8d25");
+			const DriverStatusInfo& status = CurrentDriverStatus();
+			if (status.handleOpen) ShowFastTip(L"驱动已加载");
+			else if (status.serviceRunning) ShowFastTip(L"驱动已在运行，但没连上");
+			else ShowFastTip(L"驱动加载失败");
 			InvalidateRect(_hWnd, nullptr, FALSE);
 			return;
 		}
 		if (Hit(driverUnloadRect, point)) {
 			const bool unloaded = JTAppRunOperationDirect(AppOperationUnLoadDriver) != nullptr;
 			InvalidateDriverStatus();
-			ShowFastTip(unloaded ? L"\u9a71\u52a8\u5df2\u5378\u8f7d" : L"\u9a71\u52a8\u5378\u8f7d\u5931\u8d25");
+			const DriverStatusInfo& status = CurrentDriverStatus();
+			// 卸干净了按钮就翻成绿色「加载主驱动」；还在 STOP_PENDING 时别急着改口。
+			if (!status.handleOpen && !status.serviceRunning) ShowFastTip(L"驱动已卸载");
+			else ShowFastTip(unloaded ? L"驱动正在卸载，稍等再看" : L"驱动卸载失败");
 			InvalidateRect(_hWnd, nullptr, FALSE);
 			return;
 		}

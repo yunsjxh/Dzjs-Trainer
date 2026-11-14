@@ -36,12 +36,32 @@ constexpr BYTE kTokenKeyPartB[32] = {
     0xD0, 0x0F, 0x84, 0x69, 0xA3, 0x0C, 0x64, 0x8C
 };
 
+// Why the embedded token could not be used. "token unload failed" alone sends
+// people looking at the driver, while the real reason is usually this side:
+// a placeholder resource, a reissued token, or a CNG call that refused.
+struct TokenFailureInfo {
+    const wchar_t* stage;
+    DWORD detail;
+    DWORD extra;
+};
+
+static TokenFailureInfo g_tokenFailure = { L"none", 0, 0 };
+
 static BOOL DecryptEmbeddedUnloadToken(
     const BYTE* encrypted,
     DWORD encryptedSize,
-    JDRV_UNLOAD_TOKEN* token)
+    JDRV_UNLOAD_TOKEN* token,
+    TokenFailureInfo* info)
 {
-    if (!encrypted || !token || encryptedSize < kEncryptedTokenHeaderSize) return FALSE;
+    if (!encrypted || !token) {
+        info->stage = L"arguments";
+        return FALSE;
+    }
+    if (encryptedSize < kEncryptedTokenHeaderSize) {
+        info->stage = L"short-resource";
+        info->detail = encryptedSize;
+        return FALSE;
+    }
 
     DWORD magic = 0;
     DWORD version = 0;
@@ -51,7 +71,12 @@ static BOOL DecryptEmbeddedUnloadToken(
     memcpy(&cipherSize, encrypted + 24, sizeof(cipherSize));
     if (magic != kEncryptedTokenMagic || version != kEncryptedTokenVersion ||
         cipherSize == 0 || encryptedSize != kEncryptedTokenHeaderSize + cipherSize ||
-        (cipherSize % 16UL) != 0) return FALSE;
+        (cipherSize % 16UL) != 0) {
+        info->stage = L"header";
+        info->detail = magic;
+        info->extra = cipherSize;
+        return FALSE;
+    }
 
     BYTE key[32] = {};
     for (size_t index = 0; index < _countof(key); ++index)
@@ -82,21 +107,33 @@ static BOOL DecryptEmbeddedUnloadToken(
             algorithm, &keyHandle, keyObject.data(), objectLength,
             key, sizeof(key), 0);
     }
-    if (status == 0) status = BCryptDecrypt(
-        keyHandle,
-        const_cast<PUCHAR>(encrypted + kEncryptedTokenHeaderSize), cipherSize,
-        nullptr, iv, sizeof(iv), nullptr, 0, &plainLength,
-        BCRYPT_BLOCK_PADDING);
-    if (status == 0 && plainLength == sizeof(*token)) {
-        plain.resize(plainLength);
+    if (status == 0) {
+        // BCRYPT_BLOCK_PADDING makes the size query report the ciphertext
+        // length, not the plaintext length, so the output buffer has to be
+        // allocated from cipherSize. Resizing it to the queried value and
+        // skipping the second call (the previous shape of this code) meant
+        // the token was never decrypted at all.
+        plain.resize(cipherSize);
+        DWORD outLength = cipherSize;
         status = BCryptDecrypt(
             keyHandle,
             const_cast<PUCHAR>(encrypted + kEncryptedTokenHeaderSize), cipherSize,
-            nullptr, iv, sizeof(iv), plain.data(), plainLength, &plainLength,
+            nullptr, iv, sizeof(iv), plain.data(), outLength, &plainLength,
             BCRYPT_BLOCK_PADDING);
     }
-    if (status == 0 && plainLength == sizeof(*token))
+    if (status != 0) {
+        info->stage = L"bcrypt";
+        info->detail = static_cast<DWORD>(status);
+        info->extra = encryptedSize;
+    }
+    else if (plainLength != sizeof(*token)) {
+        info->stage = L"plain-length";
+        info->detail = plainLength;
+        info->extra = static_cast<DWORD>(sizeof(*token));
+    }
+    else {
         memcpy(token, plain.data(), sizeof(*token));
+    }
 
     if (keyHandle) BCryptDestroyKey(keyHandle);
     if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
@@ -110,16 +147,33 @@ static BOOL DecryptEmbeddedUnloadToken(
 
 static BOOL LoadEmbeddedUnloadToken(JDRV_UNLOAD_TOKEN* token)
 {
-	if (!token || !currentApp) return FALSE;
+	if (!token || !currentApp) {
+		g_tokenFailure.stage = L"app";
+		return FALSE;
+	}
 	HINSTANCE module = currentApp->GetInstance();
 	HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(IDR_DRIVER_UNLOCK_TOKEN), L"BIN");
-	if (!resource) return FALSE;
+	if (!resource) {
+		g_tokenFailure.stage = L"no-resource";
+		g_tokenFailure.detail = GetLastError();
+		return FALSE;
+	}
 	HGLOBAL loaded = LoadResource(module, resource);
 	DWORD size = SizeofResource(module, resource);
-	if (!loaded || !size) return FALSE;
+	if (!loaded || !size) {
+		g_tokenFailure.stage = L"empty-resource";
+		g_tokenFailure.detail = size;
+		return FALSE;
+	}
 	BYTE* raw = static_cast<BYTE*>(LockResource(loaded));
-	if (!raw) return FALSE;
-	return DecryptEmbeddedUnloadToken(raw, size, token);
+	if (!raw) {
+		g_tokenFailure.stage = L"lock-failed";
+		return FALSE;
+	}
+	g_tokenFailure.stage = L"none";
+	g_tokenFailure.detail = 0;
+	g_tokenFailure.extra = 0;
+	return DecryptEmbeddedUnloadToken(raw, size, token, &g_tokenFailure);
 }
 
 BOOL KFShutdown()
@@ -206,7 +260,12 @@ BOOL KFBeforeUnInitDriver()
 		if (!LoadEmbeddedUnloadToken(&token)) {
 			// 先写日志再设置错误码：LogError 内部会调 WriteFile 等 API，
 			// 会把 GetLastError 覆盖掉，调用方就再也读不到真实原因了。
-			currentLogger->LogError(L"Embedded unload token is missing, invalid, or cannot be decrypted");
+			currentLogger->LogError(
+				L"Embedded unload token is missing, invalid, or cannot be decrypted"
+				L" (stage=%s detail=%lu extra=%lu)",
+				g_tokenFailure.stage,
+				g_tokenFailure.detail,
+				g_tokenFailure.extra);
 			SetLastError(ERROR_INVALID_DATA);
 			return false;
 		}
