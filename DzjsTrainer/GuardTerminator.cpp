@@ -274,12 +274,15 @@ bool RunRemediation(Logger* log, HANDLE stopEvent) {
     auto protectors = FindByName(procs, kKnownGuardProcess);
     std::set<DWORD> ignore;
     if (protectors.empty()) {
-        GuardLogSilent(L"GuardTerminator: 未发现 %s，继续等待", kKnownGuardProcess);
-    } else {
-        for (auto& p : protectors) {
-            ignore.insert(p.pid);
-            if (!TerminateAndWait(p, log)) { log->LogError(L"GuardTerminator: 未能全部结束固定守护，中止"); return false; }
-        }
+        // 没有固定守护在跑，就没有要处置的对象。以前这里会空等 60 秒等它
+        // 重新拉起，然后报一条错误，外层每 75 秒再来一轮：极域根本没装或
+        // 没启动时，整份日志就只剩这行错误。外层 15 秒会重新扫一次，那时
+        // 真出现了再处理即可。
+        return true;
+    }
+    for (auto& p : protectors) {
+        ignore.insert(p.pid);
+        if (!TerminateAndWait(p, log)) { log->LogError(L"GuardTerminator: 未能全部结束固定守护，中止"); return false; }
     }
 
     // Step 2: wait for respawn and identify random guardian
@@ -290,7 +293,12 @@ bool RunRemediation(Logger* log, HANDLE stopEvent) {
 		log->LogInfo(L"GuardTerminator: exit requested; respawn wait cancelled");
 		return true;
 	}
-    if (!respawned) { log->LogError(L"GuardTerminator: 超时未发现重新拉起的 %s", kKnownGuardProcess); return false; }
+    if (!respawned) {
+        // 已经结束了已知的守护，60 秒内没看到它被重新拉起，通常说明极域这边
+        // 没有别的看门狗了。这条不是错误，外层下一轮会重新确认。
+        log->LogWarn(L"GuardTerminator: 已结束 %s，60 秒内未见重新拉起", kKnownGuardProcess);
+        return true;
+    }
     GuardLogSilent(L"GuardTerminator: 已发现重新拉起的固定守护: %s", Label(*respawned).c_str());
 
     std::vector<PInfo> procs2;

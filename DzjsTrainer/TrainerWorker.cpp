@@ -946,6 +946,17 @@ bool TrainerWorkerInternal::UnInjectDll(DWORD pid, LPCWSTR moduleName)
 // ===================== 自定义进程注入 =====================
 // 目标由用户在 GUI / 命令行显式指定，不自动扩散到子进程。
 // 32 位目标复用现有 InjectDll；64 位目标交给内嵌的 64 位助手完成。
+// 目标进程已经退出时不用卸载：模块跟着进程一起没了，硬去 OpenProcess 只会
+// 拿到 STATUS_INVALID_CID（0xC000000B），退出日志凭空多两条失败记录。
+static bool IsProcessGone(DWORD pid)
+{
+	HANDLE process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+	if (!process) return GetLastError() == ERROR_INVALID_PARAMETER;
+	const DWORD wait = WaitForSingleObject(process, 0);
+	CloseHandle(process);
+	return wait == WAIT_OBJECT_0;
+}
+
 static void SetCustomInjectStatus(std::wstring* status, const std::wstring& text)
 {
 	if (status) *status = text;
@@ -1241,6 +1252,11 @@ bool TrainerWorkerInternal::IsCustomInjected(DWORD pid)
 void TrainerWorkerInternal::UnloadAllCustomInjected()
 {
 	for (const auto& item : _CustomInjected) {
+		if (IsProcessGone(item.pid)) {
+			currentLogger->LogInfo(L"退出时跳过已退出的自定义注入 pid=%lu name=%s",
+				item.pid, item.name.c_str());
+			continue;
+		}
 		bool ok = false;
 		if (item.is64) {
 			const LPCWSTR dll = currentApp ? currentApp->GetPartFullPath(PART_HOOKER64) : nullptr;

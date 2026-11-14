@@ -41,10 +41,11 @@ else {
 
 $signature = Get-AuthenticodeSignature -LiteralPath $driverOutput
 if ($null -eq $signature.SignerCertificate) { throw "Driver has no embedded signature: $driverOutput" }
-$subject = $signature.SignerCertificate.Subject -replace '^CN=', ''
-if ($subject.Length -ge 2 -and $subject.StartsWith('"') -and $subject.EndsWith('"')) {
-    $subject = $subject.Substring(1, $subject.Length - 2)
-}
+# 运行时用 CertGetNameString(CERT_NAME_SIMPLE_DISPLAY_TYPE) 取签名者名称，
+# PowerShell 这边等价的是 GetNameInfo(SimpleName)：只返回 CN。以前直接剥
+# 'CN=' 前缀，证书主题里还有 O=/C= 时会把整串 DN 写进 pin，永远匹配不上。
+$subject = $signature.SignerCertificate.GetNameInfo(
+    [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
 if ([string]::IsNullOrWhiteSpace($subject)) { throw 'Unable to read the leaf certificate subject' }
 $thumbprint = ($signature.SignerCertificate.Thumbprint -replace '[^0-9A-Fa-f]', '').ToUpperInvariant()
 if ($thumbprint.Length -ne 40) { throw "Unable to read the leaf certificate SHA-1 thumbprint" }

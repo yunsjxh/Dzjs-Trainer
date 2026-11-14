@@ -204,14 +204,16 @@ bool IsPinnedJiYuTestSigner(const std::wstring& publisher, const std::wstring& t
 
 bool IsAcceptedPublisherTrust(LONG trustStatus, const std::wstring& publisher, const std::wstring& thumbprint)
 {
-    if (trustStatus == ERROR_SUCCESS) return IsAllowedDriverPublisher(publisher.c_str());
+    // Neither the pin nor the name list may rescue a bad digest, an expired
+    // certificate or a missing signature.
+    if (trustStatus != ERROR_SUCCESS && trustStatus != CERT_E_UNTRUSTEDROOT) return false;
 
-    // Private test certificates remain acceptable only when both the exact
-    // subject and the pinned leaf thumbprint match the release configuration.
-    // Missing signatures, bad digests, expired certificates, and arbitrary
-    // certificates with the same display name remain rejected.
-    return trustStatus == CERT_E_UNTRUSTEDROOT &&
-        (IsJiYuDriverPublisher(publisher.c_str()) || IsPinnedJiYuTestSigner(publisher, thumbprint));
+    // The pinned signer stands on its own, so the release certificate keeps
+    // working once its root is installed (WinVerifyTrust then returns
+    // ERROR_SUCCESS, where the vendor list alone would not recognise it).
+    if (IsPinnedJiYuTestSigner(publisher, thumbprint)) return true;
+    if (trustStatus == ERROR_SUCCESS) return IsAllowedDriverPublisher(publisher.c_str());
+    return IsJiYuDriverPublisher(publisher.c_str());
 }
 
 std::wstring NormalizeHex(std::wstring value)
