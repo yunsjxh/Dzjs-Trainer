@@ -386,7 +386,9 @@ function dzjs_sync_run(string $targetFile, bool $force = false, bool $dryRun = f
         }
 
         if ($current !== '') {
-            @copy($targetFile, $targetFile . '.bak');
+            // 备份带点前缀：它和 version.txt 在同一个站点根，不加点会被当成静态文件
+            // 直接下载走（虽然内容本身是公开的，但没必要多一个可访问路径）。
+            @copy($targetFile, dirname($targetFile) . '/.version.txt.bak');
         }
         dzjs_sync_write($targetFile, $text);
         $result['ok'] = true;
