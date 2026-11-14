@@ -13,6 +13,7 @@
 #include "SysHlp.h"
 #include "SettingHlp.h"
 #include "RegHlp.h"
+#include <TlHelp32.h>
 
 extern JTApp *currentApp;
 extern LoggerInternal * currentLogger;
@@ -121,6 +122,8 @@ void TrainerWorkerInternal::StopInternal() {
 		KillTimer(hWndMain, TIMER_CK);
 		KillTimer(hWndMain, TIMER_RESET_PID);
 	}
+	// 退出时把用户显式注入的进程全部卸载，避免残留钩子。
+	UnloadAllCustomInjected();
 }
 
 void TrainerWorkerInternal::SetUpdateInfoCallback(TrainerWorkerCallback *callback)
@@ -940,8 +943,325 @@ bool TrainerWorkerInternal::UnInjectDll(DWORD pid, LPCWSTR moduleName)
 	}
 	return result.success;
 }
+// ===================== 自定义进程注入 =====================
+// 目标由用户在 GUI / 命令行显式指定，不自动扩散到子进程。
+// 32 位目标复用现有 InjectDll；64 位目标交给内嵌的 64 位助手完成。
+static void SetCustomInjectStatus(std::wstring* status, const std::wstring& text)
+{
+	if (status) *status = text;
+}
+
+// 32 位目标：FreeLibrary 之前先远程调用 hooks DLL 导出的 VUnloadAll()。
+// DllMain(DLL_PROCESS_DETACH) 不清理钩子，直接卸载会留下悬空 detour，
+// 目标进程下一次调用被钩 API 就跳到已释放内存。64 位侧由助手做同样的两步。
+static void RemoteInvokeVUnloadAll(DWORD pid, LPCWSTR dllPath, LPCWSTR moduleName)
+{
+	if (!dllPath || !*dllPath) return;
+	// 当数据文件映射，不执行 DllMain；导出表仍可读，函数地址-基址即 RVA。
+	const HMODULE local = LoadLibraryExW(dllPath, nullptr, DONT_RESOLVE_DLL_REFERENCES);
+	if (!local) return;
+	const FARPROC proc = GetProcAddress(local, "VUnloadAll");
+	const DWORD rva = proc ? static_cast<DWORD>(
+		reinterpret_cast<const BYTE*>(proc) - reinterpret_cast<const BYTE*>(local)) : 0;
+	FreeLibrary(local);
+	if (!rva) return;
+
+	HMODULE remoteBase = nullptr;
+	const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+	if (snapshot != INVALID_HANDLE_VALUE) {
+		MODULEENTRY32W entry = {};
+		entry.dwSize = sizeof(entry);
+		if (Module32FirstW(snapshot, &entry)) {
+			do {
+				if (_wcsicmp(entry.szModule, moduleName) == 0) { remoteBase = entry.hModule; break; }
+			} while (Module32NextW(snapshot, &entry));
+		}
+		CloseHandle(snapshot);
+	}
+	if (!remoteBase) return;
+	HANDLE process = nullptr;
+	if (!NT_SUCCESS(MOpenProcessNt(pid, &process)) || !process) return;
+	const auto unloadFn = reinterpret_cast<LPTHREAD_START_ROUTINE>(
+		reinterpret_cast<BYTE*>(remoteBase) + rva);
+	const HANDLE thread = CreateRemoteThread(process, nullptr, 0, unloadFn, nullptr, 0, nullptr);
+	if (thread) { WaitForSingleObject(thread, 15000); CloseHandle(thread); }
+	CloseHandle(process);
+}
+
+static std::wstring TrimCustomTarget(const std::wstring& s)
+{
+	size_t b = 0, e = s.size();
+	while (b < e && (s[b] == L' ' || s[b] == L'\t' || s[b] == L'"')) ++b;
+	while (e > b && (s[e - 1] == L' ' || s[e - 1] == L'\t' || s[e - 1] == L'"')) --e;
+	return s.substr(b, e - b);
+}
+static bool IsDecimalCustomTarget(const std::wstring& s)
+{
+	if (s.empty()) return false;
+	for (size_t i = 0; i < s.size(); ++i)
+		if (s[i] < L'0' || s[i] > L'9') return false;
+	return true;
+}
+
+bool TrainerWorkerInternal::ResolveCustomTarget(LPCWSTR target, DWORD* outPid,
+	std::wstring* outName, std::wstring* status)
+{
+	const std::wstring text = TrimCustomTarget(target ? target : L"");
+	if (text.empty()) { SetCustomInjectStatus(status, L"请输入 PID 或进程名"); return false; }
+	const bool numeric = IsDecimalCustomTarget(text);
+	const DWORD wantedPid = numeric ? static_cast<DWORD>(_wtol(text.c_str())) : 0;
+
+	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snapshot != INVALID_HANDLE_VALUE) {
+		PROCESSENTRY32W entry = {};
+		entry.dwSize = sizeof(entry);
+		DWORD matches = 0, foundPid = 0;
+		std::wstring foundName;
+		if (Process32FirstW(snapshot, &entry)) {
+			do {
+				const std::wstring exe(entry.szExeFile);
+				bool hit = numeric ? (entry.th32ProcessID == wantedPid)
+					: (_wcsicmp(exe.c_str(), text.c_str()) == 0);
+				if (!hit && !numeric) {
+					const size_t dot = exe.find_last_of(L'.');
+					const std::wstring base = dot == std::wstring::npos ? exe : exe.substr(0, dot);
+					hit = _wcsicmp(base.c_str(), text.c_str()) == 0;
+				}
+				if (hit) {
+					++matches;
+					if (!foundPid) { foundPid = entry.th32ProcessID; foundName = exe; }
+				}
+			} while (Process32NextW(snapshot, &entry));
+		}
+		CloseHandle(snapshot);
+		if (foundPid) {
+			*outPid = foundPid;
+			*outName = foundName;
+			if (matches > 1)
+				currentLogger->LogWarn(L"自定义注入：进程名 %s 匹配到 %lu 个实例，使用 PID %lu",
+					text.c_str(), matches, foundPid);
+			return true;
+		}
+	}
+	// 快照枚举不到受保护进程时，显式给出的 PID 仍允许尝试，让注入器给出真实错误码。
+	if (numeric) {
+		*outPid = wantedPid;
+		*outName = L"PID " + text;
+		return true;
+	}
+	SetCustomInjectStatus(status, L"找不到进程：" + text);
+	return false;
+}
+
+// 只挡"注入自己"这一种：训练器把 hooks 装进自己的进程，会把自己的文件/注册表
+// 调用一起钩住，界面和日志当场就废。系统关键进程不再在这里拦 —— 目标可能来自
+// 人工添加，是否值得冒险由用户决定；真打不开或注入失败时注入器会给出真实错误码。
+bool TrainerWorkerInternal::IsSelfCustomTarget(DWORD pid, LPCWSTR name, std::wstring* status)
+{
+	if (pid == GetCurrentProcessId()) {
+		SetCustomInjectStatus(status, L"不能注入训练器自身");
+		return false;
+	}
+	return true;
+}
+
+bool TrainerWorkerInternal::DetectTargetBitness(DWORD pid, bool* outIs64, std::wstring* status)
+{
+	*outIs64 = false;
+	if (!SysHlp::Is64BitOS()) return true;   // 32 位系统上所有进程都是 32 位
+
+	HANDLE process = nullptr;
+	const NTSTATUS ntStatus = MOpenProcessNt(pid, &process);
+	if (!NT_SUCCESS(ntStatus) || !process) {
+		WCHAR message[128] = {};
+		swprintf_s(message, L"打开目标进程失败 (NTSTATUS 0x%08X)", static_cast<unsigned>(ntStatus));
+		SetCustomInjectStatus(status, message);
+		return false;
+	}
+	typedef BOOL(WINAPI *IsWow64Process2Fn)(HANDLE, USHORT*, USHORT*);
+	const HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+	const auto isWow64Process2 = kernel32
+		? reinterpret_cast<IsWow64Process2Fn>(GetProcAddress(kernel32, "IsWow64Process2")) : nullptr;
+	if (isWow64Process2) {
+		USHORT machine = 0, native = 0;
+		if (isWow64Process2(process, &machine, &native)) {
+			*outIs64 = machine == IMAGE_FILE_MACHINE_AMD64 || machine == IMAGE_FILE_MACHINE_ARM64
+				|| (machine == IMAGE_FILE_MACHINE_UNKNOWN && native != IMAGE_FILE_MACHINE_I386);
+			CloseHandle(process);
+			return true;
+		}
+	}
+	BOOL wow64 = FALSE;
+	if (IsWow64Process(process, &wow64)) {
+		*outIs64 = !wow64;   // 本机已是 64 位系统；非 WOW64 即原生 64 位
+		CloseHandle(process);
+		return true;
+	}
+	CloseHandle(process);
+	SetCustomInjectStatus(status, L"无法判断目标进程位数，已取消注入");
+	return false;
+}
+
+bool TrainerWorkerInternal::RunInjector64(DWORD pid, LPCWSTR dllPath, bool unload, std::wstring* status)
+{
+	const LPCWSTR injector = currentApp ? currentApp->GetPartFullPath(PART_INJECTOR64) : nullptr;
+	if (!injector || GetFileAttributesW(injector) == INVALID_FILE_ATTRIBUTES) {
+		SetCustomInjectStatus(status, L"64 位注入助手不存在，请使用包含新资源的主程序");
+		return false;
+	}
+	std::wstring command = L"\"" + std::wstring(injector) + L"\" --pid " + std::to_wstring(pid)
+		+ L" --dll \"" + std::wstring(dllPath) + L"\"" + (unload ? L" --unload" : L"");
+	std::vector<wchar_t> writable(command.begin(), command.end());
+	writable.push_back(L'\0');
+
+	STARTUPINFOW startup = {};
+	startup.cb = sizeof(startup);
+	PROCESS_INFORMATION processInfo = {};
+	if (!CreateProcessW(injector, writable.data(), nullptr, nullptr, FALSE,
+		CREATE_NO_WINDOW, nullptr, nullptr, &startup, &processInfo)) {
+		WCHAR message[128] = {};
+		swprintf_s(message, L"启动 64 位注入助手失败，错误码 %lu", GetLastError());
+		SetCustomInjectStatus(status, message);
+		return false;
+	}
+	CloseHandle(processInfo.hThread);
+	WaitForSingleObject(processInfo.hProcess, 40000);
+	DWORD exitCode = STILL_ACTIVE;
+	GetExitCodeProcess(processInfo.hProcess, &exitCode);
+	CloseHandle(processInfo.hProcess);
+	if (exitCode != 0) {
+		WCHAR message[160] = {};
+		swprintf_s(message, L"64 位%s失败，错误码 %lu", unload ? L"卸载" : L"注入", exitCode);
+		SetCustomInjectStatus(status, message);
+		currentLogger->LogError(L"Injector64 failed pid=%lu unload=%d exit=%lu", pid, unload, exitCode);
+		return false;
+	}
+	return true;
+}
+
+bool TrainerWorkerInternal::InjectCustomProcess(LPCWSTR target, std::wstring* status)
+{
+	DWORD pid = 0;
+	std::wstring name;
+	if (!ResolveCustomTarget(target, &pid, &name, status)) return false;
+	if (!IsSelfCustomTarget(pid, name.c_str(), status)) return false;
+	for (const auto& injected : _CustomInjected) {
+		if (injected.pid == pid) {
+			SetCustomInjectStatus(status, L"该进程已注入，无需重复操作：" + name);
+			return true;
+		}
+	}
+	bool is64 = false;
+	if (!DetectTargetBitness(pid, &is64, status)) return false;
+	const LPCWSTR dll = currentApp
+		? currentApp->GetPartFullPath(is64 ? PART_HOOKER64 : PART_HOOKER) : nullptr;
+	if (!dll || GetFileAttributesW(dll) == INVALID_FILE_ATTRIBUTES) {
+		SetCustomInjectStatus(status, is64 ? L"x64 hooks DLL 不存在，请使用包含新资源的主程序"
+			: L"hooks DLL 不存在");
+		return false;
+	}
+	const bool ok = is64 ? RunInjector64(pid, dll, false, status) : InjectDll(pid, dll);
+	if (!ok) {
+		if (status && status->empty()) SetCustomInjectStatus(status, L"注入失败，详见运行日志");
+		currentLogger->LogError(L"自定义注入失败 target=%s pid=%lu is64=%d", target ? target : L"", pid, is64);
+		return false;
+	}
+	CustomInjectedProcess record;
+	record.pid = pid;
+	record.name = name;
+	record.is64 = is64;
+	_CustomInjected.push_back(record);
+	WCHAR message[192] = {};
+	swprintf_s(message, L"已注入 %s [PID %lu，%s]", name.c_str(), pid, is64 ? L"64 位" : L"32 位");
+	SetCustomInjectStatus(status, message);
+	currentLogger->LogInfo(L"自定义注入成功 pid=%lu name=%s is64=%d dll=%s", pid, name.c_str(), is64, dll);
+	return true;
+}
+
+bool TrainerWorkerInternal::UninjectCustomProcess(LPCWSTR target, std::wstring* status)
+{
+	DWORD pid = 0;
+	std::wstring name;
+	if (!ResolveCustomTarget(target, &pid, &name, status)) return false;
+	auto it = _CustomInjected.begin();
+	for (; it != _CustomInjected.end(); ++it) if (it->pid == pid) break;
+	bool is64 = false;
+	std::wstring recordName = name;
+	if (it != _CustomInjected.end()) {
+		is64 = it->is64;
+		recordName = it->name;
+	}
+	else {
+		// 命令行 -uninject 由另一个进程发起，本进程的已注入列表是空的；
+		// 直接按目标位数卸载，目标若已退出由注入器/助手返回明确错误。
+		if (!DetectTargetBitness(pid, &is64, status)) return false;
+	}
+	bool ok = false;
+	if (is64) {
+		const LPCWSTR dll = currentApp ? currentApp->GetPartFullPath(PART_HOOKER64) : nullptr;
+		ok = dll && RunInjector64(pid, dll, true, status);
+	}
+	else {
+		RemoteInvokeVUnloadAll(pid,
+			currentApp ? currentApp->GetPartFullPath(PART_HOOKER) : L"",
+			L"DzjsTrainerHooks.dll");
+		ok = UnInjectDll(pid, L"DzjsTrainerHooks.dll");
+		if (!ok) SetCustomInjectStatus(status, L"卸载失败，详见运行日志");
+	}
+	if (!ok) return false;
+	if (it != _CustomInjected.end()) _CustomInjected.erase(it);
+	WCHAR message[192] = {};
+	swprintf_s(message, L"已卸载 %s [PID %lu]", recordName.c_str(), pid);
+	SetCustomInjectStatus(status, message);
+	currentLogger->LogInfo(L"自定义注入已卸载 pid=%lu name=%s is64=%d", pid, recordName.c_str(), is64);
+	return true;
+}
+
+std::wstring TrainerWorkerInternal::GetCustomInjectedList()
+{
+	if (_CustomInjected.empty()) return L"（暂无自定义注入进程）";
+	std::wstring text;
+	for (const auto& item : _CustomInjected) {
+		WCHAR line[192] = {};
+		swprintf_s(line, L"PID %-8lu  %-32s  %s", item.pid, item.name.c_str(),
+			item.is64 ? L"64 位" : L"32 位");
+		text += line;
+		text += L"\n";
+	}
+	return text;
+}
+
+bool TrainerWorkerInternal::IsCustomInjected(DWORD pid)
+{
+	for (const auto& item : _CustomInjected)
+		if (item.pid == pid) return true;
+	return false;
+}
+
+void TrainerWorkerInternal::UnloadAllCustomInjected()
+{
+	for (const auto& item : _CustomInjected) {
+		bool ok = false;
+		if (item.is64) {
+			const LPCWSTR dll = currentApp ? currentApp->GetPartFullPath(PART_HOOKER64) : nullptr;
+			std::wstring ignored;
+			ok = dll && RunInjector64(item.pid, dll, true, &ignored);
+		}
+		else {
+			RemoteInvokeVUnloadAll(item.pid,
+				currentApp ? currentApp->GetPartFullPath(PART_HOOKER) : L"",
+				L"DzjsTrainerHooks.dll");
+			ok = UnInjectDll(item.pid, L"DzjsTrainerHooks.dll");
+		}
+		currentLogger->LogInfo(L"退出时卸载自定义注入 pid=%lu is64=%d result=%d",
+			item.pid, item.is64, ok);
+	}
+	_CustomInjected.clear();
+}
+
 bool TrainerWorkerInternal::UnLoadAllVirus()
 {
+	UnloadAllCustomInjected();
 	if (_MasterHelperPid > 4) {
 		if (UnInjectDll(_MasterHelperPid, L"DzjsTrainerHooks.dll"))
 			currentLogger->Log(L"已强制卸载 MasterHelper 病毒");

@@ -1,5 +1,7 @@
-#include "stdafx.h"
+﻿#include "stdafx.h"
 #include "MainWindow.h"
+#include <cwctype>
+#include <unordered_map>
 #include "../DzjsTrainerUpdater/BuiltinUpdate.h"
 #include "../WindowCaptureProtection.h"
 #include "DriverServiceActions.h"
@@ -14,6 +16,9 @@
 #ifndef DZJS_ENABLE_CAPTURE_EXCLUSION
 #define DZJS_ENABLE_CAPTURE_EXCLUSION 1
 #endif
+
+// 进程图标缓存定义在后面的「进程选择器」一节，析构路径上要先用到。
+void ClearProcessIconCache();
 
 // The About page shows the version of the binary that is actually running, read
 // from its own file version resource. A compile-time constant drifts from
@@ -94,6 +99,7 @@ const std::wstring& NavVersionLine()
 #include <setupapi.h>
 #include <cfgmgr32.h>
 #include <devguid.h>
+#include <winsvc.h>
 #include <shobjidl.h>
 #include <wintrust.h>
 #include <softpub.h>
@@ -163,6 +169,14 @@ struct UpdateProgressPayload {
 // 弹窗里的两个按钮和普通按钮共用一套 hover/press 机制，编号避开页面上的。
 constexpr int kUpdateDialogPrimary = 120;
 constexpr int kUpdateDialogSecondary = 121;
+// 进程选择器：主操作 / 取消 / 刷新 / 全选。列表行不占 hover 槽位，直接用 hoverRow。
+constexpr int kProcessPickerPrimary = 122;
+constexpr int kProcessPickerSecondary = 123;
+constexpr int kProcessPickerRefresh = 124;
+constexpr int kProcessPickerSelectAll = 125;
+// 搜索框的控件 ID。它不是自绘的按钮，只用来收 IDC 和 WM_CTLCOLOR 分支。
+constexpr int kProcessPickerSearch = 126;
+constexpr int kProcessPickerMaxRows = 14;
 
 std::wstring FormatByteSize(unsigned long long bytes)
 {
@@ -764,7 +778,22 @@ COLORREF BlendColorRef(COLORREF from, COLORREF to, double amount)
 		mix(GetBValue(from), GetBValue(to)));
 }
 
-void DrawNativeButton(const DRAWITEMSTRUCT* item, HFONT font, bool dark, bool hover = false)
+// 原生 owner-draw 按钮的窗口是直角的，自绘圆角之外那四块会露出**控件类擦背景**
+// 留下的颜色 —— DefWindowProc 对 WM_CTLCOLORBTN 返回 COLOR_BTNFACE，也就是
+// RGB(240,240,240)。深色卡片上就是按钮四角各一块近白三角，连起来像一圈白边。
+// 所以 DrawNativeButton 必须先把整个按钮矩形按它所在的卡片色铺一遍。
+COLORREF CardSurfaceColor(bool dark)
+{
+	return dark ? RGB(33, 40, 37) : RGB(255, 255, 255);
+}
+
+// 退出确认面板的底色。面板填充、输入框背景、按钮四角的补底都用它，别各写一份。
+COLORREF ExitPanelColor(bool dark)
+{
+	return dark ? RGB(38, 45, 42) : RGB(255, 255, 255);
+}
+
+void DrawNativeButton(const DRAWITEMSTRUCT* item, HFONT font, bool dark, COLORREF surface, bool hover = false)
 {
 	const bool pressed = (item->itemState & ODS_SELECTED) != 0;
 	const int id = static_cast<int>(item->CtlID);
@@ -803,6 +832,12 @@ void DrawNativeButton(const DRAWITEMSTRUCT* item, HFONT font, bool dark, bool ho
 		}
 	}
 	RECT rect = item->rcItem;
+	// 先把圆角外面的四角铺成卡片色。RoundRect 只填圆角以内，剩下的就是上面
+	// 说的那块 COLOR_BTNFACE —— 这一行是修白边的全部关键，别删。
+	HBRUSH surfaceBrush = CreateSolidBrush(surface);
+	FillRect(item->hDC, &rect, surfaceBrush);
+	DeleteObject(surfaceBrush);
+
 	HBRUSH brush = CreateSolidBrush(fill);
 	HPEN pen = CreatePen(PS_NULL, 0, 0);
 	HGDIOBJ oldBrush = SelectObject(item->hDC, brush);
@@ -821,17 +856,26 @@ void DrawNativeButton(const DRAWITEMSTRUCT* item, HFONT font, bool dark, bool ho
 	DeleteObject(pen);
 }
 
+// 顺序必须与 MainWindow.h 的 Page 枚举逐项对齐（导航用 static_cast<int>(page) 反查）。
+// 「使用帮助」页已删除，第 6 项由「进程注入」接替。
 const wchar_t* kNavLabels[] = {
-	L"\u72b6\u6001\u603b\u89c8", L"\u9632\u62a4\u7b56\u7565", L"\u66ff\u6362\u753b\u9762", L"\u7279\u5f81\u626b\u63cf", L"\u9ad8\u7ea7\u914d\u7f6e", L"\u4f7f\u7528\u5e2e\u52a9", L"\u7f51\u7edc\u5de5\u5177", L"\u8bbe\u5907\u8bca\u65ad", L"\u8fd0\u884c\u65e5\u5fd7", L"\u5173\u4e8e\u8f6f\u4ef6"
+	L"\u72b6\u6001\u603b\u89c8", L"\u9632\u62a4\u7b56\u7565", L"\u66ff\u6362\u753b\u9762", L"\u7279\u5f81\u626b\u63cf", L"\u9ad8\u7ea7\u914d\u7f6e", L"\u8fdb\u7a0b\u6ce8\u5165", L"\u7f51\u7edc\u5de5\u5177", L"\u8bbe\u5907\u8bca\u65ad", L"\u8fd0\u884c\u65e5\u5fd7", L"\u5173\u4e8e\u8f6f\u4ef6"
 };
 const wchar_t* kPageTitles[] = {
-	L"\u72b6\u6001\u603b\u89c8", L"\u9632\u62a4\u7b56\u7565", L"\u66ff\u6362\u753b\u9762", L"\u7279\u5f81\u7801\u626b\u63cf", L"\u9ad8\u7ea7\u914d\u7f6e", L"\u4f7f\u7528\u5e2e\u52a9", L"\u7f51\u7edc\u5de5\u5177", L"\u8bbe\u5907\u8bca\u65ad", L"\u8fd0\u884c\u65e5\u5fd7", L"\u5173\u4e8e Dzjs Trainer"
+	L"\u72b6\u6001\u603b\u89c8", L"\u9632\u62a4\u7b56\u7565", L"\u66ff\u6362\u753b\u9762", L"\u7279\u5f81\u7801\u626b\u63cf", L"\u9ad8\u7ea7\u914d\u7f6e", L"\u8fdb\u7a0b\u6ce8\u5165", L"\u7f51\u7edc\u5de5\u5177", L"\u8bbe\u5907\u8bca\u65ad", L"\u8fd0\u884c\u65e5\u5fd7", L"\u5173\u4e8e Dzjs Trainer"
 };
+// 侧栏项数。三处循环（布局、悬停命中、点击命中）原本各写一个 11，
+// 删页时漏改任何一处都会让最后一项点不动 —— 收成一个常量，由数组长度推出，
+// 保证「标签表少一项」和「循环多跑一次」不会同时发生。
+constexpr int kNavCount = static_cast<int>(sizeof(kNavLabels) / sizeof(kNavLabels[0]));
 const wchar_t* kToggleLabels[] = {
 	L"\u62e6\u622a\u8fdc\u7a0b\u8fd0\u884c\u7a0b\u5e8f", L"\u76f4\u63a5\u62d2\u7edd\u8fdc\u7a0b\u547d\u4ee4", L"\u5141\u8bb8\u5e7f\u64ad\u7a97\u53e3\u7f6e\u9876", L"\u963b\u6b62\u8fdc\u7a0b\u7ed3\u675f\u8fdb\u7a0b",
 	L"\u5141\u8bb8\u6559\u5e08\u67e5\u770b\u5c4f\u5e55", L"\u963b\u6b62\u8fdc\u7a0b\u5173\u95ed\u7a97\u53e3", L"\u5141\u8bb8\u6559\u5e08\u63a7\u5236\u7535\u8111",
+	L"\u62e6\u622a\u8fdc\u7a0b\u7a97\u53e3\u64cd\u4f5c", L"\u62e6\u622a\u6781\u57df\u9a71\u52a8\u8bbf\u95ee",
 	L"\u89c6\u9891\u6d41\u4fdd\u62a4"
 };
+// 防护策略页的开关数量（第 9 项「视频流保护」不在这张表里，它走下面的媒体面板）。
+constexpr int kProtectionToggleCount = 9;
 
 Color C(bool dark, BYTE r, BYTE g, BYTE b, BYTE dr, BYTE dg, BYTE db, BYTE a = 255) {
 	return Color(a, dark ? dr : r, dark ? dg : g, dark ? db : b);
@@ -1187,6 +1231,109 @@ bool PromptAvText(HWND owner, LPCWSTR title, LPCWSTR prompt, std::wstring* value
 
 constexpr wchar_t kExitConfirmClass[] = L"DzjsTrainerExitConfirm";
 
+// 退出确认面板的布局。绘制（PaintExitConfirm）和原生控件（WM_CREATE）共用这一组
+// 常量 —— 原来两边各写一套坐标，改一处必然错位。
+// 几何沿用原来的 520x350 / 内边距 34，只把散落的字面量收拢，不动观感。
+constexpr int kExitPanelWidth = 520;
+constexpr int kExitPanelHeight = 350;
+constexpr int kExitPadX = 34;
+constexpr int kExitContentWidth = kExitPanelWidth - kExitPadX * 2;   // 452
+
+constexpr int kExitTitleY = 30;
+constexpr int kExitSubtitleY = 76;
+constexpr int kExitCodeY = 116;
+constexpr int kExitCodeHeight = 38;
+constexpr int kExitHintY = 170;
+constexpr int kExitErrorY = 196;       // 贴着提示行，只留 4px
+constexpr int kExitEditY = 234;
+constexpr int kExitEditHeight = 36;
+constexpr int kExitButtonY = 286;
+constexpr int kExitButtonWidth = 100;
+constexpr int kExitButtonHeight = 34;
+constexpr int kExitButtonGap = 10;
+
+// 面板圆角：和主界面卡片同一档。
+constexpr float kExitPanelRadius = 12.0f;
+// 输入框外框圆角。原来 EDIT 带 WS_EX_CLIENTEDGE，系统会画 3D 凹陷直角边，
+// 这是整个界面上唯一一处非圆角的控件边框；改成自绘细边之后用 10。
+constexpr float kExitEditRadius = 10.0f;
+
+// 验证码有效期。到点就换一组新的、并清空已输入的内容 —— 屏幕上摆着的数字
+// 只有 30 秒可用，被人拍照或者事后回头抄都来不及。
+constexpr UINT kExitCodeRefreshSeconds = 30;
+constexpr UINT_PTR kExitRefreshTimer = 1;
+// 倒计时每 200ms 校一次。不按 1000ms 走是因为 WM_TIMER 会被输入抢占、
+// 每次最多迟到一两百毫秒，累加之后显示会明显偏慢；这里按绝对时间算剩余，
+// 只在「秒数变了」的时候重画那一小块。
+constexpr UINT kExitRefreshTickMs = 200;
+// 倒计时文字占的宽度，右端对齐内容区右边界。
+constexpr int kExitCountdownWidth = 88;
+
+// 后备缓冲。整帧先在内存里画完，再**一次性** BitBlt 上屏。
+//
+// 为什么必须有：直接分步往窗口 DC 上画（铺底色 -> 贴壁纸 -> 压暗化 -> 盖面板）
+// 时，每一步都是一次独立的写屏幕，而 DWM 会在任意两步之间合成一帧。
+// 倒计时每秒跳一次，正好把那个「只画了底色」的中间态暴露出来 —— 实测抓帧
+// 抓到过亮度 18 的帧（正好是 Clear 的 RGB(18,18,18)），就是用户看到的「黑一下」。
+// 换成后备缓冲之后，窗口每次只收到一次 BitBlt，不存在中间态。
+struct ExitBackBuffer {
+	HDC dc = nullptr;
+	HBITMAP bitmap = nullptr;
+	HGDIOBJ oldBitmap = nullptr;
+	std::unique_ptr<Gdiplus::Bitmap> surface;   // 包住 DIB 内存，供 GDI+ 直接画
+	int width = 0;
+	int height = 0;
+
+	bool Create(int w, int h)
+	{
+		Destroy();
+		if (w <= 0 || h <= 0) return false;
+		dc = CreateCompatibleDC(nullptr);
+		if (!dc) return false;
+		BITMAPINFO info{};
+		info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+		info.bmiHeader.biWidth = w;
+		info.bmiHeader.biHeight = -h;      // 负值 = 自上而下，和 GDI+ 坐标一致
+		info.bmiHeader.biPlanes = 1;
+		info.bmiHeader.biBitCount = 32;
+		info.bmiHeader.biCompression = BI_RGB;
+		void* bits = nullptr;
+		bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+		if (!bitmap || !bits) {
+			Destroy();
+			return false;
+		}
+		oldBitmap = SelectObject(dc, bitmap);
+		surface = std::make_unique<Gdiplus::Bitmap>(w, h, w * 4,
+			PixelFormat32bppRGB, static_cast<BYTE*>(bits));
+		if (!surface || surface->GetLastStatus() != Ok) {
+			Destroy();
+			return false;
+		}
+		width = w;
+		height = h;
+		return true;
+	}
+
+	void Destroy()
+	{
+		// Bitmap 只是包着 DIB 的内存，必须先于位图释放，否则析构会写到已释放的页。
+		surface.reset();
+		if (dc && oldBitmap) SelectObject(dc, oldBitmap);
+		oldBitmap = nullptr;
+		if (bitmap) {
+			DeleteObject(bitmap);
+			bitmap = nullptr;
+		}
+		if (dc) {
+			DeleteDC(dc);
+			dc = nullptr;
+		}
+		width = 0;
+		height = 0;
+	}
+};
+
 struct ExitConfirmContext {
 	HWND owner = nullptr;
 	HWND window = nullptr;
@@ -1194,6 +1341,7 @@ struct ExitConfirmContext {
 	HANDLE readyEvent = nullptr;
 	DWORD desktopFailure = ERROR_SUCCESS;
 	std::unique_ptr<Gdiplus::Bitmap> blurredWallpaper;
+	ExitBackBuffer backBuffer;
 	std::wstring wallpaperPath;
 	int panelX = 0;
 	int panelY = 0;
@@ -1204,6 +1352,8 @@ struct ExitConfirmContext {
 	bool rawInputRegistered = false;
 	std::wstring challenge;
 	std::wstring value;
+	ULONGLONG refreshDeadline = 0;   // GetTickCount64 口径的绝对时间
+	int shownSeconds = -1;           // 当前画在屏幕上的剩余秒数，-1 表示还没画过
 	bool darkMode = false;
 	bool accepted = false;
 	bool sawPhysicalKeyboard = false;
@@ -1218,13 +1368,15 @@ std::unique_ptr<Bitmap> BuildExitWallpaper(LPCWSTR path)
 	std::unique_ptr<Image> source(Image::FromFile(path, FALSE));
 	if (!source || source->GetLastStatus() != Ok || source->GetWidth() == 0 || source->GetHeight() == 0)
 		return {};
-	const int targetWidth = 240;
-	const int targetHeight = 135;
+	const int targetWidth = 320;
+	const int targetHeight = 180;
 	std::unique_ptr<Bitmap> result = std::make_unique<Bitmap>(targetWidth, targetHeight, PixelFormat32bppARGB);
 	if (!result || result->GetLastStatus() != Ok) return {};
 	Graphics graphics(result.get());
 	graphics.SetInterpolationMode(InterpolationModeHighQualityBicubic);
-	graphics.Clear(Color(255, 25, 32, 29));
+	// 这个底色只在壁纸比例对不上、四周露边时可见。原来是 RGB(25,32,29)，
+	// 一片墨绿 —— 换成中性深灰，不参与调色。
+	graphics.Clear(Color(255, 18, 18, 18));
 	const REAL sourceAspect = static_cast<REAL>(source->GetWidth()) / static_cast<REAL>(source->GetHeight());
 	const REAL targetAspect = static_cast<REAL>(targetWidth) / static_cast<REAL>(targetHeight);
 	REAL drawWidth = static_cast<REAL>(targetWidth);
@@ -1244,25 +1396,45 @@ std::unique_ptr<Bitmap> BuildExitWallpaper(LPCWSTR path)
 		const auto* row = reinterpret_cast<const DWORD*>(reinterpret_cast<const BYTE*>(data.Scan0) + y * data.Stride);
 		std::copy(row, row + targetWidth, sourcePixels.begin() + static_cast<size_t>(y) * targetWidth);
 	}
-	const int radius = 4;
+	// 盒式模糊改成可分离两遍（先横后纵）。二维 (2r+1)² 采样和两次 (2r+1) 采样
+	// 在数学上等价，复杂度从 O(r²) 降到 O(r)。半径同时从 4 降到 3：320x180 上
+	// r=3 折算到 1080p 约 18px，比原来的 32px 收敛，桌面的大块结构能认出来，
+	// 不至于糊成一片纯色。
+	const int radius = 3;
+	const int kernelSize = radius * 2 + 1;   // 不叫 window：这个文件里 window 全是 HWND
+	std::vector<DWORD> temp(sourcePixels.size(), 0);
+
+	for (int y = 0; y < targetHeight; ++y) {
+		const DWORD* srcRow = &sourcePixels[static_cast<size_t>(y) * targetWidth];
+		DWORD* dstRow = &temp[static_cast<size_t>(y) * targetWidth];
+		for (int x = 0; x < targetWidth; ++x) {
+			unsigned int blue = 0, green = 0, red = 0, alpha = 0;
+			for (int dx = -radius; dx <= radius; ++dx) {
+				const int sampleX = (std::max)(0, (std::min)(targetWidth - 1, x + dx));
+				const DWORD pixel = srcRow[sampleX];
+				blue += (pixel >> 0) & 0xff;
+				green += (pixel >> 8) & 0xff;
+				red += (pixel >> 16) & 0xff;
+				alpha += (pixel >> 24) & 0xff;
+			}
+			dstRow[x] = ((alpha / kernelSize) << 24) | ((red / kernelSize) << 16) |
+				((green / kernelSize) << 8) | (blue / kernelSize);
+		}
+	}
 	for (int y = 0; y < targetHeight; ++y) {
 		auto* row = reinterpret_cast<DWORD*>(reinterpret_cast<BYTE*>(data.Scan0) + y * data.Stride);
 		for (int x = 0; x < targetWidth; ++x) {
-			unsigned int blue = 0, green = 0, red = 0, alpha = 0, count = 0;
+			unsigned int blue = 0, green = 0, red = 0, alpha = 0;
 			for (int dy = -radius; dy <= radius; ++dy) {
 				const int sampleY = (std::max)(0, (std::min)(targetHeight - 1, y + dy));
-				for (int dx = -radius; dx <= radius; ++dx) {
-					const int sampleX = (std::max)(0, (std::min)(targetWidth - 1, x + dx));
-					const DWORD pixel = sourcePixels[static_cast<size_t>(sampleY) * targetWidth + sampleX];
-					blue += (pixel >> 0) & 0xff;
-					green += (pixel >> 8) & 0xff;
-					red += (pixel >> 16) & 0xff;
-					alpha += (pixel >> 24) & 0xff;
-					++count;
-				}
+				const DWORD pixel = temp[static_cast<size_t>(sampleY) * targetWidth + x];
+				blue += (pixel >> 0) & 0xff;
+				green += (pixel >> 8) & 0xff;
+				red += (pixel >> 16) & 0xff;
+				alpha += (pixel >> 24) & 0xff;
 			}
-			row[x] = ((alpha / count) << 24) | ((red / count) << 16) |
-				((green / count) << 8) | (blue / count);
+			row[x] = ((alpha / kernelSize) << 24) | ((red / kernelSize) << 16) |
+				((green / kernelSize) << 8) | (blue / kernelSize);
 		}
 	}
 	result->UnlockBits(&data);
@@ -1285,15 +1457,17 @@ DWORD WINAPI ExitConfirmDesktopThreadProc(LPVOID parameter)
 		return context->desktopFailure;
 	}
 
-	const int width = 520;
-	const int height = 350;
+	const int width = kExitPanelWidth;
+	const int height = kExitPanelHeight;
 	const int screenWidth = GetSystemMetrics(SM_CXSCREEN);
 	const int screenHeight = GetSystemMetrics(SM_CYSCREEN);
 	context->panelX = (screenWidth - width) / 2;
 	context->panelY = (screenHeight - height) / 2;
 	context->blurredWallpaper = BuildExitWallpaper(context->wallpaperPath.c_str());
-	context->window = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_APPWINDOW | WS_EX_TOPMOST,
-		kExitConfirmClass, L"确认退出", WS_POPUP | WS_BORDER,
+	// 去掉 WS_EX_DLGMODALFRAME 和 WS_BORDER：这是个铺满整屏的窗口，系统会在
+	// 暗化后的壁纸边缘画一圈 1px 边框，看起来像一道黑线。
+	context->window = CreateWindowExW(WS_EX_APPWINDOW | WS_EX_TOPMOST,
+		kExitConfirmClass, L"确认退出", WS_POPUP,
 		0, 0, screenWidth, screenHeight, nullptr, nullptr, GetModuleHandleW(nullptr), context);
 	if (!context->window) {
 		context->desktopFailure = GetLastError();
@@ -1366,6 +1540,17 @@ void SetExitConfirmEditText(ExitConfirmContext* context, const std::wstring& val
 	SendMessageW(context->edit, EM_SETSEL, position, position);
 }
 
+// 换一组新验证码。必须同时清空已输入的内容和错误态：
+// 旧数字对新码必然不匹配，留着只会让用户以为是自己打错了。
+void RefreshExitChallenge(ExitConfirmContext* context)
+{
+	if (!context) return;
+	context->challenge = MakeExitChallenge();
+	context->value.clear();
+	context->invalidInput = false;
+	SetExitConfirmEditText(context, std::wstring(), 0);
+}
+
 void HandleExitConfirmKeyboard(HWND window, ExitConfirmContext* context, const RAWKEYBOARD& keyboard)
 {
 	if (!context || !context->edit || (keyboard.Flags & RI_KEY_BREAK) != 0) return;
@@ -1420,31 +1605,91 @@ void PaintExitConfirm(HWND window, ExitConfirmContext* context)
 	HDC dc = BeginPaint(window, &ps);
 	RECT client{};
 	GetClientRect(window, &client);
-	Graphics graphics(dc);
 	const int width = client.right;
 	const int height = client.bottom;
-	graphics.Clear(C(context->darkMode, 31, 38, 34, 25, 31, 28));
+	ExitBackBuffer& back = context->backBuffer;
+	if (!back.surface || back.width != width || back.height != height) {
+		if (!back.Create(width, height)) {
+			// 拿不到后备缓冲就退回直接画。会有中间态，但总比不画强。
+			Graphics fallback(dc);
+			fallback.Clear(Color(255, 18, 18, 18));
+			EndPaint(window, &ps);
+			return;
+		}
+	}
+	// 只渲染脏矩形，别每秒把 1920x1080 整屏重画一遍。
+	Graphics graphics(back.surface.get());
+	graphics.SetClip(RectF(static_cast<REAL>(ps.rcPaint.left), static_cast<REAL>(ps.rcPaint.top),
+		static_cast<REAL>(ps.rcPaint.right - ps.rcPaint.left),
+		static_cast<REAL>(ps.rcPaint.bottom - ps.rcPaint.top)));
+	// 抗锯齿只影响边缘质量，不改任何几何或配色：圆角不再有台阶，小字不再发虚。
+	graphics.SetSmoothingMode(SmoothingModeAntiAlias);
+	graphics.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+	const bool d = context->darkMode;
+
+	// 底色和暗化层原来是 RGB(25,32,29) / RGB(12,22,19)（浅色是 RGB(22,42,35)），
+	// 三个都带绿 —— 叠在蓝调壁纸上就成了「墨绿一片」，看不出是桌面模糊。
+	// 换成中性深灰，壁纸自己的颜色才能透出来。
+	graphics.Clear(Color(255, 18, 18, 18));
 	if (context->blurredWallpaper && context->blurredWallpaper->GetLastStatus() == Ok)
 		graphics.DrawImage(context->blurredWallpaper.get(), 0, 0, width, height);
-	SolidBrush dimmer(Color(context->darkMode ? 172 : 136, context->darkMode ? 12 : 22,
-		context->darkMode ? 22 : 42, context->darkMode ? 19 : 35));
+	SolidBrush dimmer(Color(d ? 172 : 136, 10, 10, 10));
 	graphics.FillRectangle(&dimmer, 0, 0, width, height);
+
 	const float panelX = static_cast<float>(context->panelX);
 	const float panelY = static_cast<float>(context->panelY);
-	FillRound(graphics, RectF(panelX, panelY, 520.0f, 350.0f), 12,
-		C(context->darkMode, 255, 255, 255, 38, 45, 42));
-	Text(graphics, L"确认退出 Dzjs Trainer", panelX + 34, panelY + 30, 452, 30, 19, FontStyleBold,
-		C(context->darkMode, 30, 36, 33, 225, 233, 229));
-	Text(graphics, L"为确认是本人操作，请在下方原样输入这组数字：", panelX + 34, panelY + 76, 452, 24, 11, FontStyleRegular,
-		C(context->darkMode, 81, 91, 86, 171, 183, 177));
-	Text(graphics, context->challenge.c_str(), panelX + 34, panelY + 108, 452, 38, 25, FontStyleBold,
-		C(context->darkMode, 0, 107, 95, 130, 213, 199), StringAlignmentCenter);
-	Text(graphics, L"仅接受真实键盘按键，粘贴或程序模拟输入不会通过验证。", panelX + 34, panelY + 178, 452, 22, 11, FontStyleRegular,
-		C(context->darkMode, 91, 70, 20, 232, 211, 162), StringAlignmentCenter);
-	if (context->invalidInput) {
-		Text(graphics, L"输入不匹配或不是直接键盘输入，请重试。", panelX + 34, panelY + 204, 452, 22, 11, FontStyleBold,
-			C(context->darkMode, 155, 45, 36, 244, 178, 165), StringAlignmentCenter);
+	const RectF panel(panelX, panelY,
+		static_cast<float>(kExitPanelWidth), static_cast<float>(kExitPanelHeight));
+	FillRound(graphics, panel, kExitPanelRadius, C(d, 255, 255, 255, 38, 45, 42));
+
+	Text(graphics, L"确认退出 Dzjs Trainer", panelX + kExitPadX, panelY + kExitTitleY,
+		static_cast<float>(kExitContentWidth), 30, 19, FontStyleBold,
+		C(d, 30, 36, 33, 225, 233, 229));
+	Text(graphics, L"为确认是本人操作，请在下方原样输入这组数字：",
+		panelX + kExitPadX, panelY + kExitSubtitleY,
+		static_cast<float>(kExitContentWidth), 24, 11, FontStyleRegular,
+		C(d, 81, 91, 86, 171, 183, 177));
+	Text(graphics, context->challenge.c_str(), panelX + kExitPadX, panelY + kExitCodeY,
+		static_cast<float>(kExitContentWidth), static_cast<float>(kExitCodeHeight), 25, FontStyleBold,
+		C(d, 0, 107, 95, 130, 213, 199), StringAlignmentCenter);
+	// 刷新倒计时：压在验证码同一行的右端，11px 小字，不占新行、不动任何几何。
+	// 不给它加底色或边框 —— 那会变成徽章，属于多余装饰。
+	if (context->shownSeconds >= 0) {
+		wchar_t countdown[16]{};
+		swprintf_s(countdown, L"%d 秒后刷新", context->shownSeconds);
+		Text(graphics, countdown,
+			panelX + kExitPadX + kExitContentWidth - kExitCountdownWidth,
+			panelY + kExitCodeY + 13,
+			static_cast<float>(kExitCountdownWidth), 20, 11, FontStyleRegular,
+			C(d, 150, 160, 155, 120, 132, 126), StringAlignmentFar);
 	}
+	Text(graphics, L"仅接受真实键盘按键，粘贴或程序模拟输入不会通过验证。",
+		panelX + kExitPadX, panelY + kExitHintY,
+		static_cast<float>(kExitContentWidth), 22, 11, FontStyleRegular,
+		C(d, 91, 70, 20, 232, 211, 162), StringAlignmentCenter);
+	if (context->invalidInput) {
+		Text(graphics, L"输入不匹配或不是直接键盘输入，请重试。",
+			panelX + kExitPadX, panelY + kExitErrorY,
+			static_cast<float>(kExitContentWidth), 22, 11, FontStyleBold,
+			C(d, 155, 45, 36, 244, 178, 165), StringAlignmentCenter);
+	}
+
+	// 输入框外框。原来 EDIT 带 WS_EX_CLIENTEDGE，系统画 3D 凹陷直角边，
+	// 是整个界面上唯一一处非圆角控件边框；改成自绘一圈 1px 细边，
+	// 填充色与面板同色，所以观感上只是「一个描边圆角框」。
+	const RectF editFrame(panelX + kExitPadX, panelY + kExitEditY,
+		static_cast<float>(kExitContentWidth), static_cast<float>(kExitEditHeight));
+	FillRound(graphics, editFrame, kExitEditRadius, C(d, 255, 255, 255, 38, 45, 42));
+	StrokeRound(graphics, editFrame, kExitEditRadius,
+		context->invalidInput ? C(d, 226, 150, 140, 150, 60, 52)
+			: C(d, 205, 213, 209, 60, 70, 65));
+
+	// 内存里已经画完整了，这里一次性搬上屏 —— 窗口只收到这一次写操作，
+	// 不会出现「只画了底色」或「壁纸还没盖上面板」的中间帧。
+	BitBlt(dc, ps.rcPaint.left, ps.rcPaint.top,
+		ps.rcPaint.right - ps.rcPaint.left, ps.rcPaint.bottom - ps.rcPaint.top,
+		back.dc, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
+
 	EndPaint(window, &ps);
 }
 
@@ -1460,23 +1705,63 @@ LRESULT CALLBACK ExitConfirmProc(HWND window, UINT message, WPARAM wParam, LPARA
 	}
 	if (!context) return DefWindowProcW(window, message, wParam, lParam);
 	switch (message) {
-	case WM_CREATE:
+	case WM_CREATE: {
 		context->font = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
 			OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
-		context->editBrush = CreateSolidBrush(context->darkMode ? RGB(38, 45, 42) : RGB(255, 255, 255));
-		context->edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+		// 与面板同色：外框填充也是这个色，所以输入框看起来只是「面板上的一个描边框」。
+		context->editBrush = CreateSolidBrush(ExitPanelColor(context->darkMode));
+		// 去掉 WS_EX_CLIENTEDGE（3D 凹陷直角边），缩进自绘圆角框里，四周各留 6px。
+		context->edit = CreateWindowExW(0, L"EDIT", L"",
 			WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_CENTER | ES_AUTOHSCROLL | ES_NUMBER,
-			context->panelX + 34, context->panelY + 236, 452, 36, window, reinterpret_cast<HMENU>(IDC_EXIT_CONFIRM_EDIT), GetModuleHandleW(nullptr), nullptr);
+			context->panelX + kExitPadX + 11, context->panelY + kExitEditY + 6,
+			kExitContentWidth - 22, kExitEditHeight - 12, window,
+			reinterpret_cast<HMENU>(IDC_EXIT_CONFIRM_EDIT), GetModuleHandleW(nullptr), nullptr);
 		if (context->font) SendMessageW(context->edit, WM_SETFONT, reinterpret_cast<WPARAM>(context->font), TRUE);
 		SetWindowLongPtrW(context->edit, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(context));
 		context->originalEditProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(context->edit, GWLP_WNDPROC,
 			reinterpret_cast<LONG_PTR>(ExitConfirmEditProc)));
-		CreateWindowExW(0, L"BUTTON", L"确认退出", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-			context->panelX + 276, context->panelY + 286, 100, 34, window, reinterpret_cast<HMENU>(IDC_EXIT_CONFIRM_OK), GetModuleHandleW(nullptr), nullptr);
-		CreateWindowExW(0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-			context->panelX + 386, context->panelY + 286, 100, 34, window, reinterpret_cast<HMENU>(IDC_EXIT_CONFIRM_CANCEL), GetModuleHandleW(nullptr), nullptr);
+		const int buttonY = context->panelY + kExitButtonY;
+		const int cancelX = context->panelX + kExitPadX + kExitContentWidth - kExitButtonWidth;
+		const int okX = cancelX - kExitButtonGap - kExitButtonWidth;
+		HWND okButton = CreateWindowExW(0, L"BUTTON", L"确认退出",
+			WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+			okX, buttonY, kExitButtonWidth, kExitButtonHeight, window,
+			reinterpret_cast<HMENU>(IDC_EXIT_CONFIRM_OK), GetModuleHandleW(nullptr), nullptr);
+		HWND cancelButton = CreateWindowExW(0, L"BUTTON", L"取消",
+			WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+			cancelX, buttonY, kExitButtonWidth, kExitButtonHeight, window,
+			reinterpret_cast<HMENU>(IDC_EXIT_CONFIRM_CANCEL), GetModuleHandleW(nullptr), nullptr);
+		// 原来没注册悬停，这两个按钮是全界面唯一不响应鼠标的控件。
+		EnableNativeButtonHover(okButton);
+		EnableNativeButtonHover(cancelButton);
+		context->refreshDeadline = GetTickCount64() + kExitCodeRefreshSeconds * 1000ULL;
+		context->shownSeconds = static_cast<int>(kExitCodeRefreshSeconds);
+		SetTimer(window, kExitRefreshTimer, kExitRefreshTickMs, nullptr);
 		SetFocus(context->edit);
 		return 0;
+	}
+	case WM_TIMER: {
+		if (wParam != kExitRefreshTimer) break;
+		const ULONGLONG now = GetTickCount64();
+		if (now >= context->refreshDeadline) {
+			RefreshExitChallenge(context);
+			context->refreshDeadline = now + kExitCodeRefreshSeconds * 1000ULL;
+			context->shownSeconds = static_cast<int>(kExitCodeRefreshSeconds);
+			InvalidateRect(window, nullptr, FALSE);
+			return 0;
+		}
+		const int remaining = static_cast<int>((context->refreshDeadline - now + 999) / 1000);
+		if (remaining == context->shownSeconds) return 0;
+		context->shownSeconds = remaining;
+		// 只重画倒计时那一小块，不要每秒整窗重绘一遍。
+		RECT dirty{};
+		dirty.left = context->panelX + kExitPadX + kExitContentWidth - kExitCountdownWidth - 4;
+		dirty.top = context->panelY + kExitCodeY;
+		dirty.right = context->panelX + kExitPadX + kExitContentWidth;
+		dirty.bottom = context->panelY + kExitCodeY + kExitCodeHeight;
+		InvalidateRect(window, &dirty, FALSE);
+		return 0;
+	}
 	case WM_PAINT:
 		PaintExitConfirm(window, context);
 		return 0;
@@ -1539,6 +1824,8 @@ LRESULT CALLBACK ExitConfirmProc(HWND window, UINT message, WPARAM wParam, LPARA
 		DestroyWindow(window);
 		return 0;
 	case WM_DESTROY:
+		// 定时器属于这个窗口，销毁前必须停掉，否则消息会投给一个正在拆的窗口。
+		KillTimer(window, kExitRefreshTimer);
 		PostQuitMessage(0);
 		return 0;
 	case WM_CTLCOLORSTATIC: {
@@ -1547,16 +1834,22 @@ LRESULT CALLBACK ExitConfirmProc(HWND window, UINT message, WPARAM wParam, LPARA
 		SetBkMode(dc, TRANSPARENT);
 		return reinterpret_cast<LRESULT>(GetStockObject(NULL_BRUSH));
 	}
-	case WM_CTLCOLOREDIT: {
+	case WM_CTLCOLOREDIT:
+	case WM_CTLCOLORBTN: {
+		// BTN 也要接管：owner-draw 按钮在 WM_DRAWITEM 之前会先用这个画刷擦一遍底，
+		// 不接管就是系统灰 RGB(240,240,240)，深色面板上一眼就看见。
 		HDC dc = reinterpret_cast<HDC>(wParam);
 		SetTextColor(dc, context->darkMode ? RGB(222, 230, 226) : RGB(35, 42, 39));
-		SetBkColor(dc, context->darkMode ? RGB(38, 45, 42) : RGB(255, 255, 255));
+		SetBkColor(dc, ExitPanelColor(context->darkMode));
 		return reinterpret_cast<LRESULT>(context->editBrush);
 	}
 	case WM_DRAWITEM: {
 		const auto* item = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
 		if (item && (item->CtlID == IDC_EXIT_CONFIRM_OK || item->CtlID == IDC_EXIT_CONFIRM_CANCEL)) {
-			DrawNativeButton(item, context->font, context->darkMode);
+			// 补上悬停状态（见 WM_CREATE 里的 EnableNativeButtonHover）。
+			// surface 传面板色：按钮四角露出来的就是面板，白边才不会出现。
+			DrawNativeButton(item, context->font, context->darkMode, ExitPanelColor(context->darkMode),
+				NativeButtonHoverMap()[item->hwndItem]);
 			return TRUE;
 		}
 		break;
@@ -1577,6 +1870,7 @@ LRESULT CALLBACK ExitConfirmProc(HWND window, UINT message, WPARAM wParam, LPARA
 			DeleteObject(context->font);
 			context->font = nullptr;
 		}
+		context->backBuffer.Destroy();
 		context->window = nullptr;
 		break;
 	}
@@ -3007,12 +3301,49 @@ struct MainWindow::TeacherBackend {
 	bool running = false;
 };
 
+// 系统是浅色还是深色：AppsUseLightTheme 控制"应用"模式，SystemUsesLightTheme 控制
+// 任务栏/开始菜单。用户可能只改了其中一个，所以先读 Apps，读不到再退回 System；
+// 两个键都没有的老系统按浅色处理（和改动前的行为一致）。
+bool SystemPrefersDarkTheme()
+{
+	auto readDword = [](LPCWSTR name, DWORD* value) {
+		DWORD data = 0;
+		DWORD size = sizeof(data);
+		if (RegGetValueW(HKEY_CURRENT_USER,
+			L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+			name, RRF_RT_REG_DWORD, nullptr, &data, &size) != ERROR_SUCCESS)
+			return false;
+		*value = data;
+		return true;
+	};
+	DWORD appsLight = 1;
+	if (readDword(L"AppsUseLightTheme", &appsLight)) return appsLight == 0;
+	DWORD systemLight = 1;
+	if (readDword(L"SystemUsesLightTheme", &systemLight)) return systemLight == 0;
+	return false;
+}
+
+// 标题栏属于非客户区，由 DWM 绘制；不显式声明的话深色主题下顶上仍是一条白条。
+// Win10 20H1 起是属性 20，更早的版本是 19，先试新的再退回旧的。
+void ApplyDarkTitleBar(HWND hwnd, bool dark)
+{
+	if (!hwnd) return;
+	BOOL value = dark ? TRUE : FALSE;
+	if (FAILED(DwmSetWindowAttribute(hwnd, 20, &value, sizeof(value))))
+		DwmSetWindowAttribute(hwnd, 19, &value, sizeof(value));
+	// 属性改了 DWM 不一定会立刻重画边框，戳一下让它刷。
+	SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+		SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+}
+
 MainWindow::MainWindow()
 {
 	// Register the object before CreateWindowExW can synchronously deliver WM_NCCREATE.
 	// The window manager's CREATESTRUCT payload was observed corrupted in the failing
 	// build, while the constructor's this pointer is still valid at this point.
 	currentMainWindow = this;
+	// 首帧就按系统色调画，避免先闪一下浅色再切过去。
+	darkMode = SystemPrefersDarkTheme();
 	screenWidth = GetSystemMetrics(SM_CXSCREEN);
 	screenHeight = GetSystemMetrics(SM_CYSCREEN);
 	GdiplusStartupInput input;
@@ -3031,6 +3362,28 @@ MainWindow::MainWindow()
 	UpdateWindow(_hWnd);
 }
 
+// 切换浅色/深色。fromSystem = true 表示这是系统设置变更触发的，
+// 手动选过主题之后就不该再被系统顶掉；fromSystem = false 表示用户点了主题按钮。
+void MainWindow::ApplyTheme(bool dark, bool fromSystem)
+{
+	if (fromSystem && !themeFollowsSystem) return;
+	if (!fromSystem) themeFollowsSystem = false;
+	const bool changed = darkMode != dark;
+	darkMode = dark;
+	ApplyDarkTitleBar(_hWnd, dark);
+	// 原生控件的底色来自这两支画刷，切主题必须重建，否则编辑框还是旧底色。
+	if (controlSurfaceBrush) DeleteObject(controlSurfaceBrush);
+	controlSurfaceBrush = CreateSolidBrush(dark ? RGB(38, 45, 42) : RGB(255, 255, 255));
+	if (advancedFieldBrush) DeleteObject(advancedFieldBrush);
+	advancedFieldBrush = CreateSolidBrush(dark ? RGB(26, 33, 30) : RGB(255, 255, 255));
+	if (processPickerFieldBrush) DeleteObject(processPickerFieldBrush);
+	processPickerFieldBrush = CreateSolidBrush(dark ? RGB(26, 33, 30) : RGB(255, 255, 255));
+	for (HWND control : networkControls) if (control) InvalidateRect(control, nullptr, TRUE);
+	for (HWND control : advancedControls) if (control) InvalidateRect(control, nullptr, TRUE);
+	if (processPickerSearchEdit) InvalidateRect(processPickerSearchEdit, nullptr, TRUE);
+	if (changed && _hWnd) InvalidateRect(_hWnd, nullptr, FALSE);
+}
+
 MainWindow::~MainWindow()
 {
 	if (currentLogger) {
@@ -3045,6 +3398,7 @@ MainWindow::~MainWindow()
 	StopTeacherService();
 	if (controlSurfaceBrush) DeleteObject(controlSurfaceBrush);
 	if (advancedFieldBrush) DeleteObject(advancedFieldBrush);
+	if (processPickerFieldBrush) DeleteObject(processPickerFieldBrush);
 	if (controlFont) DeleteObject(controlFont);
 	ReleaseBackBuffer();
 	// Member destructors run AFTER this body, so every object holding a GDI+ type
@@ -3059,6 +3413,7 @@ MainWindow::~MainWindow()
 	}
 	// 文本字体是文件级静态缓存，同样要在 GdiplusShutdown 之前清掉。
 	ReleaseTextFontCache();
+	ClearProcessIconCache();
 	UnloadMaterialIconFont();
 	if (gdiplusToken) GdiplusShutdown(gdiplusToken);
 	if (currentMainWindow == this) currentMainWindow = nullptr;
@@ -3114,6 +3469,7 @@ bool MainWindow::Initialize()
 	SetTimer(_hWnd, TIMER_SERVICE_POLL, 200, nullptr);
 	int corner = 2;
 	DwmSetWindowAttribute(_hWnd, 33, &corner, sizeof(corner));
+	ApplyDarkTitleBar(_hWnd, darkMode);
 	OnFirstShow();
 	return true;
 }
@@ -3276,11 +3632,21 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 
 	switch (message) {
 	case WM_ERASEBKGND: return 1;
+	case WM_SETTINGCHANGE:
+		// 不去解引用 lParam：别的进程广播过来的字符串指针在本进程里无效，
+		// 拿它做 wcscmp 就是一次野指针读。直接重读注册表，值没变时不会重绘。
+		self->ApplyTheme(SystemPrefersDarkTheme(), true);
+		break;
+	case WM_THEMECHANGED:
+		self->ApplyTheme(SystemPrefersDarkTheme(), true);
+		break;
 	case WM_PAINT: self->Paint(); return 0;
 	case WM_SIZE: {
 		// 最小化时客户区是 0x0，没必要重排控件，也避免把后备缓冲建成 0 尺寸。
 		if (wParam == SIZE_MINIMIZED) return 0;
 		self->LayoutEmbeddedWindows();
+		// 搜索框是原生子窗口，几何跟着卡片走，缩放时要跟着挪。
+		self->PositionProcessPickerSearchEdit();
 		InvalidateRect(hwnd, nullptr, FALSE);
 		return 0;
 	}
@@ -3302,12 +3668,22 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 		self->mouseTracking = false;
 		self->hoverTarget = -1;
 		self->pressTarget = -1;
+		self->processPicker.hoverRow = -1;
 		self->EnsureAnimationTimer();
 		InvalidateRect(hwnd, nullptr, FALSE);
 		return 0;
 	case WM_MOUSEWHEEL: {
 		POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
 		ScreenToClient(hwnd, &point);
+		if (self->ProcessPickerVisible()) {
+			const int notches = GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA;
+			const int rows = (std::max)(1, self->processPicker.rowCount);
+			const int maxScroll = (std::max)(0, static_cast<int>(self->processPicker.visible.size()) - rows);
+			self->processPicker.scroll = (std::max)(0,
+				(std::min)(maxScroll, self->processPicker.scroll - notches * 3));
+			InvalidateRect(hwnd, nullptr, FALSE);
+			return 0;
+		}
 		if (self->page == Page::Diagnostics && PtInRect(&self->diagnosticsListRect, point) &&
 			!self->diagnosticsVisibleDrivers.empty()) {
 			const int notches = GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA;
@@ -3340,6 +3716,14 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 	case WM_LBUTTONDOWN: {
 		// 只是记住按下的目标，用来给按钮画"按下去"的样子；真正的动作仍在抬起时执行。
 		POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+		if (self->ProcessPickerVisible()) {
+			self->pressTarget = self->HitProcessPickerAt(point);
+			if (self->pressTarget >= 0) {
+				self->EnsureAnimationTimer();
+				InvalidateRect(hwnd, nullptr, FALSE);
+			}
+			return 0;
+		}
 		if (self->UpdateDialogVisible()) {
 			self->pressTarget = self->HitUpdateDialogAt(point);
 			if (self->pressTarget >= 0) {
@@ -3365,6 +3749,17 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 	}
 	case WM_KEYDOWN:
 	case WM_SYSKEYDOWN:
+		// 进程选择器是模态的：上下选行、回车执行、Esc 取消，其余按键全吃掉。
+		if (self->ProcessPickerVisible()) {
+			// Tab 在弹窗自己的按钮之间转 —— 原来被下面那句"全吃掉"一起吞了，
+			// 键盘用户除了上下键没有别的出路。
+			if (wParam == VK_TAB) {
+				self->MoveFocus((GetKeyState(VK_SHIFT) & 0x8000) != 0);
+				return 0;
+			}
+			self->HandleProcessPickerKey(message, wParam);
+			return 0;
+		}
 		// 录制快捷键时，主键先归这里，别让 DefWindowProc 抢去（Alt 会拉系统菜单）。
 		if (self->hotkeyCaptureIndex >= 0) {
 			self->HandleHotkeyKey(static_cast<UINT>(wParam));
@@ -3395,6 +3790,13 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 			return 0;
 		}
 		break;
+	case WM_CHAR:
+		// 搜索框是自绘的，没有原生 EDIT 帮忙收字符，只能在这里取。
+		if (self->ProcessPickerVisible()) {
+			self->HandleProcessPickerKey(message, wParam);
+			return 0;
+		}
+		break;
 	case WM_KILLFOCUS:
 		if (self->hotkeyCaptureIndex >= 0) {
 			self->hotkeyCaptureIndex = -1;
@@ -3407,7 +3809,8 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 		auto item = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
 		if (item && ((item->CtlID >= IDC_NET_DETECT_PORT && item->CtlID <= IDC_NET_SCAN) || item->CtlID == IDC_NET_TEACHER ||
 			(item->CtlID >= IDC_TEACHER_REFRESH && item->CtlID <= IDC_TEACHER_REBOOT) || item->CtlID == IDC_TEACHER_VIEW || item->CtlID == IDC_TEACHER_CHAT_SEND)) {
-			DrawNativeButton(item, self->controlFont, self->darkMode, NativeButtonHoverMap()[item->hwndItem]);
+			DrawNativeButton(item, self->controlFont, self->darkMode, CardSurfaceColor(self->darkMode),
+				NativeButtonHoverMap()[item->hwndItem]);
 			return TRUE;
 		}
 		break;
@@ -3416,10 +3819,20 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 	case WM_CTLCOLORLISTBOX:
 	// STATIC 也要接管，否则教师端宿主框（WS_EX_CLIENTEDGE）会用系统灰
 	// COLOR_BTNFACE 画底，把下面自绘的圆角卡片盖成一个灰方块。
+	// BTN 同理：owner-draw 按钮在 WM_DRAWITEM 之前用这个画刷擦底，
+	// 不接管就是 RGB(240,240,240)，深色卡片上按钮四角会露出白边。
+	case WM_CTLCOLORBTN:
 	case WM_CTLCOLORSTATIC: {
 		HDC controlDc = reinterpret_cast<HDC>(wParam);
 		// 高级配置页的输入框要跟自绘的圆角框同色，否则控件那块方底色会顶出来。
 		const int controlId = GetDlgCtrlID(reinterpret_cast<HWND>(lParam));
+		if (controlId == kProcessPickerSearch) {
+			// 搜索框的方底色必须和自绘的圆角填充一模一样，否则圆角里会露出一个白/灰方块。
+			SetTextColor(controlDc, self->darkMode ? RGB(232, 238, 235) : RGB(26, 30, 28));
+			SetBkColor(controlDc, self->darkMode ? RGB(26, 33, 30) : RGB(255, 255, 255));
+			if (!self->processPickerFieldBrush) break;
+			return reinterpret_cast<LRESULT>(self->processPickerFieldBrush);
+		}
 		if (controlId == IDC_ADV_INTERVAL) {
 			SetTextColor(controlDc, self->darkMode ? RGB(222, 230, 226) : RGB(35, 42, 39));
 			SetBkColor(controlDc, self->darkMode ? RGB(26, 33, 30) : RGB(255, 255, 255));
@@ -3606,15 +4019,15 @@ void MainWindow::Paint()
 	case Page::Replacement: PaintProtection(g, width, height, offset); break;
 	case Page::Antivirus: PaintAntivirus(g, width, height, offset); break;
 	case Page::Advanced: PaintAdvanced(g, width, height, offset); break;
-	case Page::Help: PaintHelp(g, width, height, offset); break;
 	case Page::Network: PaintNetwork(g, width, height, offset); break;
 	case Page::Diagnostics: PaintDiagnostics(g, width, height, offset); break;
 	case Page::Logs: PaintLogs(g, width, height, offset); break;
 	case Page::About: PaintAbout(g, width, height, offset); break;
+	case Page::Injection: PaintInjection(g, width, height, offset); break;
 	}
 	// 键盘焦点环。只在 Tab 导航时出现，鼠标点击会清掉。
 	// 更新弹窗有自己的一套焦点环（画在卡片里），这里跳过，免得环被卡片盖住。
-	if (focusTarget >= 0 && !UpdateDialogVisible()) {
+	if (focusTarget >= 0 && !ModalDialogVisible()) {
 		RECT focusRect{};
 		if (TargetRect(focusTarget, &focusRect)) {
 			const RectF ring(static_cast<REAL>(focusRect.left) - 3.0f, static_cast<REAL>(focusRect.top) - 3.0f,
@@ -3627,6 +4040,7 @@ void MainWindow::Paint()
 	PaintToast(g, width, height);
 	// 弹窗画在最后：提示条、页面内容、焦点环都得在它下面。
 	PaintUpdateDialog(g, width, height);
+	PaintProcessPicker(g, width, height);
 	// 直接 BitBlt 到窗口 DC：比 Graphics::DrawImage 快约 45 倍。
 	// BeginPaint 拿到的 DC 已经按更新区裁剪，被子控件挡住的部分不会覆盖。
 	BitBlt(dc, 0, 0, width, height, backBufferDc, 0, 0, SRCCOPY);
@@ -3673,8 +4087,10 @@ void MainWindow::PaintNavigation(Graphics& g, int height)
 	Text(g, L"\u8bbe\u5907\u9632\u62a4\u4e2d\u5fc3", 76, 44, 128, 18, 11, FontStyleRegular, C(d, 67, 72, 70, 191, 200, 196));
 	Text(g, L"\u5de5\u4f5c\u533a", 24, 94, 150, 18, 11, FontStyleBold, C(d, 91, 97, 94, 164, 174, 169));
 
-	const int navIcons[] = { 0, 1, 5, 5, 6, 3, 0, 2, 3, 6 };
-	for (int i = 0; i < 10; ++i) {
+	const int navIcons[] = { 0, 1, 5, 5, 6, 6, 0, 2, 3, 6 };
+	static_assert(sizeof(navIcons) / sizeof(navIcons[0]) == sizeof(kNavLabels) / sizeof(kNavLabels[0]),
+		"navIcons and kNavLabels must have the same length");
+	for (int i = 0; i < kNavCount; ++i) {
 		const float y = 110.0f + i * 45.0f;
 		navRects[i] = { 12, static_cast<LONG>(y), 208, static_cast<LONG>(y + 40) };
 		const bool active = static_cast<int>(page) == i;
@@ -3688,7 +4104,7 @@ void MainWindow::PaintNavigation(Graphics& g, int height)
 		const float pillY = 110.0f + navIndicator * 45.0f;
 		FillRound(g, RectF(12, pillY, 196, 40), 20, C(d, 183, 232, 222, 42, 79, 72));
 	}
-	for (int i = 0; i < 10; ++i) {
+	for (int i = 0; i < kNavCount; ++i) {
 		const float y = 110.0f + i * 45.0f;
 		const bool active = static_cast<int>(page) == i;
 		const Color navColor = active ? C(d, 0, 81, 72, 156, 240, 225) : C(d, 58, 64, 61, 197, 207, 202);
@@ -3922,6 +4338,39 @@ void MainWindow::PaintOverview(Graphics& g, int width, int height, int offsetY)
 	}
 }
 
+// 「防护策略」右上角驱动状态框的数据。XDriverLoaded() 看的是本进程持有的设备
+// 句柄，驱动被别的实例加载（或者本进程刚启动还没打开）时它是 FALSE；这时再查
+// 一次 SCM，才能把「服务在跑但没连上」和「服务没起来」分开。
+const MainWindow::DriverStatusInfo& MainWindow::CurrentDriverStatus()
+{
+	const unsigned long long now = GetTickCount64();
+	if (driverStatus.sampledAt != 0 && now - driverStatus.sampledAt < 1500) return driverStatus;
+
+	driverStatus.handleOpen = XDriverLoaded() != FALSE;
+	LPCWSTR name = XGetDriverServiceName();
+	driverStatus.serviceName = (name != nullptr && name[0] != L'\0') ? name : L"";
+	driverStatus.serviceExists = false;
+	driverStatus.serviceRunning = false;
+	if (!driverStatus.serviceName.empty()) {
+		SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+		if (manager != nullptr) {
+			SC_HANDLE service = OpenServiceW(manager, driverStatus.serviceName.c_str(), SERVICE_QUERY_STATUS);
+			if (service != nullptr) {
+				SERVICE_STATUS status{};
+				if (QueryServiceStatus(service, &status)) {
+					driverStatus.serviceExists = true;
+					driverStatus.serviceRunning = status.dwCurrentState == SERVICE_RUNNING;
+				}
+				CloseServiceHandle(service);
+			}
+			CloseServiceHandle(manager);
+		}
+	}
+	// sampledAt 用 0 当哨兵，开机 1.5 秒内 GetTickCount64 可能真的落在 0 附近。
+	driverStatus.sampledAt = now != 0 ? now : 1;
+	return driverStatus;
+}
+
 void MainWindow::PaintProtection(Graphics& g, int width, int height, int offsetY)
 {
 	const float x = 248.0f;
@@ -3936,40 +4385,51 @@ void MainWindow::PaintProtection(Graphics& g, int width, int height, int offsetY
 	const float protectionCardH = replacementPage ? fillHeight : (std::min)(fillHeight, 560.0f);
 	// 标题区 88 + 底部留白 24，剩下按 4 个槽位平分。
 	const float toggleSlot = replacementPage ? 68.0f
-		: (std::max)(68.0f, (protectionCardH - 112.0f) / 4.0f);
+		: (std::max)(68.0f, (protectionCardH - 112.0f) / 5.0f);
 	// 行卡片在槽位里居中，槽位够大时最多长到 80，避免细长条看着像空行。
 	const float toggleRowH = (std::max)(62.0f, (std::min)(80.0f, toggleSlot - 14.0f));
 	SoftShadow(g, RectF(x, y, w, protectionCardH), 12, darkMode);
 	FillRound(g, RectF(x, y, w, protectionCardH), 12, C(darkMode, 255, 255, 255, 33, 40, 37));
+	// 页面顶部这一行要放三样东西：标题 + 副标题、「驱动状态」框、「卸载主驱动」。
+	// 状态框贴在按钮左边，窄窗口放不下就整块收起，副标题按剩余宽度截断，
+	// 免得三块叠在一起。
+	const float unloadX = x + w - 150.0f;
+	const float unloadY = y + 20.0f;
+	const float statusW = 292.0f;
+	const float statusX = unloadX - 12.0f - statusW;
+	// 放得下就显示，放不下整块收起；阈值按副标题还能留出一整行来定。
+	const bool showDriverStatus = statusX - (x + 24.0f) >= 300.0f;
+	const float headingRight = showDriverStatus ? statusX - 16.0f : unloadX - 16.0f;
 	if (!replacementPage) {
-	Text(g, L"\u884c\u4e3a\u63a7\u5236", x + 24, y + 20, 200, 28, 16, FontStyleBold, C(darkMode, 24, 30, 27, 226, 233, 229));
-	Text(g, L"\u9009\u62e9\u5141\u8bb8\u7684\u8fdc\u7a0b\u884c\u4e3a\uff0c\u66f4\u6539\u5c06\u7acb\u5373\u5e94\u7528", x + 24, y + 50, 440, 20, 11, FontStyleRegular, C(darkMode, 91, 99, 95, 166, 177, 171));
-	bool values[] = { !setAllowAllRunOp, setBandAllRunOp, setAllowGbTop, setProhibitKillProcess, setAllowMonitor, setProhibitCloseWindow, setAllowControl };
-	const float cardW = (w - 62) / 2.0f;
-	for (int i = 0; i < 7; ++i) {
-		const int col = i % 2;
-		const int row = i / 2;
-		const float cardX = x + 24 + col * (cardW + 14);
-		// 最后一行只有一个开关，仍按槽位对齐，不要让它自己居中跑偏。
-		const float cardY = y + 88 + row * toggleSlot + (toggleSlot - toggleRowH) / 2.0f;
-		toggleRects[i] = { static_cast<LONG>(cardX), static_cast<LONG>(cardY),
-			static_cast<LONG>(cardX + cardW), static_cast<LONG>(cardY + toggleRowH) };
-		FillRound(g, RectF(cardX, cardY, cardW, toggleRowH), 12 ,
-			Blend(C(darkMode, 248, 251, 249, 31, 37, 35), C(darkMode, 223, 238, 232, 48, 60, 56), hoverProgress[20 + i]));
-		const float toggleTextY = cardY + toggleRowH / 2.0f - 12.0f;
-		Text(g, kToggleLabels[i], cardX + 18, toggleTextY, cardW - 100, 25, 12, FontStyleRegular,
-			C(darkMode, 40, 46, 43, 220, 229, 225));
-		const float switchY = cardY + toggleRowH / 2.0f - 13.0f;
-		// 滑块按插值走，不是瞬间跳；轨道颜色跟着一起过渡。
-		const float motion = AnimateToggle(i, values[i]);
-		FillRound(g, RectF(cardX + cardW - 62, switchY, 44, 26), 13,
-			Blend(C(darkMode, 116, 124, 120, 97, 108, 103), C(darkMode, 0, 107, 95, 130, 213, 199), motion));
-		SolidBrush knob(Blend(C(darkMode, 245, 247, 245, 219, 225, 222), C(darkMode, 255, 255, 255, 0, 55, 49), motion));
-		g.FillEllipse(&knob, RectF(cardX + cardW - (58.0f - motion * 18.0f), switchY + 4.0f, 18.0f, 18.0f));
-	}
-	toggleRects[7] = {};
-	driverLoadRect = {};
-	driverUnloadRect = {};
+		Text(g, L"\u884c\u4e3a\u63a7\u5236", x + 24, y + 20, 200, 28, 16, FontStyleBold, C(darkMode, 24, 30, 27, 226, 233, 229));
+		Text(g, L"\u9ed8\u8ba4\u53ea\u8bb0\u5f55\u4e0d\u62e6\u622a\uff1b\u6253\u5f00\u54ea\u4e00\u9879\uff0c\u5bf9\u5e94\u7684\u62e6\u622a\u624d\u4f1a\u751f\u6548",
+			x + 24, y + 50, (std::max)(220.0f, headingRight - (x + 24.0f)), 20, 11, FontStyleRegular,
+			C(darkMode, 91, 99, 95, 166, 177, 171));
+		bool values[] = { !setAllowAllRunOp, setBandAllRunOp, setAllowGbTop, setProhibitKillProcess, setAllowMonitor, setProhibitCloseWindow, setAllowControl, setBlockWindowOps, setBlockDriverAccess };
+		const float cardW = (w - 62) / 2.0f;
+		for (int i = 0; i < kProtectionToggleCount; ++i) {
+			const int col = i % 2;
+			const int row = i / 2;
+			const float cardX = x + 24 + col * (cardW + 14);
+			// 最后一行只有一个开关，仍按槽位对齐，不要让它自己居中跑偏。
+			const float cardY = y + 88 + row * toggleSlot + (toggleSlot - toggleRowH) / 2.0f;
+			toggleRects[i] = { static_cast<LONG>(cardX), static_cast<LONG>(cardY),
+				static_cast<LONG>(cardX + cardW), static_cast<LONG>(cardY + toggleRowH) };
+			FillRound(g, RectF(cardX, cardY, cardW, toggleRowH), 12 ,
+				Blend(C(darkMode, 248, 251, 249, 31, 37, 35), C(darkMode, 223, 238, 232, 48, 60, 56), hoverProgress[20 + i]));
+			const float toggleTextY = cardY + toggleRowH / 2.0f - 12.0f;
+			Text(g, kToggleLabels[i], cardX + 18, toggleTextY, cardW - 100, 25, 12, FontStyleRegular,
+				C(darkMode, 40, 46, 43, 220, 229, 225));
+			const float switchY = cardY + toggleRowH / 2.0f - 13.0f;
+			// 滑块按插值走，不是瞬间跳；轨道颜色跟着一起过渡。
+			const float motion = AnimateToggle(i, values[i]);
+			FillRound(g, RectF(cardX + cardW - 62, switchY, 44, 26), 13,
+				Blend(C(darkMode, 116, 124, 120, 97, 108, 103), C(darkMode, 0, 107, 95, 130, 213, 199), motion));
+			SolidBrush knob(Blend(C(darkMode, 245, 247, 245, 219, 225, 222), C(darkMode, 255, 255, 255, 0, 55, 49), motion));
+			g.FillEllipse(&knob, RectF(cardX + cardW - (58.0f - motion * 18.0f), switchY + 4.0f, 18.0f, 18.0f));
+		}
+		driverLoadRect = {};
+		driverUnloadRect = {};
 		saveSettingsRect = {};
 	}
 	else {
@@ -3978,11 +4438,47 @@ void MainWindow::PaintProtection(Graphics& g, int width, int height, int offsetY
 		saveSettingsRect = {};
 	}
 	if (!replacementPage) {
-		const float buttonX = x + w - 150;
-		const float buttonY = y + 20;
-		driverUnloadRect = { static_cast<LONG>(buttonX), static_cast<LONG>(buttonY), static_cast<LONG>(buttonX + 126), static_cast<LONG>(buttonY + 36) };
-		PaintButton(g, RectF(buttonX, buttonY, 126, 36), L"\u5378\u8f7d\u4e3b\u9a71\u52a8", 44,
+		driverUnloadRect = { static_cast<LONG>(unloadX), static_cast<LONG>(unloadY),
+			static_cast<LONG>(unloadX + 126), static_cast<LONG>(unloadY + 36) };
+		PaintButton(g, RectF(unloadX, unloadY, 126, 36), L"\u5378\u8f7d\u4e3b\u9a71\u52a8", 44,
 			ButtonStyle::Danger, 18);
+		// 驱动状态框：跟按钮竖直居中，动手之前先看清现在到底连没连上。
+		if (showDriverStatus) {
+			const DriverStatusInfo& status = CurrentDriverStatus();
+			const float boxY = unloadY - 5.0f;
+			FillRound(g, RectF(statusX, boxY, statusW, 46), 10, C(darkMode, 245, 248, 246, 43, 49, 46));
+			StrokeRound(g, RectF(statusX, boxY, statusW, 46), 10, C(darkMode, 226, 234, 229, 44, 52, 48));
+			Color stateColor;
+			const wchar_t* headline;
+			if (status.handleOpen) {
+				stateColor = C(darkMode, 0, 127, 112, 130, 213, 199);
+				headline = L"驱动已加载";
+			}
+			else if (status.serviceRunning) {
+				// 服务在跑、本进程却没句柄：这能解释"点了没反应"那类现象，
+				// 不能笼统写成未加载。
+				stateColor = C(darkMode, 184, 130, 23, 239, 198, 101);
+				headline = L"驱动在运行";
+			}
+			else {
+				stateColor = C(darkMode, 120, 128, 124, 150, 162, 156);
+				headline = L"驱动未加载";
+			}
+			FillRound(g, RectF(statusX + 14, boxY + 10, 10, 10), 5, stateColor);
+			Text(g, headline, statusX + 32, boxY + 6, statusW - 44, 18, 11, FontStyleBold, stateColor);
+			std::wstring detail;
+			if (status.serviceName.empty()) {
+				detail = L"本次运行还没有创建服务";
+			}
+			else {
+				detail = L"服务 " + status.serviceName;
+				if (status.handleOpen) detail += L" · 已连接";
+				else if (status.serviceRunning) detail += L" · 已启动";
+				else if (status.serviceExists) detail += L" · 未启动";
+			}
+			TextSingleLine(g, detail.c_str(), statusX + 32, boxY + 25, statusW - 44, 16, 10,
+				FontStyleRegular, C(darkMode, 91, 99, 95, 166, 177, 171));
+		}
 		temporaryVideoEnableRect = {};
 		temporaryVideoImageModeRect = {};
 		temporaryVideoFileModeRect = {};
@@ -4255,6 +4751,812 @@ float AdvancedToggleSlot(float cardHeight)
 	return (std::max)(72.0f, (std::min)(104.0f, (AdvancedHotkeyCardY(cardHeight) - 94.0f) / 3.0f));
 }
 
+// ---- 进程选择器：布局与进程探测 -------------------------------------------
+// 和更新弹窗共用一套"窗口内自绘模态卡片"的骨架，但内容区是一张可滚动的进程表。
+struct PickerGeometry {
+	RectF card;
+	RectF search;
+	RectF selectAll;
+	RectF refresh;
+	RectF list;
+	float rowHeight = 36.0f;
+	int rows = 1;
+};
+
+PickerGeometry ComputePickerGeometry(int width, int height)
+{
+	PickerGeometry geom;
+	float cardW = (std::min)(680.0f, static_cast<float>(width) - 96.0f);
+	cardW = (std::max)(cardW, 420.0f);
+	float cardH = (std::min)(620.0f, static_cast<float>(height) - 80.0f);
+	cardH = (std::max)(cardH, 360.0f);
+	const float cardX = (static_cast<float>(width) - cardW) / 2.0f;
+	const float cardY = (static_cast<float>(height) - cardH) / 2.0f;
+	geom.card = RectF(cardX, cardY, cardW, cardH);
+	const float right = cardX + cardW - 24.0f;
+	geom.refresh = RectF(right - 76.0f, cardY + 84.0f, 76.0f, 38.0f);
+	geom.selectAll = RectF(right - 76.0f - 8.0f - 76.0f, cardY + 84.0f, 76.0f, 38.0f);
+	geom.search = RectF(cardX + 24.0f, cardY + 84.0f, geom.selectAll.X - 12.0f - (cardX + 24.0f), 38.0f);
+	// 列表底部给页脚（状态行 + 两个按钮）留 82px。上下各留 6px 内边距。
+	const float listTop = cardY + 136.0f;
+	const float listBottom = cardY + cardH - 24.0f - 40.0f - 18.0f;
+	const float available = (std::max)(geom.rowHeight + 12.0f, listBottom - listTop);
+	int rows = static_cast<int>((available - 12.0f) / geom.rowHeight);
+	rows = (std::max)(1, (std::min)(kProcessPickerMaxRows, rows));
+	geom.rows = rows;
+	geom.list = RectF(cardX + 24.0f, listTop, cardW - 48.0f, geom.rowHeight * rows + 12.0f);
+	return geom;
+}
+
+// 只把训练器自己标成不可注入：hooks 装进本进程会把自己的文件/注册表调用一起钩住。
+// 系统关键进程不再"豁免"—— 目标可能是人工添加的，拦不拦该由用户决定；
+// 这里只给一个「系统」标签提示风险，注入本身照常尝试，失败由注入器给真实错误码。
+bool IsPickerSelfProcess(DWORD pid)
+{
+	return pid == GetCurrentProcessId();
+}
+
+bool IsCriticalPickerProcess(const std::wstring& name)
+{
+	static const wchar_t* kCritical[] = {
+		L"System", L"[System Process]", L"System Idle Process", L"smss.exe", L"csrss.exe",
+		L"wininit.exe", L"services.exe", L"lsass.exe", L"winlogon.exe", L"svchost.exe",
+		L"fontdrvhost.exe", L"dwm.exe", L"audiodg.exe", L"conhost.exe", L"MsMpEng.exe",
+		L"Registry", L"Memory Compression"
+	};
+	for (size_t i = 0; i < _countof(kCritical); ++i)
+		if (_wcsicmp(name.c_str(), kCritical[i]) == 0) return true;
+	return false;
+}
+
+// 位数和映像路径一次 OpenProcess 拿全。位数只是列表展示用，失败就记成"未知"
+// （UI 是 32 位进程，遇到受保护进程打不开句柄很正常）。
+void ProbePickerProcess(DWORD pid, std::wstring* path, bool* is64, bool* known)
+{
+	*is64 = false;
+	*known = false;
+	path->clear();
+	HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+	if (!process) return;
+	WCHAR imagePath[MAX_PATH] = {};
+	DWORD imageSize = _countof(imagePath);
+	if (QueryFullProcessImageNameW(process, 0, imagePath, &imageSize))
+		path->assign(imagePath, imageSize);
+	typedef BOOL(WINAPI *IsWow64Process2Fn)(HANDLE, USHORT*, USHORT*);
+	static IsWow64Process2Fn isWow64Process2 = []() -> IsWow64Process2Fn {
+		const HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+		return kernel32
+			? reinterpret_cast<IsWow64Process2Fn>(GetProcAddress(kernel32, "IsWow64Process2"))
+			: nullptr;
+	}();
+	if (isWow64Process2) {
+		USHORT machine = 0, native = 0;
+		if (isWow64Process2(process, &machine, &native)) {
+			*is64 = machine == IMAGE_FILE_MACHINE_AMD64 || machine == IMAGE_FILE_MACHINE_ARM64
+				|| (machine == IMAGE_FILE_MACHINE_UNKNOWN && native != IMAGE_FILE_MACHINE_I386);
+			*known = true;
+			CloseHandle(process);
+			return;
+		}
+	}
+	BOOL wow64 = FALSE;
+	if (IsWow64Process(process, &wow64)) {
+		*is64 = !wow64;
+		*known = true;
+	}
+	CloseHandle(process);
+}
+
+// 把 HICON 转成带正确 alpha 的 32bpp 位图。
+//
+// 不能用 Bitmap::FromHICON：对没有 alpha 通道的旧式图标，它会带出一块不透明的
+// 黑底/白底方块，压在青色选中行上就是一个突兀的色块 —— 这就是"图标底色和背景
+// 不匹配"的来源。这里改用「同一图标分别画在黑底和白底上，再反推 alpha」：
+//   colorOnWhite = C·a + 255·(1-a)，colorOnBlack = C·a
+//   → a = 1 - (white - black)/255，C = black / a
+// 掩码、调色板、32 位 alpha 三种图标都能统一处理，不需要读 mask 位图。
+std::shared_ptr<Bitmap> MakeIconBitmap(HICON icon, int size)
+{
+	if (!icon || size <= 0) return nullptr;
+	auto renderOn = [icon, size](BYTE background, std::vector<BYTE>* out) {
+		BITMAPINFO bmi{};
+		bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+		bmi.bmiHeader.biWidth = size;
+		bmi.bmiHeader.biHeight = -size;   // 负高度 = 自上而下，和位图内存顺序一致
+		bmi.bmiHeader.biPlanes = 1;
+		bmi.bmiHeader.biBitCount = 32;
+		bmi.bmiHeader.biCompression = BI_RGB;
+		void* bits = nullptr;
+		HDC screen = GetDC(nullptr);
+		HDC mem = CreateCompatibleDC(screen);
+		HBITMAP dib = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+		bool ok = dib && bits;
+		if (ok) {
+			HGDIOBJ old = SelectObject(mem, dib);
+			memset(bits, background, static_cast<size_t>(size) * size * 4);
+			DrawIconEx(mem, 0, 0, icon, size, size, 0, nullptr, DI_NORMAL);
+			GdiFlush();
+			const size_t bytes = static_cast<size_t>(size) * size * 4;
+			out->assign(static_cast<BYTE*>(bits), static_cast<BYTE*>(bits) + bytes);
+			SelectObject(mem, old);
+		}
+		if (dib) DeleteObject(dib);
+		DeleteDC(mem);
+		ReleaseDC(nullptr, screen);
+		return ok;
+	};
+
+	std::vector<BYTE> onBlack, onWhite;
+	if (!renderOn(0, &onBlack) || !renderOn(255, &onWhite)) return nullptr;
+	auto bitmap = std::make_shared<Bitmap>(size, size, PixelFormat32bppARGB);
+	if (!bitmap || bitmap->GetLastStatus() != Ok) return nullptr;
+	Rect lockRect(0, 0, size, size);
+	BitmapData data{};
+	if (bitmap->LockBits(&lockRect, ImageLockModeWrite, PixelFormat32bppARGB, &data) != Ok)
+		return nullptr;
+	for (int y = 0; y < size; ++y) {
+		BYTE* dst = static_cast<BYTE*>(data.Scan0) + static_cast<ptrdiff_t>(y) * data.Stride;
+		for (int x = 0; x < size; ++x) {
+			const size_t i = static_cast<size_t>(y * size + x) * 4;
+			// diff 是"被背景透出来的量"，最大通道最能代表真实的透明度。
+			int spill = 0;
+			for (int c = 0; c < 3; ++c) {
+				const int diff = static_cast<int>(onWhite[i + c]) - static_cast<int>(onBlack[i + c]);
+				if (diff > spill) spill = diff;
+			}
+			if (spill < 0) spill = 0;
+			const int opacity = 255 - spill;
+			if (opacity <= 0) {
+				dst[x * 4 + 0] = dst[x * 4 + 1] = dst[x * 4 + 2] = dst[x * 4 + 3] = 0;
+				continue;
+			}
+			for (int c = 0; c < 3; ++c) {
+				// onBlack 是 C·a，除回去才是直通 alpha 的颜色。
+				int value = static_cast<int>(onBlack[i + c]) * 255 / opacity;
+				dst[x * 4 + c] = static_cast<BYTE>(value > 255 ? 255 : value);
+			}
+			dst[x * 4 + 3] = static_cast<BYTE>(opacity);
+		}
+	}
+	bitmap->UnlockBits(&data);
+	return bitmap;
+}
+
+// 进程图标缓存：按 exe 路径缓存 16x16 位图。
+// 只在真正画到某一行时才去问 Shell，所以打开列表只需为可见的十来行付代价，
+// 不会因为系统里有 300 个进程就先等 300 次 SHGetFileInfo。
+std::unordered_map<std::wstring, std::shared_ptr<Bitmap>>& ProcessIconCache()
+{
+	static std::unordered_map<std::wstring, std::shared_ptr<Bitmap>> cache;
+	return cache;
+}
+
+Bitmap* ProcessIconFor(const std::wstring& path)
+{
+	if (path.empty()) return nullptr;
+	std::wstring key = path;
+	for (wchar_t& ch : key) ch = static_cast<wchar_t>(towlower(ch));
+	auto& cache = ProcessIconCache();
+	const auto found = cache.find(key);
+	if (found != cache.end()) return found->second.get();
+	std::shared_ptr<Bitmap> bitmap;
+	SHFILEINFOW info{};
+	if (SHGetFileInfoW(path.c_str(), 0, &info, sizeof(info), SHGFI_ICON | SHGFI_SMALLICON)
+		&& info.hIcon) {
+		bitmap = MakeIconBitmap(info.hIcon, 16);
+		DestroyIcon(info.hIcon);
+	}
+	// 失败也记进缓存（存空指针），避免每次重绘都再问一遍受保护进程。
+	cache.emplace(key, bitmap);
+	return bitmap.get();
+}
+
+// 和字体缓存一样，位图必须在 GdiplusShutdown 之前释放。
+void ClearProcessIconCache()
+{
+	ProcessIconCache().clear();
+}
+
+void MainWindow::PaintInjection(Gdiplus::Graphics& g, int width, int height, int offsetY)
+{
+	const float x = 248.0f;
+	const float y = 94.0f + offsetY;
+	const float w = static_cast<float>(width - 276);
+	const float h = static_cast<float>(height) - y - 20;
+	const Color surface = C(darkMode, 248, 251, 249, 31, 37, 35);
+	const Color titleColor = C(darkMode, 42, 49, 46, 220, 229, 225);
+	const Color secondary = C(darkMode, 98, 106, 102, 159, 171, 165);
+	const Color hairline = C(darkMode, 226, 234, 229, 44, 52, 48);
+	SoftShadow(g, RectF(x, y, w, h), 12, darkMode);
+	FillRound(g, RectF(x, y, w, h), 12, C(darkMode, 255, 255, 255, 33, 40, 37));
+	Text(g, L"\u81ea\u5b9a\u4e49\u8fdb\u7a0b\u6ce8\u5165", x + 24, y + 22, w - 48, 26, 15, FontStyleBold, titleColor);
+	Text(g, L"\u628a hooks DLL \u6ce8\u5165\u5230\u4f60\u9009\u4e2d\u7684\u8fdb\u7a0b\uff1a\u70b9\u4e0b\u65b9\u6309\u94ae\u4f1a\u6253\u5f00\u8fdb\u7a0b\u5217\u8868\uff0c\u6309\u540d\u79f0\u6216 PID \u8fc7\u6ee4\u540e\u9009\u4e2d\u5373\u53ef\uff0c32 / 64 \u4f4d\u81ea\u52a8\u8bc6\u522b\u3002", x + 24, y + 54, w - 48, 22, 11, FontStyleRegular, secondary);
+	Text(g, L"\u9ed8\u8ba4\u88c5 34 \u9879\u6709\u5e8f\u8868\uff1bini [CustomInject] Mode=minimal \u53ef\u8df3\u8fc7\u6781\u57df\u4e13\u5c5e\u94a9\u5b50\u3002\u7cfb\u7edf\u5173\u952e\u8fdb\u7a0b\u4e5f\u53ef\u9009\uff0c\u6807\u300c\u7cfb\u7edf\u300d\u4ec5\u4f5c\u63d0\u793a\u3002", x + 24, y + 78, w - 48, 22, 11, FontStyleRegular, secondary);
+	const float by = y + 116;
+	const float bw = 150.0f;
+	const wchar_t* labels[] = { L"\u6ce8\u5165\u5230\u6307\u5b9a\u8fdb\u7a0b", L"\u5378\u8f7d", L"\u5237\u65b0\u5217\u8868" };
+	for (int i = 0; i < 3; ++i) {
+		const float bx = x + 24 + i * (bw + 12.0f);
+		customInjectRects[i] = { static_cast<LONG>(bx), static_cast<LONG>(by),
+			static_cast<LONG>(bx + bw), static_cast<LONG>(by + 40) };
+		PaintButton(g, RectF(bx, by, bw, 40), labels[i], 110 + i,
+			i == 1 ? ButtonStyle::Danger : (i == 0 ? ButtonStyle::Primary : ButtonStyle::Tonal), 10.0f);
+	}
+	Text(g, customInjectStatus.c_str(), x + 24, y + 172, w - 48, 24, 11, FontStyleBold, titleColor);
+	const float listY = y + 206;
+	const float listH = (std::max)(120.0f, h - 240.0f);
+	FillRound(g, RectF(x + 24, listY, w - 48, listH), 12, surface);
+	StrokeRound(g, RectF(x + 24, listY, w - 48, listH), 12, hairline);
+	const std::wstring list = customInjectList.empty()
+		? std::wstring(L"\uff08\u6682\u65e0\u81ea\u5b9a\u4e49\u6ce8\u5165\u8fdb\u7a0b\uff09") : customInjectList;
+	size_t start = 0;
+	float lineY = listY + 16;
+	while (start < list.size() && lineY < listY + listH - 18) {
+		const size_t end = list.find(L'\n', start);
+		const std::wstring line = list.substr(start,
+			end == std::wstring::npos ? std::wstring::npos : end - start);
+		Text(g, line.c_str(), x + 40, lineY, w - 80, 20, 11, FontStyleRegular, titleColor);
+		if (end == std::wstring::npos) break;
+		start = end + 1;
+		lineY += 22.0f;
+	}
+}
+
+// ---- 进程选择器 -----------------------------------------------------------
+// 原先用 PromptAvText 弹原生输入框，让用户自己敲 PID 或进程名：敲错就得重来，
+// 而且那个框是直角灰底 + 系统标题栏，和这套圆角卡片是两套皮。
+// 现在改成窗口内自绘模态：搜索框 + 可滚动进程表 + 页脚动作区。
+
+void MainWindow::OpenProcessPicker(bool unload)
+{
+	processPicker.mode = unload ? ProcessPickerMode::Unload : ProcessPickerMode::Inject;
+	processPicker.appear = 0.0f;
+	processPicker.filter.clear();
+	processPicker.status.clear();
+	processPicker.cursor = -1;
+	processPicker.anchor = -1;
+	processPicker.scroll = 0;
+	processPicker.hoverRow = -1;
+	if (hotkeyCaptureIndex >= 0) hotkeyCaptureIndex = -1;
+	RefreshProcessPicker();
+	focusTarget = -1;
+	hoverTarget = -1;
+	pressTarget = -1;
+	ApplyDialogOcclusion();
+	SetForegroundWindow(_hWnd);
+	SetFocus(_hWnd);
+	// 搜索框必须是真控件才收得到输入法：自绘的矩形框没有焦点、没有光标、
+	// 也不在任何输入上下文中，中文输入时的组合串（WM_IME_CHAR）一律丢掉。
+	EnsureProcessPickerSearchEdit();
+	if (processPickerSearchEdit) {
+		SetWindowTextW(processPickerSearchEdit, L"");
+		PositionProcessPickerSearchEdit();
+		ShowWindow(processPickerSearchEdit, SW_SHOW);
+		SetFocus(processPickerSearchEdit);
+	}
+	EnsureAnimationTimer();
+	InvalidateRect(_hWnd, nullptr, FALSE);
+}
+
+void MainWindow::CloseProcessPicker()
+{
+	if (processPickerSearchEdit) {
+		ShowWindow(processPickerSearchEdit, SW_HIDE);
+		if (GetFocus() == processPickerSearchEdit) SetFocus(_hWnd);
+	}
+	processPicker.mode = ProcessPickerMode::None;
+	processPicker.appear = 0.0f;
+	processPicker.hoverRow = -1;
+	processPicker.status.clear();
+	focusTarget = -1;
+	hoverTarget = -1;
+	pressTarget = -1;
+	ApplyDialogOcclusion();
+	InvalidateRect(_hWnd, nullptr, FALSE);
+}
+
+// 搜索框的输入部分交给原生 EDIT，父窗口只负责画圆角底和描边。
+// 之前它是纯自绘的：没有焦点、没有光标、Tab 顺序里也没有它，主窗口只接 WM_CHAR。
+// 用中文输入法时字母先被 IME 吃掉，提交后才发 WM_IME_CHAR，这里没人处理 ——
+// 所以那个框在中文输入法下"点了没反应"，看着就像拿不到焦点。
+// 换成 EDIT 后光标、选区、系统剪贴板、右键菜单和输入法组合串都归系统管，
+// 这边只需要把文本回灌给过滤器。
+void MainWindow::EnsureProcessPickerSearchEdit()
+{
+	if (processPickerSearchEdit) return;
+	processPickerSearchEdit = CreateWindowExW(0, L"EDIT", L"",
+		WS_CHILD | ES_AUTOHSCROLL | ES_LEFT,
+		0, 0, 10, 10, _hWnd,
+		reinterpret_cast<HMENU>(static_cast<INT_PTR>(kProcessPickerSearch)),
+		JTAppGetInstanceDirect(), nullptr);
+	if (!processPickerSearchEdit) return;
+	SendMessageW(processPickerSearchEdit, WM_SETFONT,
+		reinterpret_cast<WPARAM>(controlFont), TRUE);
+	// 占位符交给系统的 cue banner（comctl32 v6 由 App.cpp 的 manifestdependency 引入）。
+	SendMessageW(processPickerSearchEdit, EM_SETCUEBANNER, TRUE,
+		reinterpret_cast<LPARAM>(L"\u6309\u8fdb\u7a0b\u540d / PID \u8fc7\u6ee4"));
+	processPickerSearchEditProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
+		processPickerSearchEdit, GWLP_WNDPROC,
+		reinterpret_cast<LONG_PTR>(ProcessPickerSearchProc)));
+}
+
+void MainWindow::PositionProcessPickerSearchEdit()
+{
+	if (!processPickerSearchEdit || !ProcessPickerVisible()) return;
+	RECT client{};
+	GetClientRect(_hWnd, &client);
+	const PickerGeometry geom = ComputePickerGeometry(client.right, client.bottom);
+	RECT target{};
+	target.left = static_cast<LONG>(geom.search.X);
+	target.top = static_cast<LONG>(geom.search.Y);
+	target.right = static_cast<LONG>(geom.search.GetRight());
+	target.bottom = static_cast<LONG>(geom.search.GetBottom());
+	// 圆角画在父窗口上，EDIT 是方的：四周各让 10 / 7 像素，贴边会把圆角削掉。
+	InflateRect(&target, -10, -7);
+	RECT current{};
+	GetWindowRect(processPickerSearchEdit, &current);
+	MapWindowPoints(HWND_DESKTOP, _hWnd, reinterpret_cast<POINT*>(&current), 2);
+	if (EqualRect(&current, &target)) return;
+	SetWindowPos(processPickerSearchEdit, HWND_TOP, target.left, target.top,
+		target.right - target.left, target.bottom - target.top, SWP_NOACTIVATE);
+}
+
+void MainWindow::SyncProcessPickerFilterFromEdit()
+{
+	if (!processPickerSearchEdit) return;
+	wchar_t buffer[64] = {};
+	GetWindowTextW(processPickerSearchEdit, buffer, _countof(buffer));
+	std::wstring text(buffer);
+	// 上限和原来手打时一致，免得整段粘进来把匹配拖慢。
+	if (text.size() > 32) text.resize(32);
+	if (text == processPicker.filter) return;
+	processPicker.filter = std::move(text);
+	RebuildProcessPickerVisible();
+	InvalidateRect(_hWnd, nullptr, FALSE);
+}
+
+LRESULT CALLBACK MainWindow::ProcessPickerSearchProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+	MainWindow* self = currentMainWindow;
+	switch (message) {
+	case WM_KEYDOWN:
+		if (self) {
+			switch (wParam) {
+			// 这些键归列表：光标行、翻页、执行、取消。EDIT 只管文字和左右移动。
+			case VK_UP:
+			case VK_DOWN:
+			case VK_PRIOR:
+			case VK_NEXT:
+			case VK_RETURN:
+			case VK_ESCAPE:
+				self->HandleProcessPickerKey(WM_KEYDOWN, wParam);
+				return 0;
+			case VK_TAB:
+				self->MoveFocus((GetKeyState(VK_SHIFT) & 0x8000) != 0);
+				return 0;
+			default:
+				break;
+			}
+		}
+		break;
+	case WM_CHAR:
+		// 上面已经处理过的控制字符别再漏进文本框。
+		if (wParam == L'\r' || wParam == L'\n' || wParam == L'\t' || wParam == 0x1B) return 0;
+		break;
+	case WM_MOUSEWHEEL:
+		// EDIT 会把滚轮当成滚文本，这里改成滚列表。lParam 本来就是屏幕坐标，
+		// 父窗口的 WM_MOUSEWHEEL 分支自己会转换。
+		PostMessageW(self ? self->_hWnd : GetParent(hwnd), WM_MOUSEWHEEL, wParam, lParam);
+		return 0;
+	default:
+		break;
+	}
+	WNDPROC base = (self && self->processPickerSearchEditProc)
+		? self->processPickerSearchEditProc : DefWindowProcW;
+	return CallWindowProcW(base, hwnd, message, wParam, lParam);
+}
+
+void MainWindow::RefreshProcessPicker()
+{
+	processPicker.entries.clear();
+	int injectedCount = 0;
+	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snapshot != INVALID_HANDLE_VALUE) {
+		PROCESSENTRY32W entry{};
+		entry.dwSize = sizeof(entry);
+		if (Process32FirstW(snapshot, &entry)) {
+			do {
+				ProcessPickerEntry item;
+				item.pid = entry.th32ProcessID;
+				item.name = entry.szExeFile;
+				if (item.name.empty()) continue;
+				item.self = IsPickerSelfProcess(item.pid);
+				item.critical = IsCriticalPickerProcess(item.name);
+				item.injected = currentWorker && currentWorker->IsCustomInjected(item.pid);
+				if (item.injected) ++injectedCount;
+				// 系统进程也探测：它们照样能被选中注入，位数得显示出来。
+				ProbePickerProcess(item.pid, &item.path, &item.is64, &item.bitnessKnown);
+				processPicker.entries.push_back(std::move(item));
+			} while (Process32NextW(snapshot, &entry));
+		}
+		CloseHandle(snapshot);
+	}
+	// 已注入的排最前（卸载时第一眼就能看到），训练器自身垫底，中间按名字排。
+	std::stable_sort(processPicker.entries.begin(), processPicker.entries.end(),
+		[](const ProcessPickerEntry& left, const ProcessPickerEntry& right) {
+			if (left.self != right.self) return !left.self;
+			if (left.injected != right.injected) return left.injected;
+			return _wcsicmp(left.name.c_str(), right.name.c_str()) < 0;
+		});
+	processPicker.scroll = 0;
+	// 列表重建了，勾选位跟着重建：宁可让用户重勾，也不能让下标和别的进程错位。
+	processPicker.checked.assign(processPicker.entries.size(), 0);
+	RebuildProcessPickerVisible();
+	WCHAR summary[128] = {};
+	swprintf_s(summary, L"\u5171 %d \u4e2a\u8fdb\u7a0b\uff0c\u5df2\u6ce8\u5165 %d \u4e2a",
+		static_cast<int>(processPicker.entries.size()), injectedCount);
+	processPicker.status = summary;
+}
+
+void MainWindow::RebuildProcessPickerVisible()
+{
+	processPicker.visible.clear();
+	std::wstring filter = processPicker.filter;
+	for (wchar_t& ch : filter) ch = static_cast<wchar_t>(towlower(ch));
+	for (int index = 0; index < static_cast<int>(processPicker.entries.size()); ++index) {
+		const ProcessPickerEntry& item = processPicker.entries[static_cast<size_t>(index)];
+		if (filter.empty()) {
+			processPicker.visible.push_back(index);
+			continue;
+		}
+		std::wstring name = item.name;
+		for (wchar_t& ch : name) ch = static_cast<wchar_t>(towlower(ch));
+		std::wstring path = item.path;
+		for (wchar_t& ch : path) ch = static_cast<wchar_t>(towlower(ch));
+		const std::wstring pid = std::to_wstring(item.pid);
+		if (name.find(filter) != std::wstring::npos || path.find(filter) != std::wstring::npos
+			|| pid.find(filter) != std::wstring::npos)
+			processPicker.visible.push_back(index);
+	}
+	// 过滤条件变了，焦点行不一定还在；落到第一个可注入的进程上。勾选不受影响。
+	processPicker.cursor = -1;
+	for (int i = 0; i < static_cast<int>(processPicker.visible.size()); ++i) {
+		const ProcessPickerEntry& item =
+			processPicker.entries[static_cast<size_t>(processPicker.visible[static_cast<size_t>(i)])];
+		if (!item.self) { processPicker.cursor = i; break; }
+	}
+	processPicker.anchor = processPicker.cursor;
+	processPicker.scroll = 0;
+}
+
+int MainWindow::HitProcessPickerAt(POINT point) const
+{
+	if (!ProcessPickerVisible()) return -1;
+	if (!IsRectEmpty(&processPickerPrimaryRect) && Hit(processPickerPrimaryRect, point))
+		return kProcessPickerPrimary;
+	if (!IsRectEmpty(&processPickerSecondaryRect) && Hit(processPickerSecondaryRect, point))
+		return kProcessPickerSecondary;
+	if (!IsRectEmpty(&processPickerRefreshRect) && Hit(processPickerRefreshRect, point))
+		return kProcessPickerRefresh;
+	if (!IsRectEmpty(&processPickerSelectAllRect) && Hit(processPickerSelectAllRect, point))
+		return kProcessPickerSelectAll;
+	return -1;
+}
+
+void MainWindow::UpdateProcessPickerHover(POINT point)
+{
+	if (!ProcessPickerVisible()) return;
+	const int target = HitProcessPickerAt(point);
+	int row = -1;
+	if (Hit(processPickerListRect, point)) {
+		for (int i = 0; i < processPicker.rowCount; ++i) {
+			if (!IsRectEmpty(&processPickerRowRects[static_cast<size_t>(i)]) &&
+				Hit(processPickerRowRects[static_cast<size_t>(i)], point)) {
+				row = i;
+				break;
+			}
+		}
+	}
+	SetCursor(LoadCursorW(nullptr, (target >= 0 || row >= 0) ? IDC_HAND : IDC_ARROW));
+	if (row != processPicker.hoverRow) {
+		processPicker.hoverRow = row;
+		InvalidateRect(_hWnd, nullptr, FALSE);
+	}
+	if (target != hoverTarget) {
+		hoverTarget = target;
+		EnsureAnimationTimer();
+		InvalidateRect(_hWnd, nullptr, FALSE);
+	}
+}
+
+bool MainWindow::HandleProcessPickerClick(POINT point)
+{
+	if (!ProcessPickerVisible()) return false;
+	const int target = HitProcessPickerAt(point);
+	if (target == kProcessPickerPrimary) {
+		CommitProcessPicker();
+		return true;
+	}
+	if (target == kProcessPickerSecondary) {
+		CloseProcessPicker();
+		return true;
+	}
+	if (target == kProcessPickerRefresh) {
+		RefreshProcessPicker();
+		InvalidateRect(_hWnd, nullptr, FALSE);
+		return true;
+	}
+	if (target == kProcessPickerSelectAll) {
+		// 全选只作用于当前过滤结果：用户搜了 "chrome" 之后点全选，不该把整机都勾上。
+		bool allChecked = true;
+		for (int index : processPicker.visible) {
+			const ProcessPickerEntry& item = processPicker.entries[static_cast<size_t>(index)];
+			if (item.self) continue;
+			if (!processPicker.checked[static_cast<size_t>(index)]) { allChecked = false; break; }
+		}
+		for (int index : processPicker.visible) {
+			const ProcessPickerEntry& item = processPicker.entries[static_cast<size_t>(index)];
+			if (item.self) continue;
+			processPicker.checked[static_cast<size_t>(index)] = allChecked ? 0 : 1;
+		}
+		InvalidateRect(_hWnd, nullptr, FALSE);
+		return true;
+	}
+	if (Hit(processPickerListRect, point)) {
+		for (int row = 0; row < processPicker.rowCount; ++row) {
+			if (IsRectEmpty(&processPickerRowRects[static_cast<size_t>(row)]) ||
+				!Hit(processPickerRowRects[static_cast<size_t>(row)], point)) continue;
+			const int index = processPicker.scroll + row;
+			if (index < 0 || index >= static_cast<int>(processPicker.visible.size())) break;
+			const size_t entryIndex = static_cast<size_t>(processPicker.visible[static_cast<size_t>(index)]);
+			const ProcessPickerEntry& item = processPicker.entries[entryIndex];
+			if (item.self) {
+				processPicker.status = L"\u4e0d\u80fd\u6ce8\u5165\u8bad\u7ec3\u5668\u81ea\u8eab";
+				InvalidateRect(_hWnd, nullptr, FALSE);
+				return true;
+			}
+			const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+			if (shift && processPicker.anchor >= 0) {
+				// Shift 连选：从锚点到当前行整段勾上（锚点那行原本没勾就全勾，勾了就全取消）。
+				const size_t anchorIndex = static_cast<size_t>(
+					processPicker.visible[static_cast<size_t>(processPicker.anchor)]);
+				const unsigned char want = processPicker.checked[anchorIndex] ? 0 : 1;
+				const int from = (std::min)(processPicker.anchor, index);
+				const int to = (std::max)(processPicker.anchor, index);
+				for (int i = from; i <= to; ++i) {
+					const size_t target2 = static_cast<size_t>(
+						processPicker.visible[static_cast<size_t>(i)]);
+					if (!processPicker.entries[target2].self)
+						processPicker.checked[target2] = want;
+				}
+			}
+			else {
+				// 单击（含 Ctrl+单击）就是切换这一行 —— 这套列表没有单独的复选框列，
+				// 点一下即勾选比"先选中再按空格"少一步。
+				processPicker.checked[entryIndex] = processPicker.checked[entryIndex] ? 0 : 1;
+				processPicker.anchor = index;
+			}
+			processPicker.cursor = index;
+			InvalidateRect(_hWnd, nullptr, FALSE);
+			return true;
+		}
+		return true;
+	}
+	// 点卡片外的遮罩等于取消，和 MD3 的 scrim 行为一致。
+	if (!Hit(processPickerCardRect, point)) {
+		CloseProcessPicker();
+		return true;
+	}
+	return true;
+}
+
+bool MainWindow::HandleProcessPickerKey(UINT key, WPARAM wParam)
+{
+	if (!ProcessPickerVisible()) return false;
+	const int count = static_cast<int>(processPicker.visible.size());
+	const int rows = (std::max)(1, processPicker.rowCount);
+	auto clampScroll = [&]() {
+		const int maxScroll = (std::max)(0, count - rows);
+		processPicker.scroll = (std::max)(0, (std::min)(maxScroll, processPicker.scroll));
+	};
+	auto moveCursor = [&](int step) {
+		if (count <= 0) return;
+		int index = processPicker.cursor < 0 ? (step > 0 ? -1 : 0) : processPicker.cursor;
+		for (int guard = 0; guard < count; ++guard) {
+			index += step;
+			if (index < 0) index = count - 1;
+			if (index >= count) index = 0;
+			const ProcessPickerEntry& item = processPicker.entries[
+				static_cast<size_t>(processPicker.visible[static_cast<size_t>(index)])];
+			if (!item.self) { processPicker.cursor = index; break; }
+		}
+		if (processPicker.cursor >= 0) {
+			if (processPicker.cursor < processPicker.scroll)
+				processPicker.scroll = processPicker.cursor;
+			else if (processPicker.cursor >= processPicker.scroll + rows)
+				processPicker.scroll = processPicker.cursor - rows + 1;
+		}
+		clampScroll();
+		InvalidateRect(_hWnd, nullptr, FALSE);
+	};
+	// 空格 / Ctrl+空格：切换光标行的勾选；按住 Shift 时从锚点连选到光标行。
+	auto toggleCursor = [&]() {
+		if (processPicker.cursor < 0 || processPicker.cursor >= count) return;
+		const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+		if (shift && processPicker.anchor >= 0) {
+			const size_t anchorIndex = static_cast<size_t>(
+				processPicker.visible[static_cast<size_t>(processPicker.anchor)]);
+			const unsigned char want = processPicker.checked[anchorIndex] ? 0 : 1;
+			const int from = (std::min)(processPicker.anchor, processPicker.cursor);
+			const int to = (std::max)(processPicker.anchor, processPicker.cursor);
+			for (int i = from; i <= to; ++i) {
+				const size_t index = static_cast<size_t>(processPicker.visible[static_cast<size_t>(i)]);
+				if (!processPicker.entries[index].self) processPicker.checked[index] = want;
+			}
+		}
+		else {
+			const size_t index = static_cast<size_t>(
+				processPicker.visible[static_cast<size_t>(processPicker.cursor)]);
+			processPicker.checked[index] = processPicker.checked[index] ? 0 : 1;
+			processPicker.anchor = processPicker.cursor;
+		}
+		InvalidateRect(_hWnd, nullptr, FALSE);
+	};
+	auto toggleSelectAll = [&]() {
+		bool allChecked = true;
+		for (int index : processPicker.visible) {
+			const ProcessPickerEntry& item = processPicker.entries[static_cast<size_t>(index)];
+			if (item.self) continue;
+			if (!processPicker.checked[static_cast<size_t>(index)]) { allChecked = false; break; }
+		}
+		for (int index : processPicker.visible) {
+			const ProcessPickerEntry& item = processPicker.entries[static_cast<size_t>(index)];
+			if (item.self) continue;
+			processPicker.checked[static_cast<size_t>(index)] = allChecked ? 0 : 1;
+		}
+		InvalidateRect(_hWnd, nullptr, FALSE);
+	};
+
+	// 焦点在弹窗按钮上时字符走主窗口的 WM_CHAR，会和 EDIT 里的文本分叉；
+	// 这里把 EDIT 拉回来对齐，免得下次点进搜索框看见的还是旧内容。
+	auto syncEditText = [this]() {
+		if (!processPickerSearchEdit) return;
+		wchar_t current[64] = {};
+		GetWindowTextW(processPickerSearchEdit, current, _countof(current));
+		if (processPicker.filter != current)
+			SetWindowTextW(processPickerSearchEdit, processPicker.filter.c_str());
+	};
+
+	if (key == WM_CHAR) {
+		const wchar_t ch = static_cast<wchar_t>(wParam);
+		if (ch == L'\b') {
+			if (!processPicker.filter.empty()) {
+				processPicker.filter.pop_back();
+				RebuildProcessPickerVisible();
+				syncEditText();
+				InvalidateRect(_hWnd, nullptr, FALSE);
+			}
+			return true;
+		}
+		// 回车 / Esc / Tab 由 WM_KEYDOWN 统一处理，这里别重复插入控制字符。
+		if (ch >= 0x20 && ch != 0x7F && processPicker.filter.size() < 32) {
+			processPicker.filter.push_back(ch);
+			RebuildProcessPickerVisible();
+			syncEditText();
+			InvalidateRect(_hWnd, nullptr, FALSE);
+		}
+		return true;
+	}
+
+	switch (wParam) {
+	case VK_ESCAPE: CloseProcessPicker(); return true;
+	case VK_RETURN: CommitProcessPicker(); return true;
+	case VK_UP: moveCursor(-1); return true;
+	case VK_DOWN: moveCursor(1); return true;
+	case VK_SPACE: toggleCursor(); return true;
+	case VK_PRIOR:
+		processPicker.scroll -= rows;
+		clampScroll();
+		InvalidateRect(_hWnd, nullptr, FALSE);
+		return true;
+	case VK_NEXT:
+		processPicker.scroll += rows;
+		clampScroll();
+		InvalidateRect(_hWnd, nullptr, FALSE);
+		return true;
+	case 'A':
+		if ((GetKeyState(VK_CONTROL) & 0x8000) != 0) { toggleSelectAll(); return true; }
+		return true;
+	default:
+		// 弹窗是模态的：其余按键一律吃掉，别漏到底下的页面去。
+		return true;
+	}
+}
+
+void MainWindow::CommitProcessPicker()
+{
+	if (!ProcessPickerVisible()) return;
+	// 勾了的全都做；一个都没勾时退回光标行 —— 单选用鼠标点一下、回车就走，不用再按空格。
+	std::vector<size_t> targets;
+	for (size_t i = 0; i < processPicker.checked.size() && i < processPicker.entries.size(); ++i)
+		if (processPicker.checked[i] && !processPicker.entries[i].self) targets.push_back(i);
+	if (targets.empty() && processPicker.cursor >= 0
+		&& processPicker.cursor < static_cast<int>(processPicker.visible.size())) {
+		const size_t index = static_cast<size_t>(
+			processPicker.visible[static_cast<size_t>(processPicker.cursor)]);
+		if (!processPicker.entries[index].self) targets.push_back(index);
+	}
+	if (targets.empty()) {
+		processPicker.status = L"\u5148\u52fe\u9009\u4e00\u4e2a\u8fdb\u7a0b";
+		InvalidateRect(_hWnd, nullptr, FALSE);
+		return;
+	}
+	if (!currentWorker) {
+		processPicker.status = L"\u63a7\u5236\u5668\u672a\u5c31\u7eea";
+		InvalidateRect(_hWnd, nullptr, FALSE);
+		return;
+	}
+	const bool unload = processPicker.mode == ProcessPickerMode::Unload;
+	int succeeded = 0;
+	std::vector<std::wstring> failed;
+	std::wstring lastStatus;
+	for (size_t i = 0; i < targets.size(); ++i) {
+		const ProcessPickerEntry& item = processPicker.entries[targets[i]];
+		// 每个目标都可能要等 64 位助手最多 40 秒，先把「正在处理 x/y」画出去。
+		WCHAR progress[96] = {};
+		swprintf_s(progress, unload ? L"\u6b63\u5728\u5378\u8f7d %d/%d\u2026" : L"\u6b63\u5728\u6ce8\u5165 %d/%d\u2026",
+			static_cast<int>(i + 1), static_cast<int>(targets.size()));
+		processPicker.status = progress;
+		InvalidateRect(_hWnd, nullptr, FALSE);
+		UpdateWindow(_hWnd);
+		// 用 PID 而不是名字：同名进程可能有多个实例，按名字会命中不确定的那个。
+		const std::wstring target = std::to_wstring(item.pid);
+		std::wstring status;
+		const bool ok = unload
+			? currentWorker->UninjectCustomProcess(target.c_str(), &status)
+			: currentWorker->InjectCustomProcess(target.c_str(), &status);
+		lastStatus = status.empty()
+			? (ok ? std::wstring(L"\u64cd\u4f5c\u5b8c\u6210") : std::wstring(L"\u64cd\u4f5c\u5931\u8d25")) : status;
+		if (ok) ++succeeded;
+		else failed.push_back(item.name);
+		if (currentLogger)
+			currentLogger->LogInfo(L"CustomInject ui unload=%d pid=%lu name=%s result=%d status=%s",
+				unload, item.pid, item.name.c_str(), ok, lastStatus.c_str());
+	}
+	customInjectList = currentWorker->GetCustomInjectedList();
+	const int total = static_cast<int>(targets.size());
+	WCHAR summary[256] = {};
+	if (failed.empty()) {
+		swprintf_s(summary, unload ? L"\u5df2\u5378\u8f7d %d \u4e2a\u8fdb\u7a0b" : L"\u5df2\u6ce8\u5165 %d \u4e2a\u8fdb\u7a0b", total);
+		customInjectStatus = summary;
+		ShowFastTip(customInjectStatus.c_str());
+		CloseProcessPicker();
+		return;
+	}
+	if (succeeded == 0) {
+		// 全部失败时把第一个失败原因整句摆出来，那比"N 个失败"有用得多。
+		swprintf_s(summary, L"%d \u4e2a\u8fdb\u7a0b\u5168\u90e8\u5931\u8d25", total);
+		customInjectStatus = summary;
+		RefreshProcessPicker();
+		processPicker.status = lastStatus.empty() ? customInjectStatus : lastStatus;
+		InvalidateRect(_hWnd, nullptr, FALSE);
+		return;
+	}
+	std::wstring names;
+	for (size_t i = 0; i < failed.size() && i < 3; ++i) {
+		if (!names.empty()) names += L"\u3001";
+		names += failed[i];
+	}
+	if (failed.size() > 3) names += L" \u7b49";
+	swprintf_s(summary, L"\u6210\u529f %d \u4e2a\uff0c\u5931\u8d25 %d \u4e2a\uff1a", succeeded,
+		static_cast<int>(failed.size()));
+	customInjectStatus = std::wstring(summary) + names;
+	// 部分失败就留在弹窗里，让用户看到具体是哪些没成功。
+	RefreshProcessPicker();
+	processPicker.status = customInjectStatus;
+	InvalidateRect(_hWnd, nullptr, FALSE);
+}
+
 void MainWindow::PaintAdvanced(Graphics& g, int width, int height, int offsetY)
 {
 	const float x = 248.0f;
@@ -4385,73 +5687,6 @@ void MainWindow::PaintAdvanced(Graphics& g, int width, int height, int offsetY)
 	const float saveY = y + AdvancedSaveButtonY(h);
 	advancedSaveRect = { static_cast<LONG>(x + w - 148), static_cast<LONG>(saveY), static_cast<LONG>(x + w - 24), static_cast<LONG>(saveY + 40) };
 	PaintPrimaryButton(g, RectF(x + w - 148, saveY, 124, 40), L"\u4fdd\u5b58\u9ad8\u7ea7\u8bbe\u7f6e", 69);
-}
-
-void MainWindow::PaintHelp(Graphics& g, int width, int height, int offsetY)
-{
-	const float x = 248.0f;
-	const float y = 94.0f + offsetY;
-	const float w = static_cast<float>(width - 276);
-	const float h = static_cast<float>(height) - y - 20;
-	SoftShadow(g, RectF(x, y, w, h), 12, darkMode);
-	FillRound(g, RectF(x, y, w, h), 12, C(darkMode, 255, 255, 255, 33, 40, 37));
-	Text(g, L"\u5feb\u901f\u4e0a\u624b", x + 28, y + 24, 220, 28, 17, FontStyleBold, C(darkMode, 24, 30, 27, 226, 233, 229));
-	Text(g, L"Dzjs Trainer \u4f1a\u81ea\u52a8\u68c0\u6d4b StudentMain \u5e76\u5e94\u7528\u5f53\u524d\u9632\u62a4\u7b56\u7565\u3002", x + 28, y + 58, w - 56, 28, 11,
-		FontStyleRegular, C(darkMode, 81, 91, 86, 171, 183, 177));
-	const wchar_t* stepTitles[] = { L"\u786e\u8ba4\u72b6\u6001", L"\u8c03\u6574\u7b56\u7565", L"\u67e5\u770b\u65e5\u5fd7" };
-	const wchar_t* stepDetails[] = {
-		L"\u5728\u201c\u72b6\u6001\u603b\u89c8\u201d\u4e2d\u68c0\u67e5\u5b66\u751f\u7aef\u8fdb\u7a0b\u548c\u9632\u62a4\u670d\u52a1\u662f\u5426\u6b63\u5e38\u3002",
-		L"\u5728\u201c\u9632\u62a4\u7b56\u7565\u201d\u4e2d\u9009\u62e9\u5141\u8bb8\u7684\u8fdc\u7a0b\u884c\u4e3a\uff0c\u4fee\u6539\u540e\u7acb\u5373\u5e94\u7528\u3002",
-		L"\u5982\u679c\u9632\u62a4\u672a\u6309\u9884\u671f\u5de5\u4f5c\uff0c\u8bf7\u5728\u201c\u8fd0\u884c\u65e5\u5fd7\u201d\u4e2d\u67e5\u770b\u539f\u56e0\u3002"
-	};
-	// 三步固定高度、从上排下来。原来按可用高度拉伸到 112px，
-	// 每张卡里只有一行字，卡片反而显得空。
-	const float stepsTop = y + 96.0f;
-	const float stepH = 88.0f;
-	const float stepGap = 16.0f;
-	for (int i = 0; i < 3; ++i) {
-		const float rowY = stepsTop + i * (stepH + stepGap);
-		// 步骤卡原来是白底画在同一张白卡上，边界完全看不见，三步像是直接浮着。
-		FillRound(g, RectF(x + 28, rowY, w - 56, stepH), 12, C(darkMode, 246, 250, 247, 30, 36, 34));
-		StrokeRound(g, RectF(x + 28, rowY, w - 56, stepH), 12, C(darkMode, 228, 236, 231, 46, 54, 50));
-		// 序号改实心主色圆 + 白字，原来淡青底配青字几乎读不出来。
-		const float badgeY = rowY + (stepH - 44.0f) / 2.0f;
-		FillRound(g, RectF(x + 48, badgeY, 44, 44), 22, C(darkMode, 0, 121, 107, 130, 213, 199));
-		wchar_t number[8];
-		swprintf_s(number, L"%d", i + 1);
-		Text(g, number, x + 48, badgeY + 11, 44, 22, 15, FontStyleBold,
-			C(darkMode, 255, 255, 255, 0, 55, 49), StringAlignmentCenter);
-		// 标题和说明并排：卡片有 860px 宽，堆成两行会让右侧空掉一大片。
-		const float lineY = rowY + stepH / 2.0f - 12.0f;
-		Text(g, stepTitles[i], x + 112, lineY, 168, 24, 14, FontStyleBold,
-			C(darkMode, 26, 32, 29, 224, 231, 227));
-		Text(g, stepDetails[i], x + 292, lineY + 3.0f, w - 340, 22, 11, FontStyleRegular,
-			C(darkMode, 88, 97, 92, 170, 181, 175));
-	}
-	// 下半截原来是空白，补一张当前生效的快捷键卡：正好把"高级配置里改过什么"
-	// 在帮助页也看得见，不用来回切页。
-	const float infoY = stepsTop + 3.0f * stepH + 2.0f * stepGap + 16.0f;
-	const float infoH = static_cast<float>(height) - 24.0f - infoY;
-	if (infoH >= 96.0f) {
-		const Color body = C(darkMode, 88, 97, 92, 170, 181, 175);
-		FillRound(g, RectF(x + 28, infoY, w - 56, infoH), 12, C(darkMode, 246, 250, 247, 30, 36, 34));
-		StrokeRound(g, RectF(x + 28, infoY, w - 56, infoH), 12, C(darkMode, 228, 236, 231, 46, 54, 50));
-		Text(g, L"\u5f53\u524d\u5feb\u6377\u952e", x + 48, infoY + 18, 220, 24, 13, FontStyleBold,
-			C(darkMode, 26, 32, 29, 224, 231, 227));
-		const wchar_t* hotkeyLabels[] = { L"\u5207\u5230\u66ff\u6362\u753b\u9762", L"\u663e\u793a / \u9690\u85cf\u4e3b\u7a97\u53e3" };
-		const int hotkeyValues[] = { hotkeyFakeFullValue, hotkeyShowHideValue };
-		for (int i = 0; i < 2; ++i) {
-			const float rowY = infoY + 52.0f + i * 30.0f;
-			if (rowY + 22.0f > infoY + infoH) break;
-			Text(g, hotkeyLabels[i], x + 48, rowY, 240, 20, 11, FontStyleRegular, body);
-			const std::wstring value = HotkeyDisplayText(hotkeyValues[i]);
-			FillRound(g, RectF(x + 300, rowY - 3, 140, 24), 8, C(darkMode, 255, 255, 255, 34, 41, 38));
-			Text(g, value.c_str(), x + 300, rowY, 140, 20, 10, FontStyleBold,
-				C(darkMode, 34, 42, 39, 224, 232, 228), StringAlignmentCenter);
-		}
-		Text(g, L"\u53ef\u5728\u201c\u9ad8\u7ea7\u914d\u7f6e \u00b7 \u5e38\u89c4\u4e0e\u5feb\u6377\u952e\u201d\u91cc\u4fee\u6539\uff0c\u4fdd\u5b58\u540e\u91cd\u542f\u751f\u6548\u3002",
-			x + 48, infoY + infoH - 34.0f, w - 96, 20, 10, FontStyleRegular, body);
-	}
 }
 
 void MainWindow::PaintNetwork(Graphics& g, int width, int height, int offsetY)
@@ -5106,6 +6341,8 @@ void MainWindow::UnloadSelectedDiagnosticDriver()
 		swprintf_s(message, L"卸载失败，错误码 %lu", static_cast<unsigned long>(errorCode));
 		ShowFastTip(message);
 	}
+	// 卸载的可能是主驱动，防护策略页那块状态要跟着变，别等缓存过期。
+	InvalidateDriverStatus();
 	RunDeviceDiagnostics();
 }
 
@@ -5426,6 +6663,248 @@ void MainWindow::PaintUpdateDialog(Graphics& g, int width, int height)
 				static_cast<REAL>(ringSource.right - ringSource.left) + 6.0f,
 				static_cast<REAL>(ringSource.bottom - ringSource.top) + 6.0f), 23.0f,
 				fade(primary), 2.0f);
+		}
+	}
+}
+
+// 进程选择器：和更新弹窗同一套模态骨架（scrim / 28 圆角 / 24 内边距），
+// 内容区换成「搜索框 + 进程表 + 页脚动作区」。
+void MainWindow::PaintProcessPicker(Graphics& g, int width, int height)
+{
+	if (!ProcessPickerVisible()) return;
+	const bool d = darkMode;
+	const float appear = (std::max)(0.0f, (std::min)(1.0f, processPicker.appear));
+	auto fade = [appear](const Color& color) {
+		return Color(static_cast<BYTE>(color.GetA() * appear), color.GetR(), color.GetG(), color.GetB());
+	};
+	const bool unloadMode = processPicker.mode == ProcessPickerMode::Unload;
+
+	const Color onSurface = C(d, 26, 30, 28, 232, 238, 235);
+	const Color onSurfaceVariant = C(d, 96, 104, 100, 168, 179, 174);
+	const Color outline = C(d, 130, 139, 134, 138, 149, 144);
+	const Color primary = C(d, 0, 107, 95, 130, 213, 199);
+	const Color container = C(d, 243, 247, 245, 38, 45, 42);
+	const Color hairline = C(d, 226, 234, 229, 44, 52, 48);
+	const Color fieldFill = C(d, 255, 255, 255, 26, 33, 30);
+
+	{
+		SolidBrush veil(Color(static_cast<BYTE>((d ? 115.0f : 82.0f) * appear), 0, 0, 0));
+		g.FillRectangle(&veil, 0, 0, width, height);
+	}
+
+	const PickerGeometry geom = ComputePickerGeometry(width, height);
+	auto toRect = [](const RectF& rect) {
+		RECT result{};
+		result.left = static_cast<LONG>(rect.X);
+		result.top = static_cast<LONG>(rect.Y);
+		result.right = static_cast<LONG>(rect.X + rect.Width);
+		result.bottom = static_cast<LONG>(rect.Y + rect.Height);
+		return result;
+	};
+	processPickerCardRect = toRect(geom.card);
+	processPickerSearchRect = toRect(geom.search);
+	processPickerRefreshRect = toRect(geom.refresh);
+	processPickerSelectAllRect = toRect(geom.selectAll);
+	processPickerListRect = toRect(geom.list);
+	processPicker.rowCount = geom.rows;
+	processPickerRowRects.fill(RECT{});
+
+	SoftShadow(g, geom.card, 28.0f, d, 1.6f * appear);
+	FillRound(g, geom.card, 28.0f, fade(container));
+
+	// 头部：图标 + 标题 + 一句说明。
+	DrawIcon(g, 5, geom.card.X + 24.0f, geom.card.Y + 24.0f, fade(primary), 24);
+	Text(g, unloadMode ? L"\u5378\u8f7d\u81ea\u5b9a\u4e49\u6ce8\u5165" : L"\u9009\u62e9\u8981\u6ce8\u5165\u7684\u8fdb\u7a0b",
+		geom.card.X + 58.0f, geom.card.Y + 22.0f, geom.card.Width - 82.0f, 26.0f, 20,
+		FontStyleBold, fade(onSurface));
+	Text(g, unloadMode
+			? L"\u53ef\u591a\u9009\uff1a\u70b9\u884c\u52fe\u9009\uff0cShift \u8fde\u9009\uff0cCtrl+A \u5168\u9009\uff1b\u9009\u597d\u540e\u70b9\u300c\u5378\u8f7d\u300d\u4e00\u6b21\u5904\u7406\u3002"
+			: L"\u53ef\u591a\u9009\uff1a\u70b9\u884c\u52fe\u9009\uff0cShift \u8fde\u9009\uff0cCtrl+A \u5168\u9009\uff1b\u9009\u597d\u540e\u70b9\u300c\u6ce8\u5165\u300d\u4e00\u6b21\u5904\u7406\u300232 / 64 \u4f4d\u81ea\u52a8\u8bc6\u522b\u3002",
+		geom.card.X + 24.0f, geom.card.Y + 52.0f, geom.card.Width - 48.0f, 18.0f, 12,
+		FontStyleRegular, fade(onSurfaceVariant));
+
+	// 搜索框：这里只画圆角底和描边，文字、光标、输入法组合串都交给叠在上面的原生 EDIT。
+	// 子窗口的位置由 WM_SIZE 和打开时排定，不在绘制里挪窗口。
+	FillRound(g, geom.search, 10.0f, fade(fieldFill));
+	StrokeRound(g, geom.search, 10.0f, fade(primary));
+	bool allChecked = true;
+	bool anySelectable = false;
+	for (int index : processPicker.visible) {
+		if (processPicker.entries[static_cast<size_t>(index)].self) continue;
+		anySelectable = true;
+		if (!processPicker.checked[static_cast<size_t>(index)]) { allChecked = false; break; }
+	}
+	PaintButton(g, geom.selectAll, (!anySelectable || allChecked) ? L"\u5168\u9009" : L"\u5168\u4e0d\u9009",
+		kProcessPickerSelectAll, ButtonStyle::Tonal, 10.0f, -1, anySelectable);
+	PaintButton(g, geom.refresh, L"\u5237\u65b0", kProcessPickerRefresh, ButtonStyle::Tonal, 10.0f);
+
+	// 进程表
+	FillRound(g, geom.list, 12.0f, fade(C(d, 248, 251, 249, 31, 37, 35)));
+	StrokeRound(g, geom.list, 12.0f, fade(hairline));
+	const int total = static_cast<int>(processPicker.visible.size());
+	{
+		Region clip(Rect(static_cast<INT>(geom.list.X), static_cast<INT>(geom.list.Y),
+			static_cast<INT>(geom.list.Width), static_cast<INT>(geom.list.Height)));
+		g.SetClip(&clip, CombineModeIntersect);
+		for (int row = 0; row < geom.rows; ++row) {
+			const int index = processPicker.scroll + row;
+			if (index >= total) break;
+			const size_t entryIndex = static_cast<size_t>(processPicker.visible[static_cast<size_t>(index)]);
+			const ProcessPickerEntry& item = processPicker.entries[entryIndex];
+			const RectF rowRect(geom.list.X + 6.0f, geom.list.Y + 6.0f + row * geom.rowHeight,
+				geom.list.Width - 12.0f, geom.rowHeight - 2.0f);
+			processPickerRowRects[static_cast<size_t>(row)] = toRect(rowRect);
+			const bool checked = processPicker.checked[entryIndex] != 0;
+			const bool focusedRow = index == processPicker.cursor && !item.self;
+			const bool hovered = row == processPicker.hoverRow && !item.self;
+			if (checked)
+				FillRound(g, rowRect, 10.0f, fade(C(d, 208, 238, 229, 40, 71, 63)));
+			else if (hovered)
+				FillRound(g, rowRect, 10.0f, fade(C(d, 243, 247, 245, 36, 43, 40)));
+			// 键盘焦点行单独描一圈：勾选是"选了什么"，焦点是"光标在哪"，两件事要分得开。
+			if (focusedRow)
+				StrokeRound(g, rowRect, 10.0f, fade(C(d, 0, 107, 95, 130, 213, 199)), 1.4f);
+
+			WCHAR pidText[16] = {};
+			swprintf_s(pidText, L"%lu", item.pid);
+			Text(g, pidText, rowRect.X + 10.0f, rowRect.Y + 9.0f, 54.0f, 18.0f, 10,
+				FontStyleRegular, fade(item.self ? outline : onSurfaceVariant), StringAlignmentFar);
+			// 进程图标：拿不到映像路径（受保护进程）时退回终端字形，保持列宽一致。
+			const float iconX = rowRect.X + 70.0f;
+			const float iconY = rowRect.Y + 9.0f;
+			// 图标底板。有些 exe（以及 shell 给无图标进程的通用窗口图标）自带一层
+			// 接近白色的方形底板，直接贴到选中行的薄荷底色上就露出一块白方块，
+			// 看着像渲染坏了。统一垫一层浅色圆角底板，让这类图标和行背景之间
+			// 始终隔着一层"设计过的"表面；透明图标垫上去也只是一个很淡的方片。
+			FillRound(g, RectF(iconX - 3.0f, iconY - 3.0f, 22.0f, 22.0f), 7.0f,
+				fade(C(d, 246, 250, 248, 48, 56, 52)));
+			if (Bitmap* icon = ProcessIconFor(item.path)) {
+				g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+				g.DrawImage(icon, RectF(iconX, iconY, 16.0f, 16.0f));
+				g.SetInterpolationMode(InterpolationModeDefault);
+			}
+			else {
+				DrawIcon(g, 5, iconX, iconY, fade(item.self ? outline : onSurfaceVariant), 16.0f);
+			}
+			TextSingleLine(g, item.name.c_str(), rowRect.X + 94.0f, rowRect.Y + 8.0f, 156.0f, 20.0f,
+				11, FontStyleBold, fade(item.self ? outline : onSurface));
+			const float pathW = rowRect.Width - 258.0f - 170.0f;
+			if (pathW > 24.0f && !item.path.empty())
+				TextSingleLine(g, item.path.c_str(), rowRect.X + 258.0f, rowRect.Y + 10.0f, pathW, 18.0f,
+					10, FontStyleRegular, fade(outline));
+			const wchar_t* bitness = !item.bitnessKnown ? L"\u2014"
+				: (item.is64 ? L"64 \u4f4d" : L"32 \u4f4d");
+			Text(g, bitness, rowRect.GetRight() - 166.0f, rowRect.Y + 9.0f, 44.0f, 18.0f, 10,
+				FontStyleRegular, fade(onSurfaceVariant), StringAlignmentFar);
+			// 右侧标签：已注入 > 系统关键（提示，不拦） > 训练器自身（唯一不可选）。
+			if (item.injected || item.critical || item.self) {
+				const RectF tag(rowRect.GetRight() - 110.0f, rowRect.Y + 7.0f, 72.0f, 20.0f);
+				LPCWSTR label = L"\u5df2\u6ce8\u5165";
+				Color tagFill = C(d, 183, 232, 222, 42, 79, 72);
+				Color tagText = C(d, 0, 81, 72, 156, 240, 225);
+				if (!item.injected && item.critical) {
+					label = L"\u7cfb\u7edf";
+					tagFill = C(d, 252, 238, 214, 66, 52, 34);
+					tagText = C(d, 150, 98, 12, 240, 198, 132);
+				}
+				else if (!item.injected && item.self) {
+					label = L"\u81ea\u8eab";
+					tagFill = C(d, 238, 232, 230, 56, 44, 42);
+					tagText = C(d, 140, 74, 66, 226, 170, 160);
+				}
+				FillRound(g, tag, 10.0f, fade(tagFill));
+				Text(g, label, tag.X, tag.Y + 3.0f, tag.Width, 16.0f, 10, FontStyleBold,
+					fade(tagText), StringAlignmentCenter);
+			}
+			// 勾选圆点。训练器自身不给画，免得看着像能选。
+			if (!item.self) {
+				const float checkX = rowRect.GetRight() - 30.0f;
+				const float checkY = rowRect.Y + 8.0f;
+				if (checked) {
+					SolidBrush filled(fade(primary));
+					g.FillEllipse(&filled, checkX, checkY, 18.0f, 18.0f);
+					Pen tick(Color(static_cast<BYTE>(255.0f * appear), 255, 255, 255), 2.0f);
+					tick.SetStartCap(LineCapRound);
+					tick.SetEndCap(LineCapRound);
+					g.DrawLine(&tick, checkX + 5.0f, checkY + 9.5f, checkX + 8.0f, checkY + 12.5f);
+					g.DrawLine(&tick, checkX + 8.0f, checkY + 12.5f, checkX + 13.5f, checkY + 5.5f);
+				}
+				else {
+					Pen ring(fade(C(d, 178, 186, 181, 96, 106, 101)), 1.4f);
+					g.DrawEllipse(&ring, checkX + 0.5f, checkY + 0.5f, 17.0f, 17.0f);
+				}
+			}
+		}
+		if (total == 0) {
+			const wchar_t* empty = processPicker.filter.empty()
+				? L"\u6ca1\u6709\u53ef\u9009\u7684\u8fdb\u7a0b" : L"\u6ca1\u6709\u5339\u914d\u7684\u8fdb\u7a0b";
+			Text(g, empty, geom.list.X, geom.list.Y + geom.list.Height / 2.0f - 12.0f, geom.list.Width,
+				24.0f, 12, FontStyleRegular, fade(outline), StringAlignmentCenter);
+		}
+		g.ResetClip();
+	}
+
+	// 页脚：左边状态行，右边动作区（主操作最右）。
+	const float buttonH = 40.0f;
+	const float buttonY = geom.card.Y + geom.card.Height - 24.0f - buttonH;
+	TextSingleLine(g, processPicker.status.c_str(), geom.card.X + 24.0f, buttonY + 12.0f,
+		geom.card.Width - 48.0f - 330.0f, 18.0f, 10, FontStyleRegular, fade(onSurfaceVariant));
+
+	processPickerPrimaryRect = {};
+	processPickerSecondaryRect = {};
+	int checkedCount = 0;
+	for (size_t i = 0; i < processPicker.checked.size(); ++i) {
+		if (processPicker.checked[i] && i < processPicker.entries.size()
+			&& !processPicker.entries[i].self) ++checkedCount;
+	}
+	const bool cursorUsable = processPicker.cursor >= 0
+		&& processPicker.cursor < static_cast<int>(processPicker.visible.size())
+		&& !processPicker.entries[static_cast<size_t>(
+			processPicker.visible[static_cast<size_t>(processPicker.cursor)])].self;
+	const bool canCommit = checkedCount > 0 || cursorUsable;
+	// 勾了多个就把数量写进按钮里：「注入 188 个」比一个笼统的「注入」更能让人停一下。
+	const float primaryW = checkedCount > 1 ? 112.0f : 96.0f;
+	WCHAR primaryLabel[48] = {};
+	if (checkedCount > 1)
+		swprintf_s(primaryLabel, unloadMode ? L"\u5378\u8f7d %d \u4e2a" : L"\u6ce8\u5165 %d \u4e2a", checkedCount);
+	else
+		wcscpy_s(primaryLabel, unloadMode ? L"\u5378\u8f7d" : L"\u6ce8\u5165");
+	const float primaryRight = geom.card.X + geom.card.Width - 24.0f;
+	const RectF primaryRect(primaryRight - primaryW, buttonY, primaryW, buttonH);
+	PaintButton(g, primaryRect, primaryLabel, kProcessPickerPrimary,
+		unloadMode ? ButtonStyle::Danger : ButtonStyle::Primary, 20.0f, -1, canCommit);
+	processPickerPrimaryRect = toRect(primaryRect);
+
+	const RectF secondaryRect(primaryRect.X - 8.0f - 76.0f, buttonY, 76.0f, buttonH);
+	{
+		const float press = pressTarget == kProcessPickerSecondary ? 1.0f : 0.0f;
+		const float overlay = press > 0.0f ? 0.12f : 0.08f * hoverProgress[kProcessPickerSecondary];
+		if (overlay > 0.003f)
+			FillRound(g, secondaryRect, 20.0f, Color(static_cast<BYTE>(255.0f * overlay * appear),
+				primary.GetR(), primary.GetG(), primary.GetB()));
+		Text(g, L"\u53d6\u6d88", secondaryRect.X, secondaryRect.Y + (buttonH - 20.0f) / 2.0f,
+			secondaryRect.Width, 20.0f, 12, FontStyleBold, fade(primary), StringAlignmentCenter);
+	}
+	processPickerSecondaryRect = toRect(secondaryRect);
+
+	// 已选数量贴在动作区左边，随勾选实时变。
+	if (checkedCount > 0) {
+		WCHAR countText[48] = {};
+		swprintf_s(countText, L"\u5df2\u9009 %d \u4e2a", checkedCount);
+		Text(g, countText, secondaryRect.X - 104.0f, buttonY + 12.0f, 96.0f, 18.0f, 10,
+			FontStyleBold, fade(primary), StringAlignmentFar);
+	}
+
+	if (focusTarget == kProcessPickerPrimary || focusTarget == kProcessPickerSecondary
+		|| focusTarget == kProcessPickerRefresh || focusTarget == kProcessPickerSelectAll) {
+		const RECT& source = focusTarget == kProcessPickerPrimary ? processPickerPrimaryRect
+			: (focusTarget == kProcessPickerSecondary ? processPickerSecondaryRect
+				: (focusTarget == kProcessPickerRefresh ? processPickerRefreshRect : processPickerSelectAllRect));
+		if (!IsRectEmpty(&source)) {
+			StrokeRound(g, RectF(static_cast<REAL>(source.left) - 3.0f,
+				static_cast<REAL>(source.top) - 3.0f,
+				static_cast<REAL>(source.right - source.left) + 6.0f,
+				static_cast<REAL>(source.bottom - source.top) + 6.0f), 23.0f, fade(primary), 2.0f);
 		}
 	}
 }
@@ -5763,11 +7242,11 @@ void MainWindow::UnloadAvDriver()
 int MainWindow::HitTargetAt(POINT point)
 {
 	int target = -1;
-	for (int i = 0; i < 10; ++i) if (Hit(navRects[i], point)) target = i;
+	for (int i = 0; i < kNavCount; ++i) if (Hit(navRects[i], point)) target = i;
 	if (page == Page::Overview) for (int i = 0; i < 5; ++i) if (Hit(actionRects[i], point)) target = 10 + i;
 	if (Hit(superTopMostRect, point)) target = 80;
 	if (page == Page::Protection || page == Page::Replacement) {
-		for (int i = 0; i < 7; ++i) if (Hit(toggleRects[i], point)) target = 20 + i;
+		for (int i = 0; i < kProtectionToggleCount; ++i) if (Hit(toggleRects[i], point)) target = 20 + i;
 		if (Hit(temporaryVideoEnableRect, point)) target = 74;
 		if (Hit(temporaryVideoImageModeRect, point)) target = 75;
 		if (Hit(temporaryVideoFileModeRect, point)) target = 76;
@@ -5777,6 +7256,9 @@ int MainWindow::HitTargetAt(POINT point)
 		if (Hit(restoreTeacherViewRect, point)) target = 81;
 	}
 	if (page == Page::Logs && Hit(exportLogRect, point)) target = 40;
+	if (page == Page::Injection) {
+		for (int i = 0; i < 3; ++i) if (Hit(customInjectRects[i], point)) target = 110 + i;
+	}
 	if (Hit(themeRect, point)) target = 41;
 	if ((page == Page::Protection || page == Page::Replacement) && Hit(advancedSettingsRect, point)) target = 42;
 	if (page == Page::Protection && Hit(driverLoadRect, point)) target = 43;
@@ -5821,6 +7303,10 @@ bool MainWindow::TargetRect(int target, RECT* rect) const
 	// 更新弹窗的两个按钮。Tab/Enter 走的是同一套命中判断，加进来就自动可用。
 	case kUpdateDialogPrimary: found = updateDialogPrimaryRect; break;
 	case kUpdateDialogSecondary: found = updateDialogSecondaryRect; break;
+	case kProcessPickerPrimary: found = processPickerPrimaryRect; break;
+	case kProcessPickerSecondary: found = processPickerSecondaryRect; break;
+	case kProcessPickerRefresh: found = processPickerRefreshRect; break;
+	case kProcessPickerSelectAll: found = processPickerSelectAllRect; break;
 	case 0: case 1: case 2: case 3: case 4:
 	case 5: case 6: case 7: case 8: case 9:
 		found = navRects[target];
@@ -5851,6 +7337,7 @@ bool MainWindow::TargetRect(int target, RECT* rect) const
 		break;
 	case 64: case 65: case 66: found = advancedKillRects[target - 64]; break;
 	case 67: case 68: found = advancedInjectRects[target - 67]; break;
+	case 110: case 111: case 112: found = customInjectRects[target - 110]; break;
 	case 69: found = advancedSaveRect; break;
 	case 70: case 71: found = advancedTabRects[target - 70]; break;
 	case 72: found = networkProjectRect; break;
@@ -5882,12 +7369,19 @@ std::vector<int> MainWindow::FocusableTargets() const
 {
 	std::vector<int> list;
 	// 弹窗是模态的：Tab 只在它自己的按钮之间转。
+	if (ProcessPickerVisible()) {
+		if (TargetRect(kProcessPickerPrimary, nullptr)) list.push_back(kProcessPickerPrimary);
+		if (TargetRect(kProcessPickerSecondary, nullptr)) list.push_back(kProcessPickerSecondary);
+		if (TargetRect(kProcessPickerSelectAll, nullptr)) list.push_back(kProcessPickerSelectAll);
+		if (TargetRect(kProcessPickerRefresh, nullptr)) list.push_back(kProcessPickerRefresh);
+		return list;
+	}
 	if (UpdateDialogVisible()) {
 		if (TargetRect(kUpdateDialogPrimary, nullptr)) list.push_back(kUpdateDialogPrimary);
 		if (TargetRect(kUpdateDialogSecondary, nullptr)) list.push_back(kUpdateDialogSecondary);
 		return list;
 	}
-	for (int i = 0; i < 10; ++i) list.push_back(i);
+	for (int i = 0; i < kNavCount; ++i) list.push_back(i);
 	list.push_back(80);   // 超级置顶
 	list.push_back(41);   // 明暗主题
 	auto push = [this, &list](int id) {
@@ -5939,6 +7433,9 @@ std::vector<int> MainWindow::FocusableTargets() const
 		break;
 	case Page::About:
 		push(74); push(73);
+		break;
+	case Page::Injection:
+		for (int i = 0; i < 3; ++i) push(110 + i);
 		break;
 	default:
 		break;
@@ -5992,7 +7489,11 @@ float MainWindow::AnimateToggle(int index, bool on)
 
 void MainWindow::UpdateHover(POINT point)
 {
-	// 弹窗期间只认弹窗里的两个按钮，底下的界面不该再跟着鼠标亮。
+	// 弹窗期间只认弹窗里的控件，底下的界面不该再跟着鼠标亮。
+	if (ProcessPickerVisible()) {
+		UpdateProcessPickerHover(point);
+		return;
+	}
 	if (UpdateDialogVisible()) {
 		const int dialogTarget = HitUpdateDialogAt(point);
 		SetCursor(LoadCursorW(nullptr, dialogTarget >= 0 ? IDC_HAND : IDC_ARROW));
@@ -6018,6 +7519,10 @@ void MainWindow::UpdateHover(POINT point)
 void MainWindow::HandleClick(POINT point)
 {
 	// 模态弹窗吃掉所有点击，连空白处也不往下传。
+	if (ProcessPickerVisible()) {
+		HandleProcessPickerClick(point);
+		return;
+	}
 	if (UpdateDialogVisible()) {
 		HandleUpdateDialogClick(point);
 		return;
@@ -6032,16 +7537,20 @@ void MainWindow::HandleClick(POINT point)
 		return;
 	}
 	if (Hit(themeRect, point)) {
-		darkMode = !darkMode;
-		if (controlSurfaceBrush) DeleteObject(controlSurfaceBrush);
-		controlSurfaceBrush = CreateSolidBrush(darkMode ? RGB(38, 45, 42) : RGB(255, 255, 255));
-		if (advancedFieldBrush) DeleteObject(advancedFieldBrush);
-		advancedFieldBrush = CreateSolidBrush(darkMode ? RGB(26, 33, 30) : RGB(255, 255, 255));
-		for (HWND control : networkControls) if (control) InvalidateRect(control, nullptr, TRUE);
-		InvalidateRect(_hWnd, nullptr, FALSE);
+		ApplyTheme(!darkMode, false);
 		return;
 	}
-	for (int i = 0; i < 10; ++i) if (Hit(navRects[i], point)) { SelectPage(static_cast<Page>(i)); return; }
+	for (int i = 0; i < kNavCount; ++i) if (Hit(navRects[i], point)) { SelectPage(static_cast<Page>(i)); return; }
+	if (page == Page::Injection) {
+		for (int i = 0; i < 3; ++i) if (Hit(customInjectRects[i], point)) {
+			if (i == 2) {
+				if (currentWorker) customInjectList = currentWorker->GetCustomInjectedList();
+				InvalidateRect(_hWnd, nullptr, FALSE);
+			}
+			else OpenProcessPicker(i == 1);
+			return;
+		}
+	}
 	if (page == Page::About && Hit(aboutUpdateRect, point)) {
 		CheckForUpdate(true);
 		return;
@@ -6112,17 +7621,20 @@ void MainWindow::HandleClick(POINT point)
 		}
 		if (Hit(driverLoadRect, point)) {
 			JTAppRunOperationDirect(AppOperationForceLoadDriver);
+			// 状态框有 1.5 秒缓存，这一步之后立刻重采，不然要等下一次重绘才变。
+			InvalidateDriverStatus();
 			ShowFastTip(XDriverLoaded() ? L"\u9a71\u52a8\u5df2\u52a0\u8f7d" : L"\u9a71\u52a8\u52a0\u8f7d\u5931\u8d25");
 			InvalidateRect(_hWnd, nullptr, FALSE);
 			return;
 		}
 		if (Hit(driverUnloadRect, point)) {
 			const bool unloaded = JTAppRunOperationDirect(AppOperationUnLoadDriver) != nullptr;
+			InvalidateDriverStatus();
 			ShowFastTip(unloaded ? L"\u9a71\u52a8\u5df2\u5378\u8f7d" : L"\u9a71\u52a8\u5378\u8f7d\u5931\u8d25");
 			InvalidateRect(_hWnd, nullptr, FALSE);
 			return;
 		}
-		for (int i = 0; i < 7; ++i) if (Hit(toggleRects[i], point)) {
+		for (int i = 0; i < kProtectionToggleCount; ++i) if (Hit(toggleRects[i], point)) {
 			switch (i) {
 			case 0: setAllowAllRunOp = !setAllowAllRunOp; break;
 			case 1: setBandAllRunOp = !setBandAllRunOp; break;
@@ -6131,6 +7643,8 @@ void MainWindow::HandleClick(POINT point)
 			case 4: setAllowMonitor = !setAllowMonitor; break;
 			case 5: setProhibitCloseWindow = !setProhibitCloseWindow; break;
 			case 6: setAllowControl = !setAllowControl; break;
+			case 7: setBlockWindowOps = !setBlockWindowOps; break;
+			case 8: setBlockDriverAccess = !setBlockDriverAccess; break;
 			}
 			SaveSettings();
 			InvalidateRect(_hWnd, nullptr, FALSE);
@@ -6564,7 +8078,7 @@ void MainWindow::StartUpdateDownload()
 // 所以弹窗期间先全部藏起来，关掉后再让各页面按自己的状态恢复可见性。
 void MainWindow::ApplyDialogOcclusion()
 {
-	if (!UpdateDialogVisible()) {
+	if (!ModalDialogVisible()) {
 		LayoutEmbeddedWindows();
 		return;
 	}
@@ -6637,6 +8151,8 @@ void MainWindow::FinishUpdateProbe(const UpdateProbeContext& probe)
 
 void MainWindow::SelectPage(Page target)
 {
+	if (target == Page::Injection && currentWorker)
+		customInjectList = currentWorker->GetCustomInjectedList();
 	if (page == target) return;
 	page = target;
 	// 网络页里有真实的子窗口（教师端宿主），高级配置页里有原生热键控件：
@@ -6796,8 +8312,9 @@ void MainWindow::SaveAdvancedSettings()
 
 void MainWindow::CreateNetworkControls()
 {
-	controlSurfaceBrush = CreateSolidBrush(RGB(255, 255, 255));
-	advancedFieldBrush = CreateSolidBrush(RGB(255, 255, 255));
+	controlSurfaceBrush = CreateSolidBrush(darkMode ? RGB(38, 45, 42) : RGB(255, 255, 255));
+	advancedFieldBrush = CreateSolidBrush(darkMode ? RGB(26, 33, 30) : RGB(255, 255, 255));
+	processPickerFieldBrush = CreateSolidBrush(darkMode ? RGB(26, 33, 30) : RGB(255, 255, 255));
 	controlFont = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
 		OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
 		DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
@@ -7553,11 +9070,15 @@ void MainWindow::LoadSettings()
 	setTopMost = settings->GetSettingBool(L"TopMost", true);
 	setAllowAllRunOp = settings->GetSettingBool(L"AllowAllRunOp", true);
 	setAllowMonitor = settings->GetSettingBool(L"AllowMonitor", true);
-	setAllowControl = settings->GetSettingBool(L"AllowControl", false);
+	// 默认值必须和注入端 VInitSettings 的默认值一致，否则界面显示"已拦截"、
+	// 钩子那边其实是放行，两边对不上。2026-11-14 起全部默认只记录。
+	setAllowControl = settings->GetSettingBool(L"AllowControl", true);
 	setAllowGbTop = settings->GetSettingBool(L"AllowGbTop", false);
-	setProhibitKillProcess = settings->GetSettingBool(L"ProhibitKillProcess", true);
-	setProhibitCloseWindow = settings->GetSettingBool(L"ProhibitCloseWindow", true);
+	setProhibitKillProcess = settings->GetSettingBool(L"ProhibitKillProcess", false);
+	setProhibitCloseWindow = settings->GetSettingBool(L"ProhibitCloseWindow", false);
 	setBandAllRunOp = settings->GetSettingBool(L"BandAllRunOp", false);
+	setBlockWindowOps = settings->GetSettingBool(L"BlockWindowOps", false);
+	setBlockDriverAccess = settings->GetSettingBool(L"BlockDriverAccess", false);
 	setDoNotShowTrayIcon = settings->GetSettingBool(L"DoNotShowTrayIcon", false);
 	// These keys are written by ApplyTemporaryVideoProtection and are also what the
 	// injected hooks read out of the same ini, so they have to be read back here.
@@ -7569,6 +9090,26 @@ void MainWindow::LoadSettings()
 	temporaryVideoFilePath = settings->GetSettingStr(L"VideoModifyVideo", L"", MAX_PATH);
 	temporaryVideoLoop = settings->GetSettingBool(L"VideoModifyLoop", true);
 	temporaryVideoPreview.reset();
+
+	// 2026-11-14：钩子默认改成「只记录不拦截」。老版本把 ProhibitKillProcess /
+	// ProhibitCloseWindow 默认写成 TRUE、AllowControl 写成 FALSE —— 这些是出厂默认，
+	// 不是用户的选择。不迁移的话，升级后界面显示"已拦截"、和新默认自相矛盾，
+	// 用户还会以为改坏了。用 EnforceMode 标记只迁移一次，之后用户怎么改都照存。
+	if (settings->GetSettingStr(L"EnforceMode", L"", 32).empty()) {
+		setAllowAllRunOp = true;
+		setProhibitKillProcess = false;
+		setProhibitCloseWindow = false;
+		setAllowControl = true;
+		setBlockWindowOps = false;
+		setBlockDriverAccess = false;
+		settings->SetSettingBool(L"AllowAllRunOp", true);
+		settings->SetSettingBool(L"ProhibitKillProcess", false);
+		settings->SetSettingBool(L"ProhibitCloseWindow", false);
+		settings->SetSettingBool(L"AllowControl", true);
+		settings->SetSettingBool(L"BlockWindowOps", false);
+		settings->SetSettingBool(L"BlockDriverAccess", false);
+		settings->SetSettingStr(L"EnforceMode", L"record");
+	}
 }
 
 void MainWindow::SaveSettings()
@@ -7580,6 +9121,8 @@ void MainWindow::SaveSettings()
 	settings->SetSettingBool(L"AllowGbTop", setAllowGbTop);
 	settings->SetSettingBool(L"ProhibitKillProcess", setProhibitKillProcess);
 	settings->SetSettingBool(L"ProhibitCloseWindow", setProhibitCloseWindow);
+	settings->SetSettingBool(L"BlockWindowOps", setBlockWindowOps);
+	settings->SetSettingBool(L"BlockDriverAccess", setBlockDriverAccess);
 	settings->SetSettingBool(L"AllowMonitor", setAllowMonitor);
 	settings->SetSettingBool(L"AllowControl", setAllowControl);
 	if (currentWorker) {
@@ -7645,6 +9188,11 @@ void MainWindow::OnFirstShow()
 void MainWindow::OnWmCommand(WPARAM wParam)
 {
 	const int command = LOWORD(wParam);
+	if (command == kProcessPickerSearch) {
+		// 搜索框的文本变了：同步回过滤器并重建列表。
+		if (HIWORD(wParam) == EN_CHANGE) SyncProcessPickerFilterFromEdit();
+		return;
+	}
 	if (command == IDC_TEACHER_STUDENTS && HIWORD(wParam) == LBN_SELCHANGE) {
 		if (teacherBackend) {
 			const int selected = static_cast<int>(SendMessageW(teacherStudentList, LB_GETCURSEL, 0, 0));
@@ -7674,9 +9222,11 @@ void MainWindow::OnWmCommand(WPARAM wParam)
 		if (IsWindowVisible(_hWnd)) SetForegroundWindow(_hWnd);
 		break;
 	case IDM_HELP:
+		// 「使用帮助」页已删除，托盘这一项直接弹原有的帮助说明，
+		// 不再跳转到已经不存在的页面（SelectPage(Page::Help) 现在编译不过）。
 		ShowWindow(_hWnd, SW_SHOW);
-		SelectPage(Page::Help);
 		SetForegroundWindow(_hWnd);
+		ShowHelp();
 		break;
 	case IDM_EXIT:
 	case CMD_POWER_EXIT: {
@@ -7768,6 +9318,9 @@ void MainWindow::OnWmTimer(WPARAM timer)
 			// 总长度未知时没有别的动画源，得自己续上重绘，否则高光停在原地。
 			if (updateDialog.mode == UpdateDialogMode::Download && updateDialog.percent < 0) needsPaint = true;
 		}
+
+		// 进程选择器：只有入场淡入，没有持续动画。
+		if (ProcessPickerVisible() && approach(processPicker.appear, 1.0f, 0.06)) needsPaint = true;
 
 		const bool toastAlive = !toastText.empty() && now <= toastUntil;
 		if (!toastText.empty() && !toastAlive) {

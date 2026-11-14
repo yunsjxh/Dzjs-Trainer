@@ -198,6 +198,10 @@ typedef LRESULT (WINAPI *fnSendMessageW)(__in HWND hWnd, __in UINT Msg, __in WPA
 typedef BOOL (WINAPI *fnTerminateProcess)(__in HANDLE hProcess,	__in UINT uExitCode);
 typedef HRESULT (WINAPI *fnFilterConnectCommunicationPort)(LPCWSTR lpPortName, DWORD dwOptions, LPCVOID lpContext, WORD wSizeOfContext, LPSECURITY_ATTRIBUTES lpSecurityAttributes, HANDLE *hPort);
 typedef BOOL (WINAPI *fnBitBlt)(HDC hdc, int x, int y, int cx, int cy, HDC hdcSrc, int x1, int y1, DWORD rop);
+typedef BOOL (WINAPI *fnPrintWindow)(HWND hwnd, HDC hdcBlt, UINT nFlags);
+typedef int  (WINAPI *fnGetDIBits)(HDC hdc, HBITMAP hbm, UINT start, UINT cLines, LPVOID lpvBits, LPBITMAPINFO lpbmi, UINT usage);
+typedef BOOL (WINAPI *fnStretchBlt)(HDC hdcDest, int xDest, int yDest, int wDest, int hDest, HDC hdcSrc, int xSrc, int ySrc, int wSrc, int hSrc, DWORD rop);
+typedef HHOOK (WINAPI *fnSetWindowsHookExW)(int idHook, HOOKPROC lpfn, HINSTANCE hmod, DWORD dwThreadId);
 
 
 //Hooks

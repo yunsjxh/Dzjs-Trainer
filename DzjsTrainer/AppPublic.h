@@ -5,7 +5,7 @@
 #include "TrainerWorker.h" 
 #include "JyUdpAttack.h" 
 
-#define CURRENT_VERSION "1.0.4.2"
+#define CURRENT_VERSION "1.0.5"
 
 // 进程启动最早期（wWinMain 里、任何驱动加载与权限提升之前）那一次 SSPI 预热的
 // 返回值，0xFFFFFFFF 表示没跑过。那行日志写在日志文件打开之前，落不了盘，
@@ -21,6 +21,10 @@ extern unsigned g_sspiEarlyNegotiate;
 #define PART_HOOKER 3
 #define PART_DRIVER 4
 #define PART_AV_DRIVER 5
+// 「进程注入」：64 位目标进程要用 x64 版 hooks DLL + 64 位注入助手，
+// 两者都作为 BIN 资源内嵌，运行时释放到主程序同目录。
+#define PART_HOOKER64 6
+#define PART_INJECTOR64 7
 
 
 

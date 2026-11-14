@@ -7,7 +7,14 @@
 #include "resource.h"
 #include "StringHlp.h"
 #include "StringSplit.h"
-#include "mhook-lib/mhook.h"
+#include "HookEngine.h"
+#include "ReplaceCodec.h"
+#include "ReplaceState.h"
+#include "HooksCommon.h"
+#include "GuardWindow.h"
+#include "GuardProcess.h"
+#include "GuardInput.h"
+#include "GuardDisplay.h"
 #include <list>
 #include <string>
 #include <vector>
@@ -59,8 +66,7 @@
 #define IDM_CLOSE_GB 25603
 #define IDM_HELP_GB2 25604
 
-#define INVALID_HHOOK_MOUSE 0x0001
-#define INVALID_HHOOK_KEYBOARD 0x0002
+// INVALID_HHOOK_MOUSE / INVALID_HHOOK_KEYBOARD 已移到 HooksCommon.h 供 guard 模块共用
 
 using namespace std;
 
@@ -82,12 +88,10 @@ static void VEnsureWndListCs()
 	if (InterlockedCompareExchange(&g_wndListCsInit, 1, 0) == 0)
 		InitializeCriticalSection(&g_wndListCs);
 }
-struct VWndListGuard {
-	VWndListGuard() { VEnsureWndListCs(); EnterCriticalSection(&g_wndListCs); }
-	~VWndListGuard() { LeaveCriticalSection(&g_wndListCs); }
-	VWndListGuard(const VWndListGuard&) = delete;
-	VWndListGuard& operator=(const VWndListGuard&) = delete;
-};
+// 临界区本身留在主翻译单元；VWndListGuard 的构造/析构通过下面两个外部函数
+// 进入，这样 guard 模块也能使用同一个锁而不需要把 CRITICAL_SECTION 变成 extern。
+void VLockWndList() { VEnsureWndListCs(); EnterCriticalSection(&g_wndListCs); }
+void VUnlockWndList() { LeaveCriticalSection(&g_wndListCs); }
 HWND jiYuGBWnd = NULL;
 HWND jiYuGBDeskRdWnd = NULL;
 HWND jiYuGBToolWnd = NULL;
@@ -104,14 +108,26 @@ HWND hWndMsgCenter = NULL;
 HWND hListBoxStatus = NULL;
 std::vector<std::wstring> statusLines;
 
-// The control window title changed in newer builds; keep the legacy title as a fallback.
-constexpr wchar_t kDzjsControlWindowTitle[] = L"Dzjs Trainer Main Window";
+// 主窗口标题是展示文案：用户自改版把 MAIN_WND_NAME 换成了
+// "Dzjs Trainer · 设备防护中心"，而窗口类名 MAIN_WND_CLS_NAME
+// (DzjsTrainerNativeWindow) 一直没变。这里原来只按两个历史标题查找，
+// 标题一改就永远返回 NULL，VSendMessageBack() 于是误判「与主程序失去联系」
+// 并弹出 IDD_OUTCTL —— 即使主窗口明明在。改为优先按类名查找，
+// 标题只作为兼容旧版本 / 改版文案的 fallback。
+constexpr wchar_t kDzjsControlWindowClass[]   = L"DzjsTrainerNativeWindow";
+constexpr wchar_t kDzjsDisplayWindowTitle[]   = L"Dzjs Trainer \u00b7 \u8bbe\u5907\u9632\u62a4\u4e2d\u5fc3";
+constexpr wchar_t kDzjsControlWindowTitle[]   = L"Dzjs Trainer Main Window";
 constexpr wchar_t kLegacyControlWindowTitle[] = L"JiYu Trainer Main Window";
 
 static HWND FindControlWindow()
 {
-	HWND window = FindWindowW(nullptr, kDzjsControlWindowTitle);
-	return window ? window : FindWindowW(nullptr, kLegacyControlWindowTitle);
+	HWND window = FindWindowW(kDzjsControlWindowClass, nullptr);
+	if (window) return window;
+	window = FindWindowW(nullptr, kDzjsDisplayWindowTitle);
+	if (window) return window;
+	window = FindWindowW(nullptr, kDzjsControlWindowTitle);
+	if (window) return window;
+	return FindWindowW(nullptr, kLegacyControlWindowTitle);
 }
 
 HWND desktopWindow, fakeDesktopWindow;
@@ -139,10 +155,19 @@ HWND hWndOpConformNoBtn = NULL;
 bool bandAllRunOp = false, allowNextRunOp = false, allowAllRunOp  = false, ProhibitKillProcess = false, ProhibitCloseWindow = false;
 bool allowMonitor = false, allowControl = false, allowGbTop = false, fakeFull = false, gbFullManual = false,
 doNotShowVirusWindow = true, forceDisableWatchDog = false;
+// 「是否动手」开关，默认全 0 = 只记录（见 HooksCommon.h 的说明）。
+bool blockWindowOps = false, blockDriverAccess = false;
 bool whitePreviewOnly = false;
+// 「进程注入」功能：主程序把本 DLL 注入到用户指定的非极域进程时，
+// VLoad() 走通用宿主分支。通用宿主不等待 LibTDMaster、不改教师端设置，
+// 但仍需要装 hook 表，否则 DLL 只是被加载、什么都不做。
+bool g_customHost = false;
+// [CustomInject] Mode=minimal 时跳过极域专属的显示域/驱动通信/远程运行钩子。
+bool g_customHookMinimal = false;
 // 钩子调用跟踪开关，默认关（ini [JTSettings] HooksTrace=1 打开）。
 // 声明必须早于 VIsInIllegalWindows —— 那里会用到它。
-static bool g_hookTrace = false;
+// 分域后 guard 模块也要读这个开关，故提升为外部链接（HooksCommon.h 里 extern）。
+bool g_hookTrace = false;
 bool captureHelperForwarding = false;
 bool isLocked = false, gbCurrentIsTop = false, isGbFounded = false;
 std::list<std::wstring> runOPWhiteList;
@@ -187,6 +212,10 @@ fnGetDesktopWindow faGetDesktopWindow = NULL;
 fnGetWindowDC faGetWindowDC = NULL;
 fnEncodeToJPEGBuffer faEncodeToJPEGBuffer = NULL;
 fnBitBlt fpBitBlt = NULL;
+fnPrintWindow faPrintWindow = NULL;
+fnGetDIBits faGetDIBits = NULL;
+fnStretchBlt faStretchBlt = NULL;
+fnSetWindowsHookExW faSetWindowsHookExW = NULL;
 fnGetForegroundWindow faGetForegroundWindow = NULL;
 fnCreateDCW faCreateDCW = NULL;
 fnEnableMenuItem faEnableMenuItem = NULL;
@@ -210,25 +239,16 @@ struct VideoStreamProps {
 	HWND m_hPulseWnd = NULL;
 } g_VideoProps;
 
-HDC g_HdcMem = NULL;
-// 视频流替换帧的同步原语:避免 VSetVideoStreamModify 在捕获线程正用 g_HdcMem 调 fpBitBlt 时
-// 调用 DeleteDC 造成 GDI 竞争/卡死。用临界区 + 引用计数保证"正在使用的 DC 不会被删除"。
-CRITICAL_SECTION g_HdcMemCs;
-bool g_HdcMemCsInit = false;
-volatile LONG g_HdcMemRefs = 0;
-std::vector<HDC> g_HdcMemPending;   // 引用计数归零前不能立即删除的旧 DC
+// 视频流替换画面：外部传入的替换 DC（所有权在调用方）。
+// 原 g_HdcMem / g_HdcMemCs / g_HdcMemCsInit / g_HdcMemRefs / g_HdcMemPending
+// 五个全局收成一个对象，临界区、引用计数、延迟删除都在对象内部（见 ReplaceState.h）。
+ReplaceState::ExternalSurface g_surface;
 bool g_Unloading = false;
 
 // 视频流自定义图片替换(JPEG 预览与 H.264 backing bitmap 共用的像素来源)
-BYTE* g_ImgData = NULL;           // RGB24(R,G,B) 缓存,行无对齐(stride=w*3)
-BYTE* g_ImgDibData = NULL;        // BGR24 顶向下 DIB 缓存,供 StretchDIBits 直接绘制
-int g_ImgW = 0, g_ImgH = 0;
-int g_ImgDibStride = 0;
-volatile LONG g_ImgRefs = 0;
-CRITICAL_SECTION g_ImgCs;
-bool g_ImgCsInit = false;
-volatile bool g_ImgValid = false;
-std::vector<BYTE*> g_ImgPendingBuffers; // 引用计数归零前不能立即释放的旧缓冲
+// 原 g_ImgData / g_ImgDibData / g_ImgW / g_ImgH / g_ImgDibStride / g_ImgRefs /
+// g_ImgCs / g_ImgCsInit / g_ImgValid / g_ImgPendingBuffers 十个全局收成一个对象。
+ReplaceState::FrameStore g_frames;
 
 // 视频替换由独立 Media Foundation 线程解码；捕获热路径只读取已发布的当前帧。
 HANDLE g_VideoThread = NULL;
@@ -360,6 +380,7 @@ hk29 = 0, hk30 = 0, hk31 = 0, hk32 = 0,
 hk33 = 0, hk34 = 0, hk35 = 0, hk36 = 0,
 hk37 = 0, hk38 = 0, hk39 = 0, hk40 = 0,
 hk41 = 0;
+BOOL hk42 = 0, hk43 = 0, hk44 = 0, hk45 = 0;
 
 volatile LONG jpegHookAttempted = 0;
 volatile LONG jpegHookLogPending = 0;
@@ -444,11 +465,13 @@ void VDebugLog(const wchar_t* str, ...)
 	InterlockedExchange(&debugLogWriting, 0);
 }
 
+// 统一挂钩入口。名字里的 "Hook" 保持原样：日志格式被回归脚本按关键字抓取。
+// 引擎实现见 HookEngine.cpp（MinHook；批量启用 + 排空卸载）。
 BOOL VSetHookLogged(LPCWSTR name, PVOID* original, PVOID replacement)
 {
-	VDebugLog(L"Mhook begin name=%s target=%p replacement=%p", name, original ? *original : NULL, replacement);
-	BOOL result = Mhook_SetHook(original, replacement);
-	VDebugLog(L"Mhook end name=%s result=%d trampoline=%p", name, result, original ? *original : NULL);
+	VDebugLog(L"hook begin name=%s target=%p replacement=%p", name, original ? *original : NULL, replacement);
+	BOOL result = HookEngine::Install(name, original, replacement) ? TRUE : FALSE;
+	VDebugLog(L"hook end name=%s result=%d trampoline=%p", name, result, original ? *original : NULL);
 	return result;
 }
 
@@ -543,6 +566,15 @@ void VLoad()
 		// 启动重试线程,待 LibJPEG20 加载后装入三层钩(实现体/IAT/GetProcAddress)。
 		VStartJpegHookRetryThread();
 	}
+	else {
+		// 自定义注入宿主（用户通过「进程注入」指定的非极域进程）。
+		// 原实现在这里什么都不做：DLL 被加载了，但 VRunMain / VInstallHooks
+		// 都没跑到，等于注入无效。这里复用同一套初始化，让 34 项有序表照样安装。
+		// 不等待 LibTDMaster、不做 capture-helper 转发、不改极域专属设置。
+		g_customHost = true;
+		VDebugLog(L"VLoad custom host pid=%lu name=%s", GetCurrentProcessId(), name.c_str());
+		VRunMain();
+	}
 
 	loaded = true;
 	VDebugLog(L"VLoad end loaded=1");
@@ -563,12 +595,36 @@ void VRunMain() {
 	VDebugLog(L"VRunMain settings file=%s", mainIniPath);
 	if (PathFileExistsW(mainIniPath))
 		VInitSettings();
-	whitePreviewOnly = !allowMonitor;
+	if (g_customHost) {
+		// 通用宿主不能照搬极域的整段 ini 语义，但**替换开关必须照搬**：
+		// 这里原先把 m_EnableModifyVideoStream 硬写成 false，理由是「TRUE 会把
+		// VInstallHooks 逼进极域的 minimal 帧替换分支」。那条分支现在已经加了
+		// !g_customHost 守卫，开关可以按 ini 生效 —— 效果就是「注入谁，谁的截屏
+		// 就被换成那张图」，不再局限于极域那几个进程。
+		// 代价是：注入一个第三方程序后，最显眼的效果就是「替换开关是全局的」，
+		// 想只对极域生效就在 ini 里关掉 EnableVideoModify 再注入。
+		WCHAR customMode[32] = {};
+		GetPrivateProfileString(L"CustomInject", L"Mode", L"full", customMode, 32, mainIniPath);
+		g_customHookMinimal = StrEqual(customMode, L"minimal") || StrEqual(customMode, L"MINIMAL");
+		// allowMonitor 仍然强制 TRUE：假桌面 + DC 拦截那套（hk26/27/33）在通用宿主里
+		// 没有 fakeDesktopWindow 可用，装上去只会把宿主自己的 GetDesktopWindow 打空。
+		allowMonitor = true;
+		whitePreviewOnly = false;
+		doNotShowVirusWindow = true;   // 不在用户指定的进程里弹状态窗口
+		forceDisableWatchDog = true;   // 没有极域 JPEG 状态可补装，不空转
+		if (g_customHookMinimal && g_VideoProps.m_EnableModifyVideoStream)
+			VDebugLog(L"VRunMain custom host minimal 模式跳过整个显示域，替换画面在 pid=%lu 里不会生效", GetCurrentProcessId());
+		VDebugLog(L"VRunMain custom host mode=%s videoModify=%d (full=34 项表 / minimal=跳过极域专属)",
+			g_customHookMinimal ? L"minimal" : L"full", g_VideoProps.m_EnableModifyVideoStream);
+	}
+	else {
+		whitePreviewOnly = !allowMonitor;
+	}
 	VDebugLog(L"VRunMain settings path=%s allowMonitor=%d whitePreviewOnly=%d allowAllRunOp=%d videoModify=%d",
 		mainIniPath, allowMonitor, whitePreviewOnly, allowAllRunOp, g_VideoProps.m_EnableModifyVideoStream);
 	// 构建标记：日志里有这一行才说明跑的是本次构建的 DLL。
 	// 排查"改了没生效"时先看它，省得在部署问题上兜圈子。
-	VDebugLog(L"hooks build=20260919-netfilter-gate");
+	VDebugLog(L"hooks build=20261114-outctl-fix");
 	// 走 minimal 还是全量集，由上面两个标志决定；全量集会接管极域的窗口/进程/网络接口，
 	// 把它记下来，出问题时一眼能看出走的是哪条分支。
 	VDebugLog(L"hooks mode=%s", (whitePreviewOnly || g_VideoProps.m_EnableModifyVideoStream) ? L"minimal" : L"full");
@@ -637,13 +693,15 @@ DWORD WINAPI VHookInitializeThread(LPVOID lpThreadParameter) {
 	VDebugLog(L"VHookInitializeThread driver handles opened");
 	VInstallHooks(VirusModeHook);
 	VDebugLog(L"VHookInitializeThread hooks installed hk28=%d", hk28);
-	VSendMessageBack(L"hkb:succ", hWndMsgCenter);
+	VSendMessageBack(L"hkb:succ", hWndMsgCenter);  // 通用宿主的回传在 VSendMessageBack 内被抑制
 	PostMessage(hWndMsgCenter, WM_HOOK_INITIALIZED, 0, 0);
-	HANDLE handshakeThread = CreateThread(NULL, 0, VHandshakeRetryThread, NULL, 0, NULL);
-	if (handshakeThread)
-		CloseHandle(handshakeThread);
-	else
-		VDebugLog(L"handshake retry thread create failed error=%lu", GetLastError());
+	if (!g_customHost) {
+		HANDLE handshakeThread = CreateThread(NULL, 0, VHandshakeRetryThread, NULL, 0, NULL);
+		if (handshakeThread)
+			CloseHandle(handshakeThread);
+		else
+			VDebugLog(L"handshake retry thread create failed error=%lu", GetLastError());
+	}
 	VDebugLog(L"VHookInitializeThread control ready");
 	return 0;
 }
@@ -770,18 +828,26 @@ void VInitSettings()
 	GetPrivateProfileString(L"JTSettings", L"AutoForceKill", L"FALSE", w, 32, mainIniPath);
 	if (StrEqual(w, L"TRUE") || StrEqual(w, L"true") || StrEqual(w, L"1")) forceKill = true;
 	else forceKill = false;
-	GetPrivateProfileString(L"JTSettings", L"AllowAllRunOp", L"FALSE", w, 32, mainIniPath);
+	// 2026-11-14 起所有开关默认「只记录不拦截」：键缺失时一律按放行处理，
+	// 用户必须在界面上主动打开某一项，对应的钩子才会真的动手。
+	GetPrivateProfileString(L"JTSettings", L"AllowAllRunOp", L"TRUE", w, 32, mainIniPath);
 	if (StrEqual(w, L"TRUE") || StrEqual(w, L"true") || StrEqual(w, L"1")) allowAllRunOp = true;
 	else allowAllRunOp = false;
 	GetPrivateProfileString(L"JTSettings", L"BandAllRunOp", L"TRUE", w, 32, mainIniPath);
 	if (!StrEqual(w, L"TRUE") && !StrEqual(w, L"true") && !StrEqual(w, L"1")) bandAllRunOp = false;
 	else bandAllRunOp = true;
-	GetPrivateProfileString(L"JTSettings", L"ProhibitKillProcess", L"TRUE", w, 32, mainIniPath);
+	GetPrivateProfileString(L"JTSettings", L"ProhibitKillProcess", L"FALSE", w, 32, mainIniPath);
 	if (!StrEqual(w, L"TRUE") && !StrEqual(w, L"true") && !StrEqual(w, L"1")) ProhibitKillProcess = false;
 	else ProhibitKillProcess = true;
-	GetPrivateProfileString(L"JTSettings", L"ProhibitCloseWindow", L"TRUE", w, 32, mainIniPath);
+	GetPrivateProfileString(L"JTSettings", L"ProhibitCloseWindow", L"FALSE", w, 32, mainIniPath);
 	if (!StrEqual(w, L"TRUE") && !StrEqual(w, L"true") && !StrEqual(w, L"1")) ProhibitCloseWindow = false;
 	else ProhibitCloseWindow = true;
+	GetPrivateProfileString(L"JTSettings", L"BlockWindowOps", L"FALSE", w, 32, mainIniPath);
+	if (StrEqual(w, L"TRUE") || StrEqual(w, L"true") || StrEqual(w, L"1")) blockWindowOps = true;
+	else blockWindowOps = false;
+	GetPrivateProfileString(L"JTSettings", L"BlockDriverAccess", L"FALSE", w, 32, mainIniPath);
+	if (StrEqual(w, L"TRUE") || StrEqual(w, L"true") || StrEqual(w, L"1")) blockDriverAccess = true;
+	else blockDriverAccess = false;
 	
 	GetPrivateProfileString(L"JTSettings", L"DoNotShowVirusWindow", L"TRUE", w, 32, mainIniPath);
 	if (!StrEqual(w, L"TRUE") && !StrEqual(w, L"true") && !StrEqual(w, L"1")) doNotShowVirusWindow = false;
@@ -857,8 +923,10 @@ void VInitSettings()
 		VStopReplacementVideo();
 		if (!useImage && videoPath[0] != L'\0') VStartReplacementVideo(videoPath, g_VideoLoop);
 	}
-	if (g_HdcMem) { DeleteDC(g_HdcMem); g_HdcMem = NULL; }
-	GetPrivateProfileString(L"JTSettings", L"AllowControl", L"FALSE", w, 32, mainIniPath);
+	// 重载配置时丢弃外部替换画面。走 ExternalSurface 而不是直接 DeleteDC：
+	// 捕获线程此刻可能正握着这个 DC，直接删会读到已释放的 GDI 对象。
+	g_surface.Set(0, 0, NULL);
+	GetPrivateProfileString(L"JTSettings", L"AllowControl", L"TRUE", w, 32, mainIniPath);
 	if (StrEqual(w, L"TRUE") || StrEqual(w, L"true") || StrEqual(w, L"1")) allowControl = true;
 	else allowControl = false;
 }
@@ -1202,11 +1270,29 @@ void VBoom() {
 	*/
 }
 void VSendMessageBack(LPCWSTR buff, HWND hDlg) {
+	// 通用宿主（用户指定进程）不参与主程序的 hk: 状态协议：不回传、不握手，
+	// 也不会因为找不到主窗口误判失联而弹 IDD_OUTCTL。下行命令仍可正常接收。
+	if (g_customHost) {
+		VDebugLog(L"message back suppressed custom-host command=%s", buff ? buff : L"(null)");
+		return;
+	}
 	HWND receiveWindow = NULL;
 	if (tlsCommandSender && IsWindow(tlsCommandSender))
 		receiveWindow = tlsCommandSender;
 	if (!receiveWindow)
 		receiveWindow = FindControlWindow();
+	if (!receiveWindow) {
+		// 启动竞态：主窗口可能比 hooks 注入晚几十到几百毫秒才建好。
+		// 原来第一次 FindWindow 失败就立刻弹 IDD_OUTCTL 模态框，既卡住
+		// 消息线程，又会误触发 -r3 重启主程序。先做有限重试（最多 1 秒）。
+		int retries = 0;
+		for (; retries < 5 && !receiveWindow; ++retries) {
+			Sleep(200);
+			receiveWindow = FindControlWindow();
+		}
+		if (receiveWindow)
+			VDebugLog(L"message back recovered after %d control-window retries", retries);
+	}
 	if (receiveWindow) {
 		SendMessageBackContext* context = new (std::nothrow) SendMessageBackContext();
 		if (!context) {
@@ -1227,6 +1313,9 @@ void VSendMessageBack(LPCWSTR buff, HWND hDlg) {
 		}
 	}
 	else if(!outlineEndJiy) {
+		VDebugLog(L"message back control window not found class=%s display=%s legacy=%s command=%s",
+			kDzjsControlWindowClass, kDzjsDisplayWindowTitle, kLegacyControlWindowTitle,
+			buff ? buff : L"(null)");
 		PostMessageW(hWndMsgCenter, WM_COMMAND, IDC_SW_STATUS_MAIN_OUT, 0);
 		PostMessageW(hWndMsgCenter, WM_COMMAND, IDC_SW_STATUS_RB_FAIL, 0);
 		outlineEndJiy = true;
@@ -1490,12 +1579,19 @@ INT_PTR CALLBACK VShowOutOfControlWndProc(HWND hDlg, UINT message, WPARAM wParam
 		break;
 	}
 	case WM_COMMAND: {
-		if (wParam == IDC_RESTART || wParam == IDNO || wParam == IDC_KILL) {
-			
-			hWndOutOfControlConformRs = wParam;
-			lResult = wParam; 
+		if (wParam == IDC_RESTART || wParam == IDNO || wParam == IDC_KILL || wParam == IDCANCEL) {
+			// 「不理会」按钮是 IDNO，而 VSendMessageBack 只把 IDCANCEL 当作
+			// "不动作"，原来点它照样会 -r3 重启主程序。统一映射成 IDCANCEL。
+			hWndOutOfControlConformRs = (wParam == IDNO) ? IDCANCEL : wParam;
+			lResult = hWndOutOfControlConformRs;
 			DestroyWindow(hDlg);
 		}
+		break;
+	}
+	case WM_CLOSE: {
+		// 本过程不走 DefDlgProc，原来点 X / Esc 完全没反应。
+		hWndOutOfControlConformRs = IDCANCEL;
+		DestroyWindow(hDlg);
 		break;
 	}
 	case WM_DESTROY: {
@@ -1683,67 +1779,37 @@ static bool GDIPlusDecodeToRGB24(LPCWSTR path, BYTE*& outBuf, int& outW, int& ou
 
 static bool VPublishReplacementFrame(BYTE* rgbData, BYTE* dibData, int width, int height, int dibStride)
 {
-	if (!rgbData || !dibData || width <= 0 || height <= 0 || dibStride < width * 3) {
-		delete[] rgbData; delete[] dibData; return false;
-	}
-	if (!g_ImgCsInit) { InitializeCriticalSection(&g_ImgCs); g_ImgCsInit = true; }
-	EnterCriticalSection(&g_ImgCs);
-	if (g_ImgValid) {
-		if (g_ImgRefs == 0) { delete[] g_ImgData; delete[] g_ImgDibData; }
-		else { if (g_ImgData) g_ImgPendingBuffers.push_back(g_ImgData); if (g_ImgDibData) g_ImgPendingBuffers.push_back(g_ImgDibData); }
-	}
-	g_ImgData = rgbData; g_ImgDibData = dibData; g_ImgW = width; g_ImgH = height; g_ImgDibStride = dibStride; g_ImgValid = true;
-	LeaveCriticalSection(&g_ImgCs); return true;
+	// 所有权一并移交 FrameStore：失败路径由它负责释放，调用点不必再写两个 delete 分支
+	// （原来是"自己判参数、自己 delete、自己加锁、自己处理 pending"，四件事混在一处）。
+	return g_frames.Publish(rgbData, dibData, width, height, dibStride);
 }
 
 void VUnloadReplacementImage()
 {
-	if (!g_ImgCsInit) return;
-	EnterCriticalSection(&g_ImgCs);
-	if (g_ImgValid) {
-		if (g_ImgRefs == 0) {
-			delete[] g_ImgData;
-			delete[] g_ImgDibData;
-		}
-		else {
-			if (g_ImgData) g_ImgPendingBuffers.push_back(g_ImgData);
-			if (g_ImgDibData) g_ImgPendingBuffers.push_back(g_ImgDibData);
-		}
-		g_ImgValid = false;
-		g_ImgData = NULL; g_ImgDibData = NULL;
-		g_ImgW = 0; g_ImgH = 0; g_ImgDibStride = 0;
-	}
-	if (g_ImgRefs == 0 && !g_ImgPendingBuffers.empty()) {
-		for (size_t i = 0; i < g_ImgPendingBuffers.size(); ++i) delete[] g_ImgPendingBuffers[i];
-		g_ImgPendingBuffers.clear();
-	}
-	LeaveCriticalSection(&g_ImgCs);
+	g_frames.Clear();
 }
 
 bool VLoadReplacementImage(LPCWSTR path)
 {
-	if (!g_ImgCsInit) { InitializeCriticalSection(&g_ImgCs); g_ImgCsInit = true; }
 	if (!path || path[0] == L'\0') { VUnloadReplacementImage(); return false; }
 	BYTE* buf = NULL; int w = 0, h = 0;
 	if (!GDIPlusDecodeToRGB24(path, buf, w, h)) {
 		VDebugLog(L"VideoModifyImage decode failed path=%s", path);
 		return false;
 	}
-	int dibStride = (w * 3 + 3) & ~3;
+	const int dibStride = ReplaceCodec::DibStride(w);
 	BYTE* dibBuf = new (std::nothrow) BYTE[(size_t)dibStride * h];
 	if (!dibBuf) {
 		delete[] buf;
 		VDebugLog(L"VideoModifyImage DIB allocation failed path=%s w=%d h=%d", path, w, h);
 		return false;
 	}
+	// 先清零：Rgb24ToDib 只写每行 width*3 字节，行末 padding 留在零上。
 	ZeroMemory(dibBuf, (size_t)dibStride * h);
-	for (int y = 0; y < h; ++y) {
-		const BYTE* src = buf + (size_t)y * w * 3;
-		BYTE* dst = dibBuf + (size_t)y * dibStride;
-		for (int x = 0; x < w; ++x) {
-			dst[0] = src[2]; dst[1] = src[1]; dst[2] = src[0];
-			src += 3; dst += 3;
-		}
+	if (ReplaceCodec::Rgb24ToDib(buf, w, h, dibBuf, dibStride) == 0) {
+		delete[] buf; delete[] dibBuf;
+		VDebugLog(L"VideoModifyImage DIB conversion rejected path=%s w=%d h=%d stride=%d", path, w, h, dibStride);
+		return false;
 	}
 	if (!VPublishReplacementFrame(buf, dibBuf, w, h, dibStride))
 		return false;
@@ -1773,7 +1839,7 @@ static bool VConvertVideoSample(IMFSample* sample, int width, int height,
 		if (SUCCEEDED(hr) && currentLength >= (DWORD)((size_t)width * 4 * height)) { scanline0 = flatData + (size_t)(height - 1) * width * 4; pitch = -(LONG)(width * 4); }
 	}
 	if (scanline0 && pitch != 0) {
-		dibStride = (width * 3 + 3) & ~3;
+		dibStride = ReplaceCodec::DibStride(width);
 		rgbData = new (std::nothrow) BYTE[(size_t)width * 3 * height];
 		dibData = new (std::nothrow) BYTE[(size_t)dibStride * height];
 		if (rgbData && dibData) {
@@ -1836,47 +1902,32 @@ bool VStartReplacementVideo(LPCWSTR path,bool loop)
 // 线程安全读取替换图缓冲(引用计数防止在读期间被释放)
 static bool VAcquireImage(BYTE*& data, BYTE*& dibData, int& w, int& h, int& dibStride)
 {
-	if (!g_ImgCsInit) return false;
-	EnterCriticalSection(&g_ImgCs);
-	if (g_ImgValid) {
-		InterlockedIncrement(&g_ImgRefs);
-		data = g_ImgData; dibData = g_ImgDibData;
-		w = g_ImgW; h = g_ImgH; dibStride = g_ImgDibStride;
-		LeaveCriticalSection(&g_ImgCs);
-		return true;
-	}
-	LeaveCriticalSection(&g_ImgCs);
-	return false;
+	ReplaceState::Frame frame;
+	if (!g_frames.Acquire(frame))
+		return false;
+	data = frame.rgb; dibData = frame.dib;
+	w = frame.width; h = frame.height; dibStride = frame.dibStride;
+	return true;
 }
 static void VReleaseImage()
 {
-	if (!g_ImgCsInit) return;
-	EnterCriticalSection(&g_ImgCs);
-	LONG refs = InterlockedDecrement(&g_ImgRefs);
-	if (refs == 0 && !g_ImgPendingBuffers.empty()) {
-		for (size_t i = 0; i < g_ImgPendingBuffers.size(); ++i) delete[] g_ImgPendingBuffers[i];
-		g_ImgPendingBuffers.clear();
-	}
-	LeaveCriticalSection(&g_ImgCs);
+	g_frames.Release();
 }
 
 // JPEG 预览输入缓冲按 bottom-up 行序解释。将顶向下的替换图按反向源行写入，
 // 避免编码后的缩略图上下颠倒；H.264 backing bitmap 使用独立的顶向下 DIB 路径。
+// 行序翻转与 RGB→BGR 两件事都由 ReplaceCodec::BlitScaled 的参数表达。
 static void OverlayImage(BYTE* dst, int dw, int dh, int dstride, const BYTE* src, int sw, int sh)
 {
-	if (dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0) return;
-	for (int y = 0; y < dh; y++) {
-		int sy = ((dh - 1 - y) * sh) / dh; if (sy >= sh) sy = sh - 1;
-		const BYTE* srow = src + (size_t)sy * sw * 3;
-		BYTE* drow = dst + (size_t)y * dstride;
-		for (int x = 0; x < dw; x++) {
-			int sx = (x * sw) / dw; if (sx >= sw) sx = sw - 1;
-			const BYTE* s = srow + sx * 3;
-			BYTE* d = drow + x * 3;
-			// EncodeToJPEGBuffer consumes BGR24, while g_ImgData is RGB24.
-			d[0] = s[2]; d[1] = s[1]; d[2] = s[0];
-		}
-	}
+	ReplaceCodec::BlitParams params;
+	params.dstWidth = dw;
+	params.dstHeight = dh;
+	params.dstStride = dstride;
+	params.srcWidth = sw;
+	params.srcHeight = sh;
+	params.swapRB = true;
+	params.flipVertical = true;
+	ReplaceCodec::BlitScaled(dst, src, params);
 }
 
 // IAT hook:改写当前进程导入表中 LibJPEG20.dll 的 EncodeToJPEGBuffer 条目,指向我们的钩子。
@@ -1994,6 +2045,7 @@ static FARPROC WINAPI hkGetProcAddress(HMODULE hModule, LPCSTR lpProcName)
 // 钩子:原始函数把屏幕 RGBA 填入 lpbyBits 后,把整块清零(RGBA,尺寸=(right-left)*(bottom-top)*4)。
 static BOOL __cdecl hkDispDXGIBitBlt(void* pRect, BYTE* lpbyBits)
 {
+	HookEngine::DetourScope detourScope;   // 卸载时等这个计数归零才释放 trampoline
 	BOOL r = g_origDispDXGIBitBlt(pRect, lpbyBits);
 	// 诊断:记录 ordinal 1 是否真的被调用、RECT 维度与返回,确认桌面背景是否走这条路。
 	static volatile LONG s_cnt = 0;
@@ -2009,11 +2061,9 @@ static BOOL __cdecl hkDispDXGIBitBlt(void* pRect, BYTE* lpbyBits)
 		LONG w = rc->right - rc->left;
 		LONG h = rc->bottom - rc->top;
 		if (w > 0 && h > 0 && w < 8192 && h < 8192) {
-			// 不透明黑:B=G=R=0, A=0xFF。逐 DWORD 填充,覆盖 RGBA/BGRA 两种布局
+			// 不透明黑:B=G=R=0, A=0xFF。按 DWORD 填充,覆盖 RGBA/BGRA 两种布局
 			// (三色字节恒为 0,alpha 强制不透明),避免消费端按 alpha 合成时透出真实桌面。
-			DWORD* px = (DWORD*)lpbyBits;
-			SIZE_T total = (SIZE_T)w * (SIZE_T)h;
-			for (SIZE_T i = 0; i < total; ++i) px[i] = 0xFF000000;
+			ReplaceCodec::ApplyOpaqueBlackRgba((DWORD*)lpbyBits, static_cast<size_t>(w) * static_cast<size_t>(h));
 			VDebugLog(L"DispDXGIBitBlt buffer blacked w=%d h=%d", w, h);
 		}
 	}
@@ -2082,6 +2132,7 @@ static DWORD VFillDispDXGIFullRefresh(DispDXGIScreenUpdate* update, LONG width, 
 // 让后续捕获一次覆盖整张持久位图，而不是沿用教师端缓存的旧桌面背景。
 static BOOL __cdecl hkDispDXGIGetScreenUpdate(int outputIndex, DispDXGIScreenUpdate* update)
 {
+	HookEngine::DetourScope detourScope;
 	BOOL r = g_origDispDXGIGetScreenUpdate(outputIndex, update);
 	static volatile LONG s_cnt = 0;
 	LONG n = InterlockedIncrement(&s_cnt);
@@ -2392,7 +2443,7 @@ void VReportJPEGHookStatus()
 // 判定点在 VInstallHooks 开头从 ini 读取，见 VLoadHookLimit()。
 static int g_hookLimit = 0;
 static int g_hookSeq = 0;
-static bool VHookAllowed()
+bool VHookAllowed()
 {
 	++g_hookSeq;
 	return g_hookLimit <= 0 || g_hookSeq <= g_hookLimit;
@@ -2406,7 +2457,7 @@ static bool VHookAllowed()
 //     [JTSettings]
 //     HooksTrace=1
 static volatile LONG g_hookTraceCount = 0;
-static void VTraceHook(const wchar_t* name)
+void VTraceHook(const wchar_t* name)
 {
 	if (!g_hookTrace) return;
 	LONG n = InterlockedIncrement(&g_hookTraceCount);
@@ -2414,8 +2465,41 @@ static void VTraceHook(const wchar_t* name)
 		VDebugLog(L"HOOK %s #%ld", name, n);
 }
 
+// 只记录模式下的动作记录。
+//
+// 这些调用点全都在热路径上（SetWindowPos / SendInput / DeviceIoControl 每秒可能上百次），
+// 而 VDebugLog 每次都要拿自旋锁 + 开文件，无条件写会把被注入的进程拖垮。
+// 所以按总量采样：前 500 条全记，之后每 100 条记一条。要看完整序列打开 HooksTrace。
+void VRecordHook(const wchar_t* name, const wchar_t* fmt, ...)
+{
+	static volatile LONG total = 0;
+	const LONG n = InterlockedIncrement(&total);
+	if (n > 20000) return;
+	if (n > 500 && (n % 100) != 0) return;
+
+	WCHAR detail[512] = { 0 };
+	if (fmt && fmt[0]) {
+		va_list args;
+		va_start(args, fmt);
+		_vsnwprintf_s(detail, _countof(detail), _TRUNCATE, fmt, args);
+		va_end(args);
+	}
+	VDebugLog(L"RECORD %s %s%s%s", name, detail,
+		detail[0] ? L" " : L"", L"(未拦截)");
+}
+
+bool VVideoReplacementEnabled()
+{
+	return g_VideoProps.m_EnableModifyVideoStream;
+}
+
 void VInstallHooks(VirusMode mode) {
 	VDebugLog(L"VInstallHooks begin mode=%d", mode);
+
+	// 批量安装作用域：本函数有多个提前 return（最小帧替换模式等），
+	// 由 RAII 保证每条路径都在返回前一次性启用本批钩子 ——
+	// 不会出现"装到一半已经生效"的半套状态。
+	HookEngine::ScopedBatch hookBatch;
 
 	// 调试用二分开关：[JTSettings] HooksLimit=N 时全量集只装前 N 个钩子（0/缺省 = 全部）。
 	// 每装一个钩子 VHookAllowed() 自增一次，超限的直接跳过（hkN 保持 0 = 未装）。
@@ -2431,7 +2515,7 @@ void VInstallHooks(VirusMode mode) {
 			VDebugLog(L"VInstallHooks HooksLimit=%d -> 全量集只装前 %d 个钩子", g_hookLimit, g_hookLimit);
 	}
 
-	//Mhook_SetHook
+	//HookEngine::Install（原 Mhook_SetHook）
 	HMODULE hUser32 = GetModuleHandle(L"user32.dll");
 	HMODULE hKernel32 = GetModuleHandle(L"kernel32.dll");
 	HMODULE hShell32 = GetModuleHandle(L"shell32.dll");
@@ -2480,7 +2564,15 @@ void VInstallHooks(VirusMode mode) {
 
 	faCreateDCW = (fnCreateDCW)GetProcAddress(hGdi32, "CreateDCW");
 	fpBitBlt = (fnBitBlt)GetProcAddress(hGdi32, "BitBlt");
-	if (!g_HdcMemCsInit) { InitializeCriticalSection(&g_HdcMemCs); g_HdcMemCsInit = true; }
+
+	// 截屏另外三条路 + SetWindowsHookExW（hk42..hk45）。
+	// 注意 gdi32 的 BitBlt/StretchBlt 是**转发导出**，真实实现在 gdi32full.dll；
+	// GetProcAddress 会自动跟进转发，返回真实地址，MinHook 改的就是它 ——
+	// 调用方从哪条路径进来都会命中。
+	faPrintWindow = (fnPrintWindow)GetProcAddress(hUser32, "PrintWindow");
+	faStretchBlt = (fnStretchBlt)GetProcAddress(hGdi32, "StretchBlt");
+	faGetDIBits = (fnGetDIBits)GetProcAddress(hGdi32, "GetDIBits");
+	faSetWindowsHookExW = (fnSetWindowsHookExW)GetProcAddress(hUser32, "SetWindowsHookExW");
 
 	if (hDwmApi) faDwmEnableComposition = (fnDwmEnableComposition)GetProcAddress(hDwmApi, "DwmEnableComposition");
 	if (hFltLib) faFilterConnectCommunicationPort = (fnFilterConnectCommunicationPort)GetProcAddress(hFltLib, "FilterConnectCommunicationPort");
@@ -2491,7 +2583,10 @@ void VInstallHooks(VirusMode mode) {
 	//}
 
 	if (mode == VirusModeHook) {
-		if (whitePreviewOnly || g_VideoProps.m_EnableModifyVideoStream)
+		// 极域宿主的「最小帧替换」分支：开替换或禁监看时只装帧替换必需的那几个钩子，
+		// 34 项表不装。通用宿主**不能**走这里 —— 那条路只装 JPEG/BitBlt/LibDeskMonitor/
+		// DispFilter，全是极域自己的模块，在第三方进程里一个都不存在，替换必然空转。
+		if (!g_customHost && (whitePreviewOnly || g_VideoProps.m_EnableModifyVideoStream))
 		{
 			VDebugLog(L"VInstallHooks minimal frame-replacement mode color=%s",
 				whitePreviewOnly ? L"white" : L"black");
@@ -2517,10 +2612,10 @@ void VInstallHooks(VirusMode mode) {
 		// 已做线程安全加固(临界区 + 引用计数);未提供替换帧时退化为纯透传,不会卡死。
 		if (g_VideoProps.m_EnableModifyVideoStream && fpBitBlt && !hk41)
 			hk41 = VSetHookLogged(L"BitBlt(video-modify)", (PVOID*)&fpBitBlt, (PVOID)Hook_BitBlt);
-		// 视频流"纯黑"模式接线:设捕获尺寸参考(g_HdcMem 保持 NULL → 触发纯黑)。
-		// Hook_BitBlt 在捕获辅助进程(DispcapHelper)会对所有 BitBlt 刷黑,
-		// 在学生端主进程(StudentMain)仅对与捕获尺寸匹配的 BitBlt 刷黑,以防破坏 UI。
-		if (hk41 && g_VideoProps.m_EnableModifyVideoStream && !g_HdcMem) {
+	// 视频流"纯黑"模式接线:设捕获尺寸参考(无外部替换画面 → 触发纯黑)。
+	// Hook_BitBlt 在捕获辅助进程(DispcapHelper)会对所有 BitBlt 刷黑,
+	// 在学生端主进程(StudentMain)仅对与捕获尺寸匹配的 BitBlt 刷黑,以防破坏 UI。
+	if (hk41 && g_VideoProps.m_EnableModifyVideoStream && !g_surface.HasSurface()) {
 			g_VideoProps.m_Width = GetSystemMetrics(SM_CXSCREEN);
 			g_VideoProps.m_Height = GetSystemMetrics(SM_CYSCREEN);
 		}
@@ -2564,63 +2659,24 @@ void VInstallHooks(VirusMode mode) {
 		// 已经装过就直接返回；hk1 是本套的第一个。
 		if (hk1) return;
 
-		if (VHookAllowed()) hk1 = VSetHookLogged(L"SetWindowPos", (PVOID*)&raSetWindowPos, (PVOID)hkSetWindowPos);
-		if (VHookAllowed()) hk2 = VSetHookLogged(L"MoveWindow", (PVOID*)&raMoveWindow, (PVOID)hkMoveWindow);
-		if (VHookAllowed()) hk3 = VSetHookLogged(L"SetForegroundWindow", (PVOID*)&raSetForegroundWindow, (PVOID)hkSetForegroundWindow);
-		if (VHookAllowed()) hk4 = VSetHookLogged(L"BringWindowToTop", (PVOID*)&faBringWindowToTop, (PVOID)hkBringWindowToTop);
-		if (VHookAllowed()) hk5 = VSetHookLogged(L"DeviceIoControl", (PVOID*)&raDeviceIoControl, (PVOID)hkDeviceIoControl);
-		if (VHookAllowed()) hk6 = VSetHookLogged(L"CreateFileA", (PVOID*)&faCreateFileA, (PVOID)hkCreateFileA);
-		if (VHookAllowed()) hk7 = VSetHookLogged(L"CreateFileW", (PVOID*)&faCreateFileW, (PVOID)hkCreateFileW);
-		if (VHookAllowed()) hk8 = VSetHookLogged(L"SetWindowsHookExA", (PVOID*)&faSetWindowsHookExA, (PVOID)hkSetWindowsHookExA);
-		if (VHookAllowed()) hk9 = VSetHookLogged(L"DeferWindowPos", (PVOID*)&faDeferWindowPos, (PVOID)hkDeferWindowPos);
-		if (VHookAllowed()) hk10 = VSetHookLogged(L"SendInput", (PVOID*)&faSendInput, (PVOID)hkSendInput);
-		if (VHookAllowed()) hk11 = VSetHookLogged(L"mouse_event", (PVOID*)&famouse_event, (PVOID)hkmouse_event);
+		// 全量集改由 HookRegistry 的有序表安装：每项带域标签、原始指针、detour
+		// 与安装标记，顺序由 seq 固定（HooksLimit=N 的语义不会因分域而变化）。
+		// detour 实现分别位于 GuardWindow/GuardProcess/GuardInput，显示域见 GuardDisplay.h。
+		HookRegistry::InstallFullSet();
 
-		//if(faTDDeskCreateInstance) 
-		//	hk15 = Mhook_SetHook((PVOID*)&faTDDeskCreateInstance, hkTDDeskCreateInstance);
+		// 通用宿主：全量集装完之后再补帧替换钩子。
+		// BitBlt 不在有序表里（表里 hk41 是 SkipWithLog —— 全量钩会误伤极域自己的 UI 绘制），
+		// 而第三方截屏绝大多数就是 GetDC(NULL) + BitBlt，所以这里按需单独装。
+		// hk42/43/44（PrintWindow / GetDIBits / StretchBlt）已由全量集装上，它们自己
+		// 按 PlanForCapture 决定透传还是替换，开关关着时只写一条 RECORD 日志。
+		// minimal 模式连显示域都跳过了，装 BitBlt 会让「minimal 不碰显示」这条承诺失效，
+		// 所以只在 full 模式下补。
+		if (g_customHost && g_VideoProps.m_EnableModifyVideoStream && !g_customHookMinimal)
+			VEnsureFrameReplacementHooks();
 
-		if (VHookAllowed()) hk16 = VSetHookLogged(L"SetWindowLongA", (PVOID*)&faSetWindowLongA, (PVOID)hkSetWindowLongA);
-		if (VHookAllowed()) hk17 = VSetHookLogged(L"SetWindowLongW", (PVOID*)&faSetWindowLongW, (PVOID)hkSetWindowLongW);
-		if (VHookAllowed()) hk18 = VSetHookLogged(L"ShowWindow", (PVOID*)&faShowWindow, (PVOID)hkShowWindow);
-		if (VHookAllowed()) hk19 = VSetHookLogged(L"ExitWindowsEx", (PVOID*)&faExitWindowsEx, (PVOID)hkExitWindowsEx);
-
-		//hk20 = Mhook_SetHook((PVOID*)&faShellExecuteW, hkShellExecuteW);
-		//if(faShellExecuteExW) hk21 = Mhook_SetHook((PVOID*)&faShellExecuteExW, hkShellExecuteExW);
-
-		if (VHookAllowed()) hk22 = VSetHookLogged(L"CreateProcessW", (PVOID*)&faCreateProcessW, (PVOID)hkCreateProcessW);
-
-		if (faDwmEnableComposition) hk23 = VSetHookLogged(L"DwmEnableComposition", (PVOID*)&faDwmEnableComposition, (PVOID)hkDwmEnableComposition);
-
-		if (VHookAllowed()) hk24 = VSetHookLogged(L"WinExec", (PVOID*)&faWinExec, (PVOID)hkWinExec);
-		if (VHookAllowed()) hk25 = VSetHookLogged(L"CallNextHookEx", (PVOID*)&faCallNextHookEx, (PVOID)hkCallNextHookEx);
-		if (VHookAllowed()) hk26 = VSetHookLogged(L"GetWindowDC", (PVOID*)&faGetWindowDC, (PVOID)hkGetWindowDC);
-		if (VHookAllowed()) hk27 = VSetHookLogged(L"GetDesktopWindow", (PVOID*)&faGetDesktopWindow, (PVOID)hkGetDesktopWindow);
-
-		VEnsureJPEGHook();
-		if (VHookAllowed()) hk29 = VSetHookLogged(L"UnhookWindowsHookEx", (PVOID*)&faUnhookWindowsHookEx, (PVOID)hkUnhookWindowsHookEx);
-
-		if (VHookAllowed()) hk30 = VSetHookLogged(L"CreateProcessA", (PVOID*)&faCreateProcessA, (PVOID)hkCreateProcessA);
-		if (VHookAllowed()) hk31 = VSetHookLogged(L"GetForegroundWindow", (PVOID*)&faGetForegroundWindow, (PVOID)hkGetForegroundWindow);
-
-		if (VHookAllowed()) hk33 = VSetHookLogged(L"CreateDCW", (PVOID*)&faCreateDCW, (PVOID)hkCreateDCW);
-		if (VHookAllowed()) hk34 = VSetHookLogged(L"EnableMenuItem", (PVOID*)&faEnableMenuItem, (PVOID)hkEnableMenuItem);
-
-		if (VHookAllowed()) hk35 = VSetHookLogged(L"SetClassLongA", (PVOID*)&faSetClassLongA, (PVOID)hkSetClassLongA);
-		if (VHookAllowed()) hk36 = VSetHookLogged(L"SetClassLongW", (PVOID*)&faSetClassLongW, (PVOID)hkSetClassLongW);
-
-		hk37 = 0;
-		VDebugLog(L"PostMessageW hook disabled to preserve StudentMain stream initialization");
-		// Hooking SendMessageW also intercepts this DLL's dialog-control messages and can deadlock its UI thread.
-		hk38 = 0;
-		VDebugLog(L"SendMessageW hook disabled to keep status UI responsive");
-		if (VHookAllowed()) hk39 = VSetHookLogged(L"TerminateProcess", (PVOID*)&faTerminateProcess, (PVOID)hkTerminateProcess);
-
-		if(faFilterConnectCommunicationPort) hk40 = VSetHookLogged(L"FilterConnectCommunicationPort", (PVOID*)&faFilterConnectCommunicationPort, (PVOID)hkFilterConnectCommunicationPort);
-
-		hk41 = 0;
-		VDebugLog(L"BitBlt hook disabled; video replacement uses EncodeToJPEGBuffer");
-
-		VDebugLog(L"VInstallHooks end mode=hook hk28=%d", hk28);
+		VDebugLog(L"VInstallHooks end mode=hook hk28=%d installed=%d window=%d process=%d input=%d display=%d",
+			hk28, HookRegistry::TotalInstalled(), GuardWindow::HookCount(),
+			GuardProcess::HookCount(), GuardInput::HookCount(), GuardDisplay::HookCount());
 	}
 	if (mode == VirusModeMaster) {
 
@@ -2669,36 +2725,12 @@ void VUnInstallHooks() {
 	while (InterlockedCompareExchange(&g_DispDXGIInstallLock, 1, 0) != 0)
 		Sleep(1);
 
-	if (hk1) Mhook_Unhook((PVOID*)&raSetWindowPos);
-	if (hk2) Mhook_Unhook((PVOID*)&raMoveWindow);
-	if (hk3) Mhook_Unhook((PVOID*)&raSetForegroundWindow);
-	if (hk4) Mhook_Unhook((PVOID*)&faBringWindowToTop);
-	if (hk5) Mhook_Unhook((PVOID*)&raDeviceIoControl);
-	if (hk6) Mhook_Unhook((PVOID*)&faCreateFileA);
-	if (hk7) Mhook_Unhook((PVOID*)&faCreateFileW);
-	if (hk8) Mhook_Unhook((PVOID*)&faSetWindowsHookExA);
-	if (hk9) Mhook_Unhook((PVOID*)&faDeferWindowPos);
-	if (hk10) Mhook_Unhook((PVOID*)&faSendInput);
-	if (hk11) Mhook_Unhook((PVOID*)&famouse_event);
-	//if (hk12) Mhook_Unhook((PVOID*)&faChangeDisplaySettingsW);
-	//if (hk13) Mhook_Unhook((PVOID*)&faOpenDesktopA);
-	//if (hk14) Mhook_Unhook((PVOID*)&faOpenInputDesktop);
-	//if (hk15) Mhook_Unhook((PVOID*)&faTDDeskCreateInstance);
-	if (hk16) Mhook_Unhook((PVOID*)&faSetWindowLongA);
-	if (hk17) Mhook_Unhook((PVOID*)&faSetWindowLongW);
-	if (hk18) Mhook_Unhook((PVOID*)&faShowWindow);
+	// inline 钩不在这里逐个还原：HookEngine::DisableAll() 按 hook 身份一次性恢复原始指令，
+	// 运行中补装的那些（LoadLibraryW/ExW、DispDXGI、LibDeskMonitor）不会漏。
+	// 下面先处理引擎管不到的**手工 IAT 补丁**。
 
-	if (hk19) Mhook_Unhook((PVOID*)&faExitWindowsEx);
-	if (hk20) Mhook_Unhook((PVOID*)&faShellExecuteW);
-	if (hk21) Mhook_Unhook((PVOID*)&faShellExecuteExW);
-	if (hk22) Mhook_Unhook((PVOID*)&faCreateProcessW);
-	if (hk23) Mhook_Unhook((PVOID*)&faDwmEnableComposition);
-	if (hk24) Mhook_Unhook((PVOID*)&faWinExec);
-	if (hk25) Mhook_Unhook((PVOID*)&faCallNextHookEx);
-	if (hk26) Mhook_Unhook((PVOID*)&faGetWindowDC);
-	if (hk27) Mhook_Unhook((PVOID*)&faGetDesktopWindow);
-	// 三层 JPEG 钩卸载:先还原多模块 IAT 补丁,再 Mhook_Unhook 实现体/GPA 钩。
-	if (hk28 || g_JpegIATHooked || g_JpegI422Hooked || g_JpegImplHooked || g_JpegI422ImplHooked || g_JpegGpaHooked) {
+	{
+		// 1) JPEG 三层钩改写过的多模块 IAT 槽
 		for (size_t i = 0; i < g_JpegIatPatches.size(); ++i) {
 			JpegIatPatch& p = g_JpegIatPatches[i];
 			DWORD oldProt = 0; MEMORY_BASIC_INFORMATION mbi;
@@ -2710,6 +2742,8 @@ void VUnInstallHooks() {
 			}
 		}
 		g_JpegIatPatches.clear();
+
+		// 2) JPEG I422 变体
 		for (size_t i = 0; i < g_JpegI422IatPatches.size(); ++i) {
 			JpegIatPatch& p = g_JpegI422IatPatches[i];
 			DWORD oldProt = 0; MEMORY_BASIC_INFORMATION mbi;
@@ -2721,24 +2755,20 @@ void VUnInstallHooks() {
 			}
 		}
 		g_JpegI422IatPatches.clear();
-		if (g_JpegI422ImplHooked) { Mhook_Unhook((PVOID*)&faEncodeToJPEGBufferI422); g_JpegI422ImplHooked = false; }
-		if (g_JpegImplHooked) { Mhook_Unhook((PVOID*)&faEncodeToJPEGBuffer); g_JpegImplHooked = false; }
-		if (g_JpegGpaHooked) { Mhook_Unhook((PVOID*)&g_pfGetProcAddress); g_JpegGpaHooked = false; }
-	if (hkLLW) { Mhook_Unhook((PVOID*)&g_pfLoadLibraryW); hkLLW = false; }
-	if (hkLLX) { Mhook_Unhook((PVOID*)&g_pfLoadLibraryExW); hkLLX = false; }
-		g_JpegIATHooked = false; g_JpegI422Hooked = false;
-		hk28 = 0;
 	}
-	if (g_DispDXGIHooked) {
-		Mhook_Unhook((PVOID*)&g_origDispDXGIBitBlt);
-		g_DispDXGIHooked = false;
-		g_origDispDXGIBitBlt = NULL;
-	}
-	if (g_DispDXGIGetScreenUpdateHooked) {
-		Mhook_Unhook((PVOID*)&g_origDispDXGIGetScreenUpdate);
-		g_DispDXGIGetScreenUpdateHooked = false;
-		g_origDispDXGIGetScreenUpdate = NULL;
-	}
+
+	// 停用全部 inline 钩，并等在飞 detour 归零 —— 之后才允许 MH_Uninitialize 释放 trampoline。
+	const int disableFailures = HookEngine::DisableAll();
+	const bool drained = HookEngine::WaitForDrain(3000);
+	VDebugLog(L"VUnInstallHooks engineHooks=%d disableFailures=%d drained=%d",
+		HookEngine::Count(), disableFailures, drained ? 1 : 0);
+
+	// 钩子已停用，状态位统一复位（不再逐个 Unhook；hkNN 现在只是"装过没"的记录）。
+	g_JpegIATHooked = false; g_JpegI422Hooked = false;
+	g_JpegImplHooked = false; g_JpegI422ImplHooked = false; g_JpegGpaHooked = false;
+	hkLLW = false; hkLLX = false; hk28 = 0;
+	if (g_DispDXGIHooked) { g_DispDXGIHooked = false; g_origDispDXGIBitBlt = NULL; }
+	if (g_DispDXGIGetScreenUpdateHooked) { g_DispDXGIGetScreenUpdateHooked = false; g_origDispDXGIGetScreenUpdate = NULL; }
 	InterlockedExchange(&g_DispDXGIInstallLock, 0);
 	InterlockedExchange(&g_DispDXGIRetryStarted, 0);
 	InterlockedExchange(&g_remoteInjectStarted, 0);
@@ -2768,32 +2798,15 @@ void VUnInstallHooks() {
 		g_origDesk2GdiFlush = NULL;
 	}
 
-	if (hk30) Mhook_Unhook((PVOID*)&faCreateProcessA);
-	if (hk31) Mhook_Unhook((PVOID*)&faGetForegroundWindow);
-
-	if (hk33) Mhook_Unhook((PVOID*)&faCreateDCW);
-	if (hk34) Mhook_Unhook((PVOID*)&faEnableMenuItem);
-	if (hk35) Mhook_Unhook((PVOID*)&faSetClassLongA);
-	if (hk36) Mhook_Unhook((PVOID*)&faSetClassLongW);
-	if (hk37) Mhook_Unhook((PVOID*)&faPostMessageW);
-	if (hk38) Mhook_Unhook((PVOID*)&faSendMessageW);
-	if (hk39) Mhook_Unhook((PVOID*)&faTerminateProcess);
-	if (hk40) Mhook_Unhook((PVOID*)&faFilterConnectCommunicationPort);
-	if (hk41) { g_Unloading = true; Mhook_Unhook((PVOID*)&fpBitBlt); }
-	if (g_HdcMemCsInit) {
-		// g_Unloading 已置位,Hook_BitBlt 不会再进入替换路径,此处可安全清理。
-		EnterCriticalSection(&g_HdcMemCs);
-		if (g_HdcMem) { DeleteDC(g_HdcMem); g_HdcMem = NULL; }
-		for (size_t i = 0; i < g_HdcMemPending.size(); i++) DeleteDC(g_HdcMemPending[i]);
-		g_HdcMemPending.clear();
-		LeaveCriticalSection(&g_HdcMemCs);
-		DeleteCriticalSection(&g_HdcMemCs);
-		g_HdcMemCsInit = false;
-	}
-	VUnloadReplacementImage();
+	// g_Unloading 已置位,Hook_BitBlt 不会再进入替换路径,此处可安全清理。
+	// 顺序:先停解码线程(它还会 Publish 帧),再销毁两个状态对象
+	// (Shutdown 各自释放当前内容与 pending,并销毁内部临界区)。
 	VStopReplacementVideo();
-	if (g_ImgCsInit) { DeleteCriticalSection(&g_ImgCs); g_ImgCsInit = false; }
+	g_surface.Shutdown();
+	g_frames.Shutdown();
 	if (g_VideoCsInit) { DeleteCriticalSection(&g_VideoCs); g_VideoCsInit = false; }
+	// 释放全部 trampoline。必须放在上面所有仍可能调进钩子的清理动作之后。
+	HookEngine::Uninitialize();
 
 	VOutPutStatus(L"[D] UnInstall all hook");
 
@@ -2824,652 +2837,33 @@ void VCloseFuckDrivers()
 //Fake hook for TDMaster
 
 
-HHOOK hMouseHook;
-HHOOK hKeyboardHook;
 
-HOOKPROC lpMouseHookfn = NULL;
-HOOKPROC lpKeyboardHookfn = NULL;
 
-LRESULT WINAPI LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam)
-{
-	LRESULT result = faCallNextHookEx(hMouseHook, nCode, wParam, lParam);
-	if (lpMouseHookfn)
-		lpMouseHookfn(nCode, wParam, lParam);
-	return result;
-}
-LRESULT WINAPI LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
-{
-	LRESULT result = faCallNextHookEx(hKeyboardHook, nCode, wParam, lParam);
-	if (lpKeyboardHookfn)
-		lpKeyboardHookfn(nCode, wParam, lParam);
-	return result;
-}
 
 //Hook stubs
 
-BOOL WINAPI hkSetForegroundWindow(HWND hWnd)
-{
-	VTraceHook(L"hkSetForegroundWindow");
-	return raSetForegroundWindow(hWnd);
-}
-BOOL WINAPI hkSetWindowPos(HWND hWnd, HWND hWndInsertAfter, int x, int y, int cx, int cy, UINT uFlags)
-{
-	VTraceHook(L"hkSetWindowPos");
-	if (loaded) 
-	{
-		if ((uFlags & SWP_NOSIZE) == 0)
-		{
-			if ((x == 0 && y == 0 && cx == screenWidth && cy == screenHeight))
-			{
-				VSwitchLockState(hWnd, TRUE);
-				if ((fakeFull) && VIsWindowGbOrHp(hWnd))
-					return raSetWindowPos(hWnd, hWndInsertAfter, x, y, cx, cy, uFlags);
-				if (VIsInIllegalCanSizeWindows(hWnd))
-				{
-					{ VWndListGuard guard; jiYuWndCanSize.remove(hWnd); }
-					raSetWindowPos(hWnd, hWndInsertAfter, x, y, cx, cy, uFlags | SWP_NOZORDER);
-					// 同步 SendMessage：目标窗口线程若不处理消息，这里会一直等下去。
-					// 日志打在它前后，卡死时最后一行就能指出是不是这里。
-					if (g_hookTrace) VDebugLog(L"hkSetWindowPos SendMessage(WM_SIZE) hwnd=%p before", hWnd);
-					SendMessage(hWnd, WM_SIZE, NULL, NULL);
-					if (g_hookTrace) VDebugLog(L"hkSetWindowPos SendMessage(WM_SIZE) hwnd=%p after", hWnd);
-					return TRUE;
-				}
-				return TRUE;
-			}
-			else {
-				VSwitchLockState(hWnd, FALSE);
-				if (fakeFull)
-					return raSetWindowPos(hWnd, HWND_NOTOPMOST, x, y, cx, cy, uFlags);
-			}
-		}
-
-		if (VIsInIllegalWindows(hWnd)) 
-			return TRUE;
-	}
-	return raSetWindowPos(hWnd, hWndInsertAfter, x, y, cx, cy, uFlags);
-}
-HDWP WINAPI hkDeferWindowPos(HDWP hWinPosInfo, HWND hWnd, HWND hWndInsertAfter, int x, int y, int cx, int cy, UINT uFlags)
-{
-	VTraceHook(L"hkDeferWindowPos");
-	if (loaded)
-	{
-		if ((uFlags & SWP_NOSIZE) == 0)
-		{
-			if (x == 0 && y == 0 && cx == screenWidth && cy == screenHeight) {
-				VSwitchLockState(hWnd, TRUE);
-				if (fakeFull && VIsWindowGbOrHp(hWnd))
-					return faDeferWindowPos(hWinPosInfo, hWnd, hWndInsertAfter, x, y, cx, cy, uFlags);
-				if (VIsInIllegalCanSizeWindows(hWnd)) {
-					{ VWndListGuard guard; jiYuWndCanSize.remove(hWnd); }
-					HDWP rs = faDeferWindowPos(hWinPosInfo, hWnd, hWndInsertAfter, x, y, cx, cy, uFlags | SWP_NOZORDER);
-					if (g_hookTrace) VDebugLog(L"hkDeferWindowPos SendMessage(WM_SIZE) hwnd=%p before", hWnd);
-					SendMessage(hWnd, WM_SIZE, NULL, NULL);
-					if (g_hookTrace) VDebugLog(L"hkDeferWindowPos SendMessage(WM_SIZE) hwnd=%p after", hWnd);
-					return rs;
-				}
-				return NULL;
-			}
-			else {
-				VSwitchLockState(hWnd, FALSE);
-				if (fakeFull) {
-					return faDeferWindowPos(hWinPosInfo, hWnd, HWND_NOTOPMOST, x, y, cx, cy, uFlags);
-				}
-
-			}
-		}
-
-		if (VIsInIllegalWindows(hWnd))
-			return NULL;
-	}
-	return faDeferWindowPos(hWinPosInfo, hWnd, hWndInsertAfter, x, y, cx, cy, uFlags);
-}
-BOOL WINAPI hkMoveWindow(HWND hWnd, int x, int y, int cx, int cy, BOOL bRepaint)
-{
-	VTraceHook(L"hkMoveWindow");
-	if (loaded)
-	{
-		if (x == 0 && y == 0 && cx == screenWidth && cy == screenHeight) {
-			VSwitchLockState(hWnd, TRUE);
-			if (fakeFull && VIsWindowGbOrHp(hWnd))
-				return raMoveWindow(hWnd, x, y, cx, cy, bRepaint);
-			if (VIsInIllegalCanSizeWindows(hWnd)) {
-				{ VWndListGuard guard; jiYuWndCanSize.remove(hWnd); }
-				return raMoveWindow(hWnd,  x, y, cx, cy, bRepaint);
-			}
-			return TRUE;
-		}
-		else {
-			VSwitchLockState(hWnd, FALSE);
-			if (fakeFull) 
-				return raMoveWindow(hWnd, x, y, cx, cy, bRepaint);
-		}
-		if (VIsInIllegalWindows(hWnd))
-			return TRUE;
-	} 
-	return raMoveWindow(hWnd, x, y, cx, cy, bRepaint);
-}
-BOOL WINAPI hkDeviceIoControl(HANDLE hDevice, DWORD dwIoControlCode, LPVOID lpInBuffer, DWORD nInBufferSize, LPVOID lpOutBuffer, DWORD nOutBufferSize, LPDWORD lpBytesReturned,  LPOVERLAPPED lpOverlapped) {
-	VTraceHook(L"hkDeviceIoControl");
-	if (hDeviceTDKeybd) {
-		if (hDevice == hDeviceTDKeybd) {
-			SetLastError(ERROR_ACCESS_DENIED);
-			return FALSE;
-		}
-	}
-	if (hDeviceTDProcHook) {
-		if (hDevice == hDeviceTDProcHook) {
-			SetLastError(ERROR_ACCESS_DENIED);
-			return FALSE;
-		}
-	}
-	if (hDeviceTDNetFilter) {
-		// 极域靠 TDNetFilter 连教师端。allowAllRunOp 为真（界面上「拦截远程运行程序」是关的）
-		// 表示不干预远程行为，此时必须放行 —— 否则极域连不上教师端，界面会卡死。
-		// 原先这里无条件挡掉，全量集一装就必然出问题。
-		if (!allowAllRunOp && hDevice == hDeviceTDNetFilter) {
-			SetLastError(ERROR_ACCESS_DENIED);
-			return FALSE;
-		}
-	}
-	return raDeviceIoControl(hDevice, dwIoControlCode, lpInBuffer, nInBufferSize, lpOutBuffer, nOutBufferSize, lpBytesReturned, lpOverlapped);
-}
-HANDLE WINAPI hkCreateFileA(LPCSTR lpFileName,  DWORD dwDesiredAccess, DWORD dwShareMode, LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile ) {
-	VTraceHook(L"hkCreateFileA");
-	if (loaded)
-	{
-		if (StringHlp::StrEqualA(lpFileName, "\\\\.\\TDKeybd")) {
-			SetLastError(ERROR_ACCESS_DENIED);
-			return INVALID_HANDLE_VALUE;
-		}
-		if (StringHlp::StrEqualA(lpFileName, "\\\\.\\TDProcHook")) {
-			SetLastError(ERROR_ACCESS_DENIED);
-			return INVALID_HANDLE_VALUE;
-		}
-		if (!allowAllRunOp && StringHlp::StrEqualA(lpFileName, "\\\\.\\TDNetFilter")) {
-			// 极域靠 TDNetFilter 连教师端；allowAllRunOp 为真时必须放行，否则会卡死。
-			SetLastError(ERROR_ACCESS_DENIED);
-			return INVALID_HANDLE_VALUE;
-		}
-	}
-	return faCreateFileA(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
-}
-HANDLE WINAPI hkCreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess,  DWORD dwShareMode, LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile) {
-	VTraceHook(L"hkCreateFileW");
-	if (loaded)
-	{
-		if (StringHlp::StrEqualW(lpFileName, L"\\\\.\\TDKeybd")) {
-			SetLastError(ERROR_ACCESS_DENIED);
-			return INVALID_HANDLE_VALUE;
-		}
-		if (StringHlp::StrEqualW(lpFileName, L"\\\\.\\TDProcHook")) {
-			SetLastError(ERROR_ACCESS_DENIED);
-			return INVALID_HANDLE_VALUE;
-		}
-		if (!allowAllRunOp && StringHlp::StrEqualW(lpFileName, L"\\\\.\\TDNetFilter")) {
-			// 同上：allowAllRunOp 为真（不干预远程行为）时不能挡极域的网络过滤驱动。
-			SetLastError(ERROR_ACCESS_DENIED);
-			return INVALID_HANDLE_VALUE;
-		}
-	}
-	return faCreateFileW(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
-}
-VOID WINAPI hkmouse_event(DWORD dwFlags, DWORD dx, DWORD dy, DWORD dwData,  ULONG_PTR dwExtraInfo)
-{
-	VTraceHook(L"hkmouse_event");
-	if (allowControl) famouse_event(dwFlags, dx, dy, dwData, dwExtraInfo);
-}
-UINT WINAPI hkSendInput(UINT cInputs, LPINPUT pInputs, int cbSize)
-{
-	VTraceHook(L"hkSendInput");
-	if (!allowControl && loaded)
-		return cInputs;
-	return faSendInput(cInputs, pInputs, cbSize);
-}
-BOOL WINAPI hkBringWindowToTop(HWND hWnd)
-{
-	VTraceHook(L"hkBringWindowToTop");
-	if (loaded)
-	{
-		if (VIsInIllegalWindows(hWnd))
-			return TRUE;
-	}
-	return faBringWindowToTop(hWnd);
-}
-BOOL WINAPI hkExitWindowsEx(UINT uFlags, DWORD dwReason) {
-	VTraceHook(L"hkExitWindowsEx");
-	const wchar_t* op = L"";
-	if((uFlags & EWX_POWEROFF) == EWX_POWEROFF) op = L"关闭您的计算机";
-	else if ((uFlags & EWX_REBOOT) == EWX_REBOOT) op = L"重启您的计算机";
-	else if ((uFlags & EWX_LOGOFF) == EWX_LOGOFF) op = L"注销您的计算机";
-	wchar_t str[37];
-	swprintf_s(str, L"极域电子教室试图%s，是否允许极域继续操作？", op);
-	if (MessageBox(NULL, str, L"JiYu Killer 防护警告", MB_ICONEXCLAMATION | MB_YESNO) == IDYES) 
-		return faExitWindowsEx(uFlags, dwReason);
-	SetLastError(ERROR_ACCESS_DENIED);
-	return FALSE;
-}
-HINSTANCE WINAPI hkShellExecuteW(HWND hwnd, LPCWSTR lpOperation, LPCWSTR lpFile, LPCWSTR lpParameters, LPCWSTR lpDirectory, INT nShowCmd) {
-
-	/*if (StrEqual(lpOperation, L"open") || StrEqual(lpOperation, L"runas")) {
-		if (VGetExtension(wstring(lpFile)) == L".exe") {
-			if (bandAllRunOp || !VShowOpConfirmDialog(lpFile, lpParameters))
-				return hInst;
-		}
-	}*/
-	return faShellExecuteW(hwnd, lpOperation, lpFile, lpParameters, lpDirectory, nShowCmd);
-}
-BOOL WINAPI hkShellExecuteExW(SHELLEXECUTEINFOW *pExecInfo) {
-
-	/*if (StrEqual(pExecInfo->lpFile, L"open") || StrEqual(pExecInfo->lpFile, L"runas")) {
-		if (bandAllRunOp || VGetExtension(wstring(pExecInfo->lpFile)) == L".exe") {
-			if (!VShowOpConfirmDialog(pExecInfo->lpFile, pExecInfo->lpParameters)) 
-				return TRUE;
-		}
-	}*/
-	return faShellExecuteExW(pExecInfo);
-
-}
-BOOL VInjectHookIntoProcess(HANDLE process)
-{
-	if (!process)
-		return FALSE;
-
-	WCHAR modulePath[MAX_PATH] = { 0 };
-	DWORD pathLength = GetModuleFileNameW(hInst, modulePath, _countof(modulePath));
-	if (pathLength == 0 || pathLength >= _countof(modulePath))
-	{
-		VDebugLog(L"capture-helper load skipped reason=module-path error=%lu", GetLastError());
-		return FALSE;
-	}
-
-	const SIZE_T pathBytes = (static_cast<SIZE_T>(pathLength) + 1) * sizeof(WCHAR);
-	LPVOID remotePath = VirtualAllocEx(process, NULL, pathBytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-	if (!remotePath)
-	{
-		VDebugLog(L"capture-helper load failed stage=VirtualAllocEx error=%lu", GetLastError());
-		return FALSE;
-	}
-
-	SIZE_T written = 0;
-	if (!WriteProcessMemory(process, remotePath, modulePath, pathBytes, &written) || written != pathBytes)
-	{
-		VDebugLog(L"capture-helper load failed stage=WriteProcessMemory error=%lu written=%Iu expected=%Iu", GetLastError(), written, pathBytes);
-		VirtualFreeEx(process, remotePath, 0, MEM_RELEASE);
-		return FALSE;
-	}
-
-	HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
-	LPTHREAD_START_ROUTINE loadLibrary = kernel32
-		? reinterpret_cast<LPTHREAD_START_ROUTINE>(GetProcAddress(kernel32, "LoadLibraryW"))
-		: NULL;
-	if (!loadLibrary)
-	{
-		VDebugLog(L"capture-helper load failed stage=LoadLibraryW-address error=%lu", GetLastError());
-		VirtualFreeEx(process, remotePath, 0, MEM_RELEASE);
-		return FALSE;
-	}
-
-	HANDLE remoteThread = CreateRemoteThread(process, NULL, 0, loadLibrary, remotePath, 0, NULL);
-	if (!remoteThread)
-	{
-		VDebugLog(L"capture-helper load failed stage=CreateRemoteThread error=%lu", GetLastError());
-		VirtualFreeEx(process, remotePath, 0, MEM_RELEASE);
-		return FALSE;
-	}
-
-	DWORD waitResult = WaitForSingleObject(remoteThread, 5000);
-	DWORD remoteModule = 0;
-	if (waitResult == WAIT_OBJECT_0)
-		GetExitCodeThread(remoteThread, &remoteModule);
-	BOOL result = waitResult == WAIT_OBJECT_0 && remoteModule != 0;
-	VDebugLog(L"capture-helper load result=%d wait=%lu module=%p error=%lu", result, waitResult,
-		reinterpret_cast<HMODULE>(static_cast<ULONG_PTR>(remoteModule)), result ? ERROR_SUCCESS : GetLastError());
-	CloseHandle(remoteThread);
-	VirtualFreeEx(process, remotePath, 0, MEM_RELEASE);
-	return result;
-}
-BOOL WINAPI hkCreateProcessW(LPCWSTR lpApplicationName, LPWSTR lpCommandLine, LPSECURITY_ATTRIBUTES lpProcessAttributes, LPSECURITY_ATTRIBUTES lpThreadAttributes, BOOL bInheritHandles, DWORD dwCreationFlags, LPVOID lpEnvironment, LPCWSTR lpCurrentDirectory, LPSTARTUPINFOW lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation)
-{
-	VTraceHook(L"hkCreateProcessW");
-	const bool isCaptureHelper =
-		(lpApplicationName && StrStrIW(lpApplicationName, L"DispcapHelper.exe")) ||
-		(lpCommandLine && StrStrIW(lpCommandLine, L"DispcapHelper.exe"));
-	if (isCaptureHelper)
-	{
-		const bool callerRequestedSuspended = (dwCreationFlags & CREATE_SUSPENDED) != 0;
-		BOOL result = faCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes,
-			bInheritHandles, dwCreationFlags | CREATE_SUSPENDED, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
-		DWORD error = GetLastError();
-		BOOL moduleLoaded = FALSE;
-		if (result && lpProcessInformation)
-			moduleLoaded = VInjectHookIntoProcess(lpProcessInformation->hProcess);
-		if (result && lpProcessInformation && !callerRequestedSuspended)
-			ResumeThread(lpProcessInformation->hThread);
-		LONG logIndex = InterlockedIncrement(&captureHelperProcessLogCount);
-		VDebugLog(L"CreateProcessW capture-helper index=%ld result=%d moduleLoaded=%d error=%lu pid=%lu application=%s command=%s",
-			logIndex, result, moduleLoaded, error, result && lpProcessInformation ? lpProcessInformation->dwProcessId : 0,
-			lpApplicationName ? lpApplicationName : L"(null)", lpCommandLine ? lpCommandLine : L"(null)");
-		SetLastError(error);
-		return result;
-	}
-
-	bool canContinue = true;
-	if(allowAllRunOp)
-		return faCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
-
-	LPCWSTR exePath = NULL;
-	if (!StrEmepty(lpApplicationName) && _waccess_s(lpApplicationName, 0) == 0) exePath = lpApplicationName;
-	else if (!StrEmepty(lpCommandLine) && _waccess_s(lpCommandLine, 0) == 0) exePath = lpCommandLine;
-	else if(!StrEmepty(lpApplicationName)) exePath = lpApplicationName;
-	else if (!StrEmepty(lpCommandLine)) exePath = lpCommandLine;
-
-	LPCWSTR lowStr = StringHlp::StrLoW(exePath);
-	if (StringHlp::StrContainsW(lowStr, L"shutdown.exe", NULL)) {
-		if (MessageBox(NULL, L"极域电子教室试图关机或重启，是否允许极域继续操作？", L"JiYu Killer 防护警告", MB_ICONEXCLAMATION | MB_YESNO) == IDNO) canContinue = false;
-	} 
-	else if (StringHlp::StrContainsW(lowStr, L"dzjstrainer.exe", NULL)
-		|| StringHlp::StrContainsW(lowStr, L"explorer", NULL)
-		|| StringHlp::StrContainsW(lowStr, L"sogouinput", NULL)
-		|| StringHlp::StrContainsW(lowStr, L"ime", NULL)
-		|| StringHlp::StrContainsW(lowStr, L"baidupinyin", NULL)
-		|| VIsOpInWhiteList(lowStr)) canContinue = true;
-	else if (StringHlp::StrContainsW(lowStr, L"tdchalk.exe", NULL))
-		canContinue = false;
-	else if (bandAllRunOp || !VShowOpConfirmDialog(lpApplicationName, lpCommandLine)) canContinue = false;
-
-	if(canContinue) return faCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
-	else return TRUE;
-}
-BOOL WINAPI hkCreateProcessA(LPCSTR lpApplicationName, LPSTR lpCommandLine, LPSECURITY_ATTRIBUTES lpProcessAttributes, LPSECURITY_ATTRIBUTES lpThreadAttributes, BOOL bInheritHandles, DWORD dwCreationFlags, LPVOID lpEnvironment, LPCSTR lpCurrentDirectory, LPSTARTUPINFOA lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation)
-{
-	VTraceHook(L"hkCreateProcessA");
-	const bool isCaptureHelper =
-		(lpApplicationName && StrStrIA(lpApplicationName, "DispcapHelper.exe")) ||
-		(lpCommandLine && StrStrIA(lpCommandLine, "DispcapHelper.exe"));
-	if (isCaptureHelper)
-	{
-		const bool callerRequestedSuspended = (dwCreationFlags & CREATE_SUSPENDED) != 0;
-		BOOL result = faCreateProcessA(lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes,
-			bInheritHandles, dwCreationFlags | CREATE_SUSPENDED, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
-		DWORD error = GetLastError();
-		BOOL moduleLoaded = FALSE;
-		if (result && lpProcessInformation)
-			moduleLoaded = VInjectHookIntoProcess(lpProcessInformation->hProcess);
-		if (result && lpProcessInformation && !callerRequestedSuspended)
-			ResumeThread(lpProcessInformation->hThread);
-		LONG logIndex = InterlockedIncrement(&captureHelperProcessLogCount);
-		VDebugLog(L"CreateProcessA capture-helper index=%ld result=%d moduleLoaded=%d error=%lu pid=%lu",
-			logIndex, result, moduleLoaded, error, result && lpProcessInformation ? lpProcessInformation->dwProcessId : 0);
-		SetLastError(error);
-		return result;
-	}
-
-	bool canContinue = true;
-	if (allowAllRunOp)
-		return faCreateProcessA(lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
-
-	LPCWSTR lpApplicationNameW = StringHlp::AnsiToUnicode(lpApplicationName);
-	LPCWSTR lpCommandLineW = StringHlp::AnsiToUnicode(lpCommandLine);
-
-	LPCSTR exePath = NULL;
-	if (!StringHlp::StrEmeptyA(lpApplicationName) && _waccess_s(lpApplicationNameW, 0) == 0) exePath = lpApplicationName;
-	else if (!StringHlp::StrEmeptyA(lpCommandLine) && _waccess_s(lpCommandLineW, 0) == 0) exePath = lpCommandLine;
-	else if (!StringHlp::StrEmeptyA(lpApplicationName)) exePath = lpApplicationName;
-	else if (!StringHlp::StrEmeptyA(lpCommandLine)) exePath = lpCommandLine;
-
-	LPCSTR lowStr = StringHlp::StrLoA(exePath);
-	LPCWSTR lowStrW = StringHlp::AnsiToUnicode(lowStr);
-
-	if (StringHlp::StrContainsA(lowStr, "shutdown.exe", NULL)) {
-		if (MessageBox(NULL, L"极域电子教室试图关机或重启，是否允许极域继续操作？", L"JiYu Killer 防护警告", MB_ICONEXCLAMATION | MB_YESNO) == IDNO) canContinue = false;
-	}
-	else if (StringHlp::StrContainsA(lowStr, "dzjstrainer.exe", NULL)
-		|| StringHlp::StrContainsA(lowStr, "explorer", NULL)
-		|| StringHlp::StrContainsA(lowStr, "sogouinput", NULL)
-		|| StringHlp::StrContainsA(lowStr, "ime", NULL)
-		|| StringHlp::StrContainsA(lowStr, "baidupinyin", NULL)
-		|| VIsOpInWhiteList(lowStrW)) canContinue = true;
-	else if (StringHlp::StrContainsA(lowStr, "tdchalk.exe", NULL))
-		canContinue = false;
-	else if (bandAllRunOp || !VShowOpConfirmDialog(lpApplicationNameW, lpCommandLineW)) canContinue = false;
-
-	StringHlp::FreeStringPtr(lpApplicationNameW);
-	StringHlp::FreeStringPtr(lpCommandLineW);
-	StringHlp::FreeStringPtr(lowStrW);
-
-	if (canContinue) return faCreateProcessA(lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
-	else return TRUE;
-}
-UINT WINAPI hkWinExec(LPCSTR lpCmdLine, UINT uCmdShow) {
-	VTraceHook(L"hkWinExec");
-	bool canContinue = true;
-	if (allowAllRunOp)
-		return faWinExec(lpCmdLine, uCmdShow);
-
-	LPCWSTR uniStr = StringHlp::AnsiToUnicode(lpCmdLine);
-	LPCWSTR lowStr = StringHlp::StrLoW(uniStr);
-	if (StringHlp::StrContainsW(lowStr, L"shutdown.exe", NULL)) {
-		if (MessageBox(NULL, L"极域电子教室试图关机或重启，是否允许极域继续操作？", L"JiYu Killer 防护警告", MB_ICONEXCLAMATION | MB_YESNO) == IDNO) canContinue = false;
-	}
-	else if (StringHlp::StrContainsW(lowStr, L"dzjstrainer.exe", NULL)
-		|| StringHlp::StrContainsW(lowStr, L"explorer", NULL)
-		|| StringHlp::StrContainsW(lowStr, L"sogouinput", NULL)
-		|| StringHlp::StrContainsW(lowStr, L"baidupinyin", NULL)
-		|| StringHlp::StrContainsW(lowStr, L"ime", NULL)
-		|| VIsOpInWhiteList(lowStr)) canContinue = true;
-	else if (StringHlp::StrContainsW(lowStr, L"tdchalk.exe", NULL)) canContinue = false;
-	else if (bandAllRunOp || !VShowOpConfirmDialog(uniStr, L"")) canContinue = false;
-
-	delete uniStr;
-	if (canContinue) return faWinExec(lpCmdLine, uCmdShow);
-	else return 32;
-}
-LONG WINAPI hkChangeDisplaySettingsW(DEVMODEW* lpDevMode, DWORD dwFlags)
-{
-	return DISP_CHANGE_SUCCESSFUL;
-}
-HDESK WINAPI hkOpenDesktopA(LPCSTR lpszDesktop, DWORD dwFlags, BOOL fInherit, ACCESS_MASK dwDesiredAccess)
-{
-	SetLastError(ERROR_ACCESS_DENIED);
-	return NULL;
-}
-HDESK WINAPI hkOpenInputDesktop(DWORD dwFlags,BOOL fInherit, ACCESS_MASK dwDesiredAccess)
-{
-	SetLastError(ERROR_ACCESS_DENIED);
-	return NULL;
-}
-LONG WINAPI hkSetWindowLongA(HWND hWnd, int nIndex, LONG dwNewLong)
-{
-	VTraceHook(L"hkSetWindowLongA");
-	if (loaded) {
-		if (fakeFull && VIsWindowGbOrHp(hWnd))
-			return faSetWindowLongA(hWnd, nIndex, dwNewLong);
-		if (VIsInIllegalWindows(hWnd))
-			return GetWindowLongA(hWnd, nIndex);
-	}
-	return faSetWindowLongA(hWnd, nIndex, dwNewLong);
-}
-LONG WINAPI hkSetWindowLongW(HWND hWnd, int nIndex, LONG dwNewLong)
-{
-	VTraceHook(L"hkSetWindowLongW");
-	if (loaded) {
-		if(fakeFull && VIsWindowGbOrHp(hWnd))
-			return faSetWindowLongW(hWnd, nIndex, dwNewLong);
-		if (VIsInIllegalWindows(hWnd))
-			return GetWindowLongW(hWnd, nIndex);
-	}
-	return faSetWindowLongW(hWnd, nIndex, dwNewLong);
-}
-BOOL WINAPI hkShowWindow(HWND hWnd, int nCmdShow)
-{
-	VTraceHook(L"hkShowWindow");
-	if (VIsWindowGbOrHp(hWnd)) 
-	{
-		if (nCmdShow == SW_SHOW || nCmdShow == SW_SHOWNORMAL  || nCmdShow == SW_MAXIMIZE || nCmdShow == SW_MAX || nCmdShow == SW_SHOWNA
-			|| nCmdShow ==  SW_SHOWMAXIMIZED || nCmdShow == SW_SHOWNOACTIVATE || nCmdShow == SW_SHOWDEFAULT) {
-			if(VIsWindowHp(hWnd))
-				VSwitchLockState(hWnd, TRUE);
-			// 只在"广播窗口从未显示变为已显示"时回传一次。
-			// 原先每次 ShowWindow 都发，而 VSendMessageBack 内部是 CreateThread ——
-			// 极域频繁显示窗口时会一次调用堆一个线程。
-			if (VIsWindowGb(hWnd) && !isGbFounded) {
-				isGbFounded = true;
-				VSendMessageBack(L"hkb:immck", hWndMsgCenter);
-			}
-		}
-		else if (nCmdShow == SW_HIDE) {
-			if (VIsWindowGb(hWnd)) isGbFounded = false;
-			VSwitchLockState(hWnd, FALSE);
-		}
-	}
-	return faShowWindow(hWnd, nCmdShow);
-}
-HRESULT WINAPI hkDwmEnableComposition(UINT uCompositionAction)
-{
-	if (!allowMonitor && uCompositionAction == DWM_EC_DISABLECOMPOSITION)
-		return S_OK;
-	return faDwmEnableComposition(uCompositionAction);
-}
-HHOOK WINAPI hkSetWindowsHookExA(int idHook, HOOKPROC lpfn, HINSTANCE hmod, DWORD dwThreadId)
-{
-	VTraceHook(L"hkSetWindowsHookExA");
-	LONG logIndex = InterlockedIncrement(&inputHookLogCount);
-	if (logIndex <= 20)
-		VDebugLog(L"SetWindowsHookExA call index=%ld idHook=%d callback=%p module=%p thread=%lu loaded=%d",
-			logIndex, idHook, lpfn, hmod, dwThreadId, loaded);
-	if (loaded)
-	{
-		if (idHook == WH_CBT) {
-			if (logIndex <= 20) VDebugLog(L"SetWindowsHookExA rejected reason=WH_CBT");
-			SetLastError(ERROR_ACCESS_DENIED);
-			return FALSE;
-		}
-		if (idHook == WH_MOUSE_LL || idHook == WH_MOUSE || idHook == WH_KEYBOARD_LL) {
-			if (hmod == hLibTDMaster) {
-				switch (idHook)
-				{
-				case WH_MOUSE_LL:
-					lpMouseHookfn = lpfn;
-					hMouseHook = faSetWindowsHookExA(idHook, LowLevelMouseProc, hmod, dwThreadId);
-					VOutPutStatus(L"[K] hMouseHook WH_MOUSE_LL hooked 0x%08x", hMouseHook);
-					VOutPutStatus(L"[K] lpfn : 0x%08x hmod :  0x%08x dwThreadId : %d", hMouseHook, hmod, dwThreadId);
-					return (HHOOK)INVALID_HHOOK_MOUSE;
-				case WH_MOUSE:
-					lpMouseHookfn = lpfn;
-					hMouseHook = faSetWindowsHookExA(idHook, LowLevelMouseProc, hmod, dwThreadId);
-					VOutPutStatus(L"[K] hMouseHook WH_MOUSE hooked 0x%08x", hMouseHook);
-					VOutPutStatus(L"[K] lpfn : 0x%08x hmod :  0x%08x dwThreadId : %d", hMouseHook, hmod, dwThreadId);
-					return (HHOOK)INVALID_HHOOK_MOUSE;
-				case WH_KEYBOARD_LL:
-					lpKeyboardHookfn = lpfn;
-					hKeyboardHook = faSetWindowsHookExA(idHook, LowLevelKeyboardProc, hmod, dwThreadId);
-					VOutPutStatus(L"[K] hMouseHook WH_KEYBOARD_LL hooked 0x%08x", hKeyboardHook);
-					VOutPutStatus(L"[K] lpfn : 0x%08x hmod :  0x%08x dwThreadId : %d", hMouseHook, hmod, dwThreadId);
-					return (HHOOK)INVALID_HHOOK_KEYBOARD;
-				}
-			}
-			if (logIndex <= 20) VDebugLog(L"SetWindowsHookExA rejected reason=input-hook-module-mismatch");
-			return FALSE;
-		}
-	}
-	return faSetWindowsHookExA(idHook, lpfn, hmod, dwThreadId);
-}
-LRESULT WINAPI hkCallNextHookEx(HHOOK hhk, int nCode, WPARAM wParam, LPARAM lParam) 
-{
-	VTraceHook(L"hkCallNextHookEx");
-	if (hhk == (HHOOK)INVALID_HHOOK_MOUSE) return 0;
-	if (hhk == (HHOOK)INVALID_HHOOK_KEYBOARD) return 0;
-	return faCallNextHookEx(hhk, nCode, wParam, lParam);
-}
-BOOL WINAPI hkUnhookWindowsHookEx(HHOOK hhk)
-{
-	VTraceHook(L"hkUnhookWindowsHookEx");
-	if (hhk == (HHOOK)INVALID_HHOOK_MOUSE) {
-		BOOL rs = faUnhookWindowsHookEx(hMouseHook);
-		hMouseHook = NULL;
-		VOutPutStatus(L"[K] hMouseHook Unkooked !");
-		return rs;
-	}
-	if (hhk == (HHOOK)INVALID_HHOOK_KEYBOARD) {
-		BOOL rs = faUnhookWindowsHookEx(hKeyboardHook);
-		hMouseHook = hKeyboardHook;
-		VOutPutStatus(L"[K] hKeyboardHook Unkooked !");
-		return rs;
-	}
-	return faUnhookWindowsHookEx(hhk);
-}
-BOOL WINAPI hkPostMessageW(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam)
-{
-	if (loaded && hWnd == mainWindow && VIsInIllegalWindowMessage(Msg) && ProhibitCloseWindow)
-		return 0;
-	if (loaded && VIsInIllegalWindowMessage(Msg)  && ProhibitCloseWindow) {
-		DWORD pid;
-		GetWindowThreadProcessId(hWnd, &pid);
-		if(pid != currentPid)
-			return 0;
-	}
-	return faPostMessageW(hWnd, Msg, wParam, lParam);
-}
-LRESULT WINAPI hkSendMessageW(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam)
-{
-	if (loaded && hWnd == mainWindow) return 0;
-	if (loaded && VIsInIllegalWindowMessage(Msg) && ProhibitCloseWindow) {
-		DWORD pid;
-		GetWindowThreadProcessId(hWnd, &pid);
-		if (pid != currentPid)
-			return 0;
-	}
-	return faSendMessageW(hWnd, Msg,  wParam,  lParam);
-}
-BOOL WINAPI hkTerminateProcess(HANDLE hProcess, UINT uExitCode)
-{
-	VTraceHook(L"hkTerminateProcess");
-	if (loaded && ProhibitKillProcess  && hProcess != GetCurrentProcess()) {
-		SetLastError(ERROR_ACCESS_DENIED);
-		return FALSE;
-	}
-	return faTerminateProcess(hProcess, uExitCode);
-}
-HRESULT WINAPI hkFilterConnectCommunicationPort(LPCWSTR lpPortName, DWORD dwOptions, LPCVOID lpContext, WORD wSizeOfContext, LPSECURITY_ATTRIBUTES lpSecurityAttributes, HANDLE * hPort)
-{
-	VTraceHook(L"hkFilterConnectCommunicationPort");
-	// \TDFileFilterPort 是极域跟它的文件过滤驱动通信的端口。挡掉它，极域会一直等
-	// 驱动响应 —— 表现就是"卡死"：钩子都装好了、日志里却没有任何钩子活动。
-	// 与 TDNetFilter 同理：allowAllRunOp 为真（不干预远程行为）时必须放行。
-	if (loaded && !allowAllRunOp && StrEqual(lpPortName, L"\\TDFileFilterPort")) {
-		VDebugLog(L"FilterConnectCommunicationPort blocked port=%s (allowAllRunOp=0)", lpPortName);
-		return S_FALSE;
-	}
-	return faFilterConnectCommunicationPort(lpPortName, dwOptions, lpContext, wSizeOfContext, lpSecurityAttributes,  hPort);
-}
-HWND WINAPI hkGetDesktopWindow(VOID)
-{
-	if (loaded)
-		return allowMonitor ? desktopWindow : fakeDesktopWindow;
-	return desktopWindow;
-}
-HDC WINAPI hkGetWindowDC(__in_opt HWND hWnd) {
-	if (loaded && hWnd == desktopWindow && !allowMonitor)
-		return faGetWindowDC(fakeDesktopWindow);
-	return faGetWindowDC(hWnd);
-}
 int __cdecl hkEncodeToJPEGBuffer(const BYTE *pixels, int width, int height, int stride, BYTE *jpegOutput, DWORD *jpegLength, int quality, int reserved1, int reserved2)
 {
+	HookEngine::DetourScope detourScope;
 	LONG callIndex = InterlockedIncrement(&jpegCallCount);
 	bool traceCall = callIndex <= 3;
-	const bool replaceFrame = !allowMonitor || g_VideoProps.m_EnableModifyVideoStream;
-	const BYTE replacementValue = !allowMonitor ? 0xFF : 0x00;
+
+	// 三态决策（透传 / 覆盖替换图 / 填充纯色）与颜色口径统一由 codec 回答：
+	//   allowMonitor=false 且无图 ⇒ 白；启用替换但允许监看 ⇒ 黑。
+	ReplaceCodec::Request request;
+	request.allowMonitor = allowMonitor;
+	request.videoModify = g_VideoProps.m_EnableModifyVideoStream;
+	const ReplaceCodec::Plan plan = ReplaceCodec::PlanJpegFrame(request);
+
 	if (traceCall)
-		VDebugLog(L"JPEG call enter index=%ld pixels=%p width=%d height=%d stride=%d output=%p lengthPtr=%p quality=%d allowMonitor=%d videoModify=%d",
-			callIndex, pixels, width, height, stride, jpegOutput, jpegLength, quality, allowMonitor, g_VideoProps.m_EnableModifyVideoStream);
-	if (replaceFrame)
+		VDebugLog(L"JPEG call enter index=%ld pixels=%p width=%d height=%d stride=%d output=%p lengthPtr=%p quality=%d allowMonitor=%d videoModify=%d action=%d",
+			callIndex, pixels, width, height, stride, jpegOutput, jpegLength, quality, allowMonitor,
+			g_VideoProps.m_EnableModifyVideoStream, (int)plan.action);
+
+	if (plan.action != ReplaceCodec::Action::Passthrough)
 	{
 		if (!faEncodeToJPEGBuffer || !jpegOutput || !jpegLength ||
-			width <= 0 || height <= 0 || stride <= 0 ||
-			width > 16384 || height > 16384 ||
-			static_cast<size_t>(stride) < static_cast<size_t>(width) * 3 ||
-			static_cast<size_t>(height) > SIZE_MAX / static_cast<size_t>(stride))
+			!ReplaceCodec::ValidateRgb24(width, height, stride))
 		{
 			if (traceCall) VDebugLog(L"JPEG call rejected index=%ld reason=invalid-arguments", callIndex);
 			if (InterlockedCompareExchange(&frameReplacementInvalidReported, 1, 0) == 0)
@@ -3483,28 +2877,41 @@ int __cdecl hkEncodeToJPEGBuffer(const BYTE *pixels, int width, int height, int 
 		}
 
 		// 优先:自定义图片覆盖源像素(覆盖预览与打开看两条路径)
-		BYTE* imgData = NULL; BYTE* imgDibData = NULL;
-		int imgW = 0, imgH = 0, imgDibStride = 0;
-		if (g_VideoProps.m_EnableModifyVideoStream &&
-			VAcquireImage(imgData, imgDibData, imgW, imgH, imgDibStride))
+		ReplaceState::Frame frame;
+		if (request.videoModify && g_frames.Acquire(frame))
 		{
-			OverlayImage(const_cast<BYTE*>(pixels), width, height, stride, imgData, imgW, imgH);
-			VReleaseImage();
-			if (traceCall) VDebugLog(L"JPEG image overlay index=%ld imgW=%d imgH=%d", callIndex, imgW, imgH);
-			if (InterlockedCompareExchange(&frameReplacementReported, 1, 0) == 0)
+			ReplaceCodec::BlitParams blit;
+			blit.dstWidth = width;
+			blit.dstHeight = height;
+			blit.dstStride = stride;
+			blit.srcWidth = frame.width;
+			blit.srcHeight = frame.height;
+			blit.swapRB = true;        // EncodeToJPEGBuffer 消费 BGR24
+			blit.flipVertical = true;  // 该缓冲按 bottom-up 行序解释
+			const bool overlaid = ReplaceCodec::BlitScaled(const_cast<BYTE*>(pixels), frame.rgb, blit);
+			const int imageW = frame.width, imageH = frame.height;
+			g_frames.Release();
+
+			if (overlaid)
 			{
-				InterlockedExchange(&frameReplacementLogWidth, width);
-				InterlockedExchange(&frameReplacementLogHeight, height);
-				InterlockedExchange(&frameReplacementLogStride, stride);
-				InterlockedExchange(&frameReplacementLogPending, 3);
+				if (traceCall) VDebugLog(L"JPEG image overlay index=%ld imgW=%d imgH=%d", callIndex, imageW, imageH);
+				if (InterlockedCompareExchange(&frameReplacementReported, 1, 0) == 0)
+				{
+					InterlockedExchange(&frameReplacementLogWidth, width);
+					InterlockedExchange(&frameReplacementLogHeight, height);
+					InterlockedExchange(&frameReplacementLogStride, stride);
+					InterlockedExchange(&frameReplacementLogPending, 3);
+				}
+				ULONGLONG encodeStart = GetTickCount64();
+				int result = faEncodeToJPEGBuffer(const_cast<BYTE*>(pixels), width, height, stride,
+					jpegOutput, jpegLength, quality, reserved1, reserved2);
+				if (traceCall) VDebugLog(L"JPEG image call end index=%ld result=%d elapsedMs=%llu", callIndex, result, GetTickCount64() - encodeStart);
+				return result;
 			}
-			ULONGLONG encodeStart = GetTickCount64();
-			int result = faEncodeToJPEGBuffer(const_cast<BYTE*>(pixels), width, height, stride,
-				jpegOutput, jpegLength, quality, reserved1, reserved2);
-			if (traceCall) VDebugLog(L"JPEG image call end index=%ld result=%d elapsedMs=%llu", callIndex, result, GetTickCount64() - encodeStart);
-			return result;
+			// 覆盖失败（尺寸不可用）⇒ 落到下面的纯色填充，失败方向仍是"更像假"。
 		}
 
+		const BYTE replacementValue = plan.solidValue;
 		const size_t frameSize = static_cast<size_t>(stride) * static_cast<size_t>(height);
 		static thread_local std::vector<BYTE> replacementFrame;
 		static thread_local BYTE currentReplacementValue = 0;
@@ -3549,13 +2956,20 @@ int __cdecl hkEncodeToJPEGBuffer(const BYTE *pixels, int width, int height, int 
 }
 int __cdecl hkEncodeToJPEGBufferI422(const BYTE *pixels, int width, int height, int stride, BYTE *jpegOutput, DWORD *jpegLength, int quality, int reserved1, int reserved2)
 {
+	HookEngine::DetourScope detourScope;
 	LONG callIndex = InterlockedIncrement(&jpegCallCount);
 	bool traceCall = callIndex <= 3;
 	if (traceCall)
 		VDebugLog(L"I422 call enter index=%ld pixels=%p width=%d height=%d stride=%d", callIndex, pixels, width, height, stride);
 
-	const bool replaceFrame = !allowMonitor || g_VideoProps.m_EnableModifyVideoStream;
-	if (!replaceFrame) {
+	// 这条路径只做纯色填充，不支持替换图 —— 用独立的决策函数表达，
+	// 避免"有图时覆盖"悄悄生效在一条从未验证过的路径上。
+	ReplaceCodec::Request request;
+	request.allowMonitor = allowMonitor;
+	request.videoModify = g_VideoProps.m_EnableModifyVideoStream;
+	const ReplaceCodec::Plan plan = ReplaceCodec::PlanI422Frame(request);
+
+	if (plan.action == ReplaceCodec::Action::Passthrough) {
 		if (faEncodeToJPEGBufferI422)
 			return faEncodeToJPEGBufferI422(pixels, width, height, stride, jpegOutput, jpegLength, quality, reserved1, reserved2);
 		return -1;
@@ -3571,7 +2985,7 @@ int __cdecl hkEncodeToJPEGBufferI422(const BYTE *pixels, int width, int height, 
 	static thread_local std::vector<BYTE> blackBuf;
 	SIZE_T frameSize = static_cast<SIZE_T>(stride) * static_cast<SIZE_T>(height);
 	if (blackBuf.size() != frameSize) {
-		try { blackBuf.assign(frameSize, 0); }
+		try { blackBuf.assign(frameSize, plan.solidValue); }
 		catch (...) {
 			return faEncodeToJPEGBufferI422(pixels, width, height, stride, jpegOutput, jpegLength, quality, reserved1, reserved2);
 		}
@@ -3588,47 +3002,6 @@ int __cdecl hkEncodeToJPEGBufferI422(const BYTE *pixels, int width, int height, 
 	return result;
 }
 
-HWND WINAPI hkGetForegroundWindow(VOID)
-{
-	VTraceHook(L"hkGetForegroundWindow");
-	return allowAllRunOp ? faGetForegroundWindow() : NULL;
-}
-HDC WINAPI hkCreateDCW(LPCWSTR pwszDriver, LPCWSTR pwszDevice, LPCWSTR pszPort, const DEVMODEW * pdm)
-{
-	if (!allowMonitor)
-	{
-		if (StrEqual(pwszDriver, L"DISPLAY"))
-			return NULL;
-	}
-	return faCreateDCW(pwszDriver, pwszDevice, pszPort, pdm);
-}
-BOOL WINAPI hkEnableMenuItem(HMENU hMenu, UINT uIDEnableItem, UINT uEnable)
-{
-	VTraceHook(L"hkEnableMenuItem");
-	// 屏蔽"关闭"菜单项属于「阻止远程关闭窗口」这一项。原先无条件生效，
-	// 与 hkPostMessageW 里用 ProhibitCloseWindow 判断的做法不一致。
-	if (ProhibitCloseWindow && uIDEnableItem == SC_CLOSE)
-		return 0;
-	return faEnableMenuItem(hMenu, uIDEnableItem, uEnable);
-}
-DWORD WINAPI hkSetClassLongA(HWND hWnd, int nIndex, LONG dwNewLong)
-{
-	VTraceHook(L"hkSetClassLongA");
-	if (loaded) {
-		if (nIndex == GCL_STYLE && (dwNewLong & CS_NOCLOSE) == CS_NOCLOSE)
-			return faSetClassLongA(hWnd, nIndex, dwNewLong ^ CS_NOCLOSE);
-	}
-	return faSetClassLongA(hWnd, nIndex, dwNewLong);
-}
-DWORD WINAPI hkSetClassLongW(HWND hWnd, int nIndex, LONG dwNewLong)
-{
-	VTraceHook(L"hkSetClassLongW");
-	if (loaded) {
-		if(nIndex == GCL_STYLE && (dwNewLong & CS_NOCLOSE) == CS_NOCLOSE)
-			return faSetClassLongW(hWnd, nIndex, dwNewLong ^ CS_NOCLOSE);
-	}
-	return faSetClassLongW(hWnd, nIndex, dwNewLong);
-}
 
 //HOOK Virus stub
 EXTERN_C HRESULT __declspec(dllexport) __cdecl TDAjustCreateInstance(CLSID *rclsid, LPUNKNOWN pUnkOuter, DWORD dwClsContext, IID *riid, LPVOID *ppv)
@@ -3674,11 +3047,16 @@ INT_PTR CALLBACK MainWndProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 		SetTimer(hDlg, TIMER_WATCH_DOG_SRV, 6666, NULL);
 		SetTimer(hDlg, TIMER_AUTO_HIDE, 2600, NULL);
 		SetTimer(hDlg, TIMER_UI_HEARTBEAT, 10000, NULL);
-		ShowWindow(fakeDesktopWindow, SW_SHOW);
-		UpdateWindow(fakeDesktopWindow);
-		ShowWindow(hDlg, SW_SHOW);
-		UpdateWindow(hDlg);
-		VDebugLog(L"MainWndProc initialization completed; window shown");
+		// 通用宿主只把消息中心当消息泵用，不显示状态窗口/假桌面，
+		// 避免在用户指定的进程里凭空冒出一个窗口。
+		if (!g_customHost) {
+			ShowWindow(fakeDesktopWindow, SW_SHOW);
+			UpdateWindow(fakeDesktopWindow);
+			ShowWindow(hDlg, SW_SHOW);
+			UpdateWindow(hDlg);
+		}
+		VDebugLog(L"MainWndProc initialization completed customHost=%d windowShown=%d",
+			g_customHost, !g_customHost);
 		return TRUE;
 	}
 	case WM_INITDIALOG: {
@@ -4155,33 +3533,15 @@ static BOOL VPatchLdmOne(HMODULE hMod, LPCSTR pszImportDll, LPCSTR pszFunc, PVOI
 
 static BOOL VDrawReplacementImage(HDC hdc, int x, int y, int width, int height)
 {
-	BYTE* rgbData = NULL;
-	BYTE* dibData = NULL;
-	int imageWidth = 0, imageHeight = 0, dibStride = 0;
-	if (!VAcquireImage(rgbData, dibData, imageWidth, imageHeight, dibStride)) return FALSE;
+	ReplaceState::Frame frame;
+	if (!g_frames.Acquire(frame)) return FALSE;
 
-	BOOL rendered = FALSE;
-	if (dibData && imageWidth > 0 && imageHeight > 0 && dibStride >= imageWidth * 3 &&
-		width > 0 && height > 0)
-	{
-		BITMAPINFO info;
-		ZeroMemory(&info, sizeof(info));
-		info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-		info.bmiHeader.biWidth = imageWidth;
-		info.bmiHeader.biHeight = -imageHeight; // 缓存按顶向下行序保存
-		info.bmiHeader.biPlanes = 1;
-		info.bmiHeader.biBitCount = 24;
-		info.bmiHeader.biCompression = BI_RGB;
+	// 绘制与 stretch mode 的保存/恢复都在 codec 里：目标 DC 是**调用者的**，
+	// 改了状态不还原的症状是"某程序截图之后界面变色"，极难归因。
+	const BOOL rendered = ReplaceCodec::PaintDib(hdc, x, y, width, height,
+		frame.dib, frame.width, frame.height, frame.dibStride) ? TRUE : FALSE;
 
-		int oldStretchMode = SetStretchBltMode(hdc, COLORONCOLOR);
-		int scanLines = StretchDIBits(hdc, x, y, width, height,
-		                              0, 0, imageWidth, imageHeight,
-		                              dibData, &info, DIB_RGB_COLORS, SRCCOPY);
-		if (oldStretchMode != 0) SetStretchBltMode(hdc, oldStretchMode);
-		rendered = scanLines != 0 && scanLines != GDI_ERROR;
-	}
-
-	VReleaseImage();
+	g_frames.Release();
 	return rendered;
 }
 
@@ -4233,6 +3593,7 @@ static bool VIsScreenCopyRop(DWORD rop)
 static BOOL WINAPI hkLdmBitBlt(HDC hdc, int x, int y, int cx, int cy,
                                HDC hdcSrc, int sx, int sy, DWORD rop)
 {
+	HookEngine::DetourScope detourScope;
 	if (InterlockedCompareExchange(&g_ldmCaptureReent, 1, 0) == 1)
 		return g_origLdmBitBlt(hdc, x, y, cx, cy, hdcSrc, sx, sy, rop); // 重入透传
 	BOOL r = g_origLdmBitBlt(hdc, x, y, cx, cy, hdcSrc, sx, sy, rop);
@@ -4261,6 +3622,7 @@ static BOOL WINAPI hkLdmBitBlt(HDC hdc, int x, int y, int cx, int cy,
 static BOOL WINAPI hkLdmStretchBlt(HDC hdc, int x, int y, int cx, int cy,
                                    HDC hdcSrc, int sx, int sy, int cw, int ch, DWORD rop)
 {
+	HookEngine::DetourScope detourScope;
 	if (InterlockedCompareExchange(&g_ldmCaptureReent, 1, 0) == 1)
 		return g_origLdmStretchBlt(hdc, x, y, cx, cy, hdcSrc, sx, sy, cw, ch, rop);
 	BOOL r = g_origLdmStretchBlt(hdc, x, y, cx, cy, hdcSrc, sx, sy, cw, ch, rop);
@@ -4323,6 +3685,7 @@ static void VEnsureLibDeskMonitorCaptureHook()
 
 static BOOL WINAPI hkDesk2GdiFlush(void)
 {
+	HookEngine::DetourScope detourScope;
 	BOOL result = g_origDesk2GdiFlush ? g_origDesk2GdiFlush() : TRUE;
 	if (!tlsCapturePending || g_Unloading || !g_Desk2GdiFlushHooked)
 		return result;
@@ -4358,6 +3721,7 @@ static BOOL WINAPI hkDesk2GdiFlush(void)
 BOOL WINAPI Hook_BitBlt(HDC hdc, int x, int y, int cx, int cy,
                         HDC hdcSrc, int x1, int y1, DWORD rop)
 {
+	HookEngine::DetourScope detourScope;
 	if (!fpBitBlt)
 		return FALSE;
 	// 线程内重入保护:同一线程递归调用 BitBlt 直接透传,避免自嵌套死循环。
@@ -4366,45 +3730,58 @@ BOOL WINAPI Hook_BitBlt(HDC hdc, int x, int y, int cx, int cy,
 
 	// 快速路径:未启用视频流修改,或正在卸载 —— 纯透传,不做任何额外 GDI 调用,
 	// 把对进程内其它 BitBlt(UI 绘制等)的影响降到最低,避免无谓开销与潜在卡死。
-	// 当前仓库从未调用 VSetVideoStreamModify 提供替换帧,因此 g_HdcMem 恒为 NULL,
+	// 当前仓库从未调用 VSetVideoStreamModify 提供替换帧,因此外部替换画面恒为空,
 	// 走的就是这条快速路径:钩子存在但行为等同透传,绝不会卡死。
 	if (g_Unloading || !g_VideoProps.m_EnableModifyVideoStream)
 		return fpBitBlt(hdc, x, y, cx, cy, hdcSrc, x1, y1, rop);
 
 	// 视频流修改:两种模式
-	//  (a) 替换帧模式:有 g_HdcMem 且与捕获尺寸匹配 → 用替换帧 BitBlt(原逻辑)
-	//  (b) 图片/纯黑模式:无替换帧(g_HdcMem==NULL) → 自定义图片铺满目标捕获位图，
+	//  (a) 替换帧模式:有外部替换画面且与捕获尺寸匹配 → 用替换帧 BitBlt(原逻辑)
+	//  (b) 图片/纯黑模式:无替换画面 → 自定义图片铺满目标捕获位图，
 	//      未配置或绘制失败时回退纯黑。
 	//      防破坏学生端 UI:仅当捕获辅助进程(DispcapHelper,基本只做屏幕捕获)对所有
 	//      BitBlt 刷黑;学生端主进程(StudentMain)只对与捕获尺寸匹配的 BitBlt 刷黑。
 	HDC replacement = NULL;
 	bool blackFill = false;
-	if (g_HdcMemCsInit) {
-		EnterCriticalSection(&g_HdcMemCs);
-		if (g_HdcMem && cx == g_VideoProps.m_Width && cy == g_VideoProps.m_Height
-			&& GetObjectType(hdcSrc) == OBJ_DC) {
-			replacement = g_HdcMem;
-			InterlockedIncrement(&g_HdcMemRefs);
+	bool hasSurface = false;
+	// 借用判定（"尺寸匹配 + 源是窗口/屏幕 DC"）与"有没有外部画面"必须在同一次取锁内完成：
+	// 分开判会出现"借不到 + 不知道要不要刷黑"的错配。
+	replacement = g_surface.Borrow(cx, cy, GetObjectType(hdcSrc) == OBJ_DC, &hasSurface);
+	if (!replacement && !hasSurface) {
+		if (g_customHost) {
+			// 通用宿主没有「捕获辅助进程 / 学生端主进程」这层身份信息，不能像极域那样
+			// 一刀切刷黑 —— 那会把宿主自己的界面绘制（窗口 DC ← 内存 DC）也一起盖掉。
+			// 只认一种形状：**屏幕 DC → 内存 DC 的整块 SRCCOPY**。
+			// 判据与 hk42/43/44 共用 GuardWindow::IsScreenCaptureInto：屏幕 DC 既认
+			// WindowFromDC == 桌面的窗口 DC，也认 CreateDCW(L"DISPLAY") 出来的显示 DC
+			// （后者 WindowFromDC 返回 NULL，只看窗口会把它当内存 DC 放行）。
+			// 所以宿主自己的双缓冲、mem→mem 合成、截图之后的 mem→窗口回贴全部放行。
+			// ★ 不能用 GetObjectType(hdcSrc) == OBJ_DC 代替：那只说明源是个 DC，
+			//   宿主自己的窗口 DC 也满足，替换图会跟着窗口一起被画到屏幕上。
+			blackFill = VIsScreenCopyRop(rop) &&
+			            GetObjectType(hdc) == OBJ_MEMDC &&
+			            GuardWindow::IsScreenCaptureInto(hdcSrc, hdc);
+			static volatile LONG s_customCaptureLogCount = 0;
+			if (blackFill && InterlockedIncrement(&s_customCaptureLogCount) <= 20)
+				VDebugLog(L"Hook_BitBlt custom-host capture cx=%d cy=%d rop=%08X srcDC=%p dstDC=%p",
+				          cx, cy, rop, hdcSrc, hdc);
 		}
-		else if (!g_HdcMem) {
-			if (!captureHelperForwarding)
+		else if (!captureHelperForwarding)
+			blackFill = true;
+		else {
+			// StudentMain: 仅刷黑"屏幕/窗口 → 内存位图"的捕获,避免误伤 UI(mem→窗口 绘制,目标不是 MEMDC)。
+			// 整屏尺寸(视频流预览)与窗口尺寸(打开看:LibDeskMonitor 把源窗口 DC BitBlt 进内存位图)均命中。
+			bool isFullScreen = (cx == g_VideoProps.m_Width && cy == g_VideoProps.m_Height);
+			if (isFullScreen)
 				blackFill = true;
-			else {
-				// StudentMain: 仅刷黑"屏幕/窗口 → 内存位图"的捕获,避免误伤 UI(mem→窗口 绘制,目标不是 MEMDC)。
-				// 整屏尺寸(视频流预览)与窗口尺寸(打开看:LibDeskMonitor 把源窗口 DC BitBlt 进内存位图)均命中。
-				bool isFullScreen = (cx == g_VideoProps.m_Width && cy == g_VideoProps.m_Height);
-				if (isFullScreen)
-					blackFill = true;
-				else if (VIsScreenCopyRop(rop) &&
-				         GetObjectType(hdc) == OBJ_MEMDC &&
-				         GetObjectType(hdcSrc) == OBJ_DC) {
-					blackFill = true;
-					VDebugLog(L"Hook_BitBlt blackFill cx=%d cy=%d rop=%08X srcDC=%p dstDC=%p screenToMem=1",
-					          cx, cy, rop, hdcSrc, hdc);
-				}
+			else if (VIsScreenCopyRop(rop) &&
+			         GetObjectType(hdc) == OBJ_MEMDC &&
+			         GetObjectType(hdcSrc) == OBJ_DC) {
+				blackFill = true;
+				VDebugLog(L"Hook_BitBlt blackFill cx=%d cy=%d rop=%08X srcDC=%p dstDC=%p screenToMem=1",
+				          cx, cy, rop, hdcSrc, hdc);
 			}
 		}
-		LeaveCriticalSection(&g_HdcMemCs);
 	}
 
 	BOOL result;
@@ -4434,15 +3811,9 @@ BOOL WINAPI Hook_BitBlt(HDC hdc, int x, int y, int cx, int cy,
 		result = fpBitBlt(hdc, x, y, cx, cy, hdcSrc, x1, y1, rop);
 
 	if (replacement) {
-		// 用完了:递减引用计数;若归零且有待删除的旧 DC,在此安全删除
+		// 用完了:归还引用;若归零且有待删除的旧 DC,由 Return 内部安全删除
 		// (引用计数归零意味着已没有任何线程正在使用该 DC)。
-		EnterCriticalSection(&g_HdcMemCs);
-		if (InterlockedDecrement(&g_HdcMemRefs) == 0 && !g_HdcMemPending.empty()) {
-			for (size_t i = 0; i < g_HdcMemPending.size(); i++)
-				DeleteDC(g_HdcMemPending[i]);
-			g_HdcMemPending.clear();
-		}
-		LeaveCriticalSection(&g_HdcMemCs);
+		g_surface.Return();
 	}
 	return result;
 }
@@ -4453,23 +3824,12 @@ void VSetVideoStreamModify(int width, int height, HDC hdcMem, bool enable)
 	g_VideoProps.m_Height = height;
 	g_VideoProps.m_EnableModifyVideoStream = enable;
 
-	if (!g_HdcMemCsInit) return;
-	EnterCriticalSection(&g_HdcMemCs);
-	HDC old = g_HdcMem;
-	// 替换或清空当前替换帧;enable=false 时直接置 NULL(停用替换)。
-	g_HdcMem = (enable && hdcMem && hdcMem != old) ? hdcMem : NULL;
-	LeaveCriticalSection(&g_HdcMemCs);
-
-	if (old) {
-		// 若此刻仍有捕获线程正引用 old,绝不能立即删:先挂起,等引用计数归零时由 Hook_BitBlt 删除。
-		if (InterlockedCompareExchange(&g_HdcMemRefs, 0, 0) == 0) {
-			DeleteDC(old);
-		} else {
-			EnterCriticalSection(&g_HdcMemCs);
-			g_HdcMemPending.push_back(old);
-			LeaveCriticalSection(&g_HdcMemCs);
-		}
-	}
+	// 停用或没给 DC ⇒ 清空；给出 DC ⇒ 换新（旧的安全延迟删除）。
+	// ★ 与原实现的差异：旧代码在 hdcMem 与当前 DC **相同**时反而置 NULL
+	//   （`hdcMem != old` 条件写反了方向），重复设置同一个 DC 会把替换画面丢掉。
+	//   这条路径在本仓库从未被调用（主程序不调 VSetVideoStreamModify），
+	//   这里按正确语义实现：相同即保持不变。
+	g_surface.Set(width, height, (enable && hdcMem) ? hdcMem : NULL);
 }
 
 void VSetPulseWindow(HWND hWnd)

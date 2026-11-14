@@ -57,7 +57,10 @@ public:
 
 private:
 	struct TeacherBackend;
-	enum class Page { Overview, Protection, Replacement, Antivirus, Advanced, Help, Network, Diagnostics, Logs, About };
+	// 顺序即侧栏顺序，也即 Page 的整数值（导航用 static_cast<int>(page) 反查）。
+	// 「使用帮助」页已删除，位置由「进程注入」接替 —— Injection 放在第 6 位，
+	// 后面的 Network/Diagnostics/Logs/About 序号保持不变，少动就少出错。
+	enum class Page { Overview, Protection, Replacement, Antivirus, Advanced, Injection, Network, Diagnostics, Logs, About };
 
 	struct LogEntry {
 		std::wstring text;
@@ -80,6 +83,20 @@ private:
 	};
 
 	enum class DiagnosticsFilter { All, HighRisk, Signed, Review };
+
+	// 「防护策略」页右上角那块驱动状态。
+	// XDriverLoaded() 只说明本进程有没有打开设备句柄 —— 驱动被别的实例加载时
+	// 它是 FALSE，据此写「没装」会误导。所以顺带问一次 SCM，把「服务在跑但本
+	// 程序没连上」和「服务根本没起来」分开显示。
+	struct DriverStatusInfo {
+		bool handleOpen = false;
+		bool serviceExists = false;
+		bool serviceRunning = false;
+		std::wstring serviceName;
+		// 0 表示还没采样过。Paint 在 hover 动画里一秒会被叫几十次，
+		// 缓存 1.5 秒，加载/卸载之后调用 InvalidateDriverStatus() 直接作废。
+		unsigned long long sampledAt = 0;
+	};
 
 	HWND _hWnd = nullptr;
 	ULONG_PTR gdiplusToken = 0;
@@ -115,6 +132,10 @@ private:
 	// 高级配置页的输入框底色，必须和自绘的圆角输入框填充一致，
 	// 否则原生控件的方块背景会从圆角里露出来。
 	HBRUSH advancedFieldBrush = nullptr;
+	// 进程选择器的搜索框是原生 EDIT，底色同样要和自绘的圆角框对齐。
+	HBRUSH processPickerFieldBrush = nullptr;
+	HWND processPickerSearchEdit = nullptr;
+	WNDPROC processPickerSearchEditProc = nullptr;
 	std::array<HWND, 15> networkControls{};
 	HWND teacherHostWindow = nullptr;
 	HWND teacherLaunchButton = nullptr;
@@ -152,6 +173,50 @@ private:
 	int hotkeyShowHideValue = 1604;
 	int hotkeyCaptureIndex = -1;
 	std::array<RECT, 2> advancedHotkeyRect{};
+	// Custom process injection page
+	std::array<RECT, 3> customInjectRects{};
+	std::wstring customInjectStatus = L"\u5c31\u7eea";
+	std::wstring customInjectList;
+
+	// 进程选择弹窗：和更新弹窗共用一套窗口内自绘模态卡片，不再弹原生对话框。
+	// 原生 STATIC/EDIT/BUTTON 是直角灰底 + 系统标题栏，和这套圆角玻璃界面两套皮。
+	struct ProcessPickerEntry {
+		DWORD pid = 0;
+		std::wstring name;
+		std::wstring path;
+		bool is64 = false;
+		bool bitnessKnown = false;   // 打不开进程句柄时位数未知，别硬标成 32 位
+		bool self = false;           // 训练器自身：唯一不给注入的目标
+		bool critical = false;       // 系统关键进程：只做提示，不拦
+		bool injected = false;
+	};
+	enum class ProcessPickerMode { None, Inject, Unload };
+	struct ProcessPickerState {
+		ProcessPickerMode mode = ProcessPickerMode::None;
+		float appear = 0.0f;
+		std::wstring filter;
+		std::vector<ProcessPickerEntry> entries;
+		std::vector<int> visible;   // 过滤后的下标，指向 entries
+		// 多选：与 entries 平行的勾选位。选中状态跟着进程走，不跟着行号走，
+		// 所以过滤、滚动、刷新都不会把别人的勾错位。
+		std::vector<unsigned char> checked;
+		int cursor = -1;            // 焦点行，指向 visible
+		int anchor = -1;            // Shift 连选的起点，指向 visible
+		int scroll = 0;
+		int rowCount = 0;
+		int hoverRow = -1;
+		std::wstring status;
+	};
+	ProcessPickerState processPicker;
+	RECT processPickerCardRect{};
+	RECT processPickerListRect{};
+	RECT processPickerSearchRect{};
+	RECT processPickerPrimaryRect{};
+	RECT processPickerSecondaryRect{};
+	RECT processPickerRefreshRect{};
+	RECT processPickerSelectAllRect{};
+	std::array<RECT, 14> processPickerRowRects{};
+	bool ProcessPickerVisible() const { return processPicker.mode != ProcessPickerMode::None; }
 	int advancedTab = 0;
 	int advancedKillMode = 1;
 	int advancedInjectMode = 0;
@@ -197,6 +262,9 @@ private:
 	bool animationTimerRunning = false;
 	ULONGLONG lastAnimationTick = 0;
 	bool darkMode = false;
+	// 没手动点过主题按钮就跟随系统的浅色/深色设置；点过之后本次运行内以手动为准。
+	bool themeFollowsSystem = true;
+	void ApplyTheme(bool dark, bool fromSystem);
 	bool firstShow = true;
 	bool isUserCancel = false;
 	bool closeButtonClickPending = false;
@@ -219,10 +287,15 @@ private:
 	bool setAllowAllRunOp = true;
 	bool setAllowGbTop = false;
 	bool setAllowMonitor = true;
-	bool setAllowControl = false;
-	bool setProhibitKillProcess = true;
-	bool setProhibitCloseWindow = true;
+	// 2026-11-14 起「默认只记录不拦截」：下面这些"允许"类开关默认放行，
+	// "阻止"类开关默认关闭。用户打开某一项，注入的钩子才会真的动手。
+	bool setAllowControl = true;
+	bool setProhibitKillProcess = false;
+	bool setProhibitCloseWindow = false;
 	bool setBandAllRunOp = false;
+	// 新增的两个拦截项：窗口操作 / 极域驱动访问。
+	bool setBlockWindowOps = false;
+	bool setBlockDriverAccess = false;
 	// Information-stream protection is deliberately session-only.  It is reset
 	// when the program exits and is never written to the normal settings file.
 	bool temporaryVideoProtection = false;
@@ -253,6 +326,7 @@ private:
 	RECT advancedSettingsRect{};
 	RECT driverLoadRect{};
 	RECT driverUnloadRect{};
+	DriverStatusInfo driverStatus;
 	RECT avScanRect{};
 	RECT avImportRect{};
 	RECT avInputRect{};
@@ -306,7 +380,6 @@ private:
 	void PaintAntivirus(Gdiplus::Graphics& g, int width, int height, int offsetY);
 	void PaintLogs(Gdiplus::Graphics& g, int width, int height, int offsetY);
 	void PaintAdvanced(Gdiplus::Graphics& g, int width, int height, int offsetY);
-	void PaintHelp(Gdiplus::Graphics& g, int width, int height, int offsetY);
 	void PaintNetwork(Gdiplus::Graphics& g, int width, int height, int offsetY);
 	void PaintDiagnostics(Gdiplus::Graphics& g, int width, int height, int offsetY);
 	void PaintAbout(Gdiplus::Graphics& g, int width, int height, int offsetY);
@@ -356,6 +429,7 @@ private:
 	RECT updateDialogPrimaryRect{};
 	RECT updateDialogSecondaryRect{};
 	bool UpdateDialogVisible() const { return updateDialog.mode != UpdateDialogMode::None; }
+	bool ModalDialogVisible() const { return UpdateDialogVisible() || ProcessPickerVisible(); }
 	// 一次探测还没回来时不再起第二次。两次并行探测会各弹一次结果，谁先到不确定；
 	// 用户看到的就是「点了没动静，再点一下突然说已是最新版本」。
 	std::atomic<bool> updateProbeInFlight{ false };
@@ -371,6 +445,23 @@ private:
 	void ApplyDialogOcclusion();
 	void RequestSuperTopmost();
 	void SelectPage(Page target);
+	void PaintInjection(Gdiplus::Graphics& g, int width, int height, int offsetY);
+	// 自绘进程选择器
+	void PaintProcessPicker(Gdiplus::Graphics& g, int width, int height);
+	void OpenProcessPicker(bool unload);
+	void CloseProcessPicker();
+	void RefreshProcessPicker();
+	void RebuildProcessPickerVisible();
+	int HitProcessPickerAt(POINT point) const;
+	bool HandleProcessPickerClick(POINT point);
+	bool HandleProcessPickerKey(UINT key, WPARAM wParam);
+	void UpdateProcessPickerHover(POINT point);
+	void CommitProcessPicker();
+	// 搜索框：自绘的那个框接不到输入法，所以叠一个真 EDIT 上去。
+	void EnsureProcessPickerSearchEdit();
+	void PositionProcessPickerSearchEdit();
+	void SyncProcessPickerFilterFromEdit();
+	static LRESULT CALLBACK ProcessPickerSearchProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
 	void StartAvProcessScan();
 	void StopAvProcessScan();
 	void FinishAvProcessScan();
@@ -378,6 +469,9 @@ private:
 	void InputAvSignature();
 	void CopyAvSignature();
 	void UnloadAvDriver();
+	// 驱动状态框的数据源，带 1.5 秒缓存；点完加载/卸载调 Invalidate 立刻重采。
+	const DriverStatusInfo& CurrentDriverStatus();
+	void InvalidateDriverStatus() { driverStatus.sampledAt = 0; }
 	void LayoutEmbeddedWindows();
 	void CreateNetworkControls();
 	void LayoutNetworkControls();

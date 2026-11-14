@@ -460,6 +460,25 @@ int JTAppInternal::CheckAndInstall()
 		appLogger->LogInfo(L"已释放内嵌 DzjsTrainerHooks.dll");
 	}
 
+	// 「进程注入」：64 位目标进程需要 x64 版 hooks DLL 和 64 位注入助手。
+	// 32 位主程序无法对 64 位进程 CreateRemoteThread，助手在 64 位侧完成注入。
+	auto stageCustomInjectResource = [this](int resourceId, LPCWSTR path, LPCWSTR label) -> bool {
+		if (ResourceMatchesFile(hInstance, MAKEINTRESOURCE(resourceId), L"BIN", path)) return true;
+		std::wstring staged = std::wstring(path) + L".new";
+		DeleteFile(staged.c_str());
+		if (InstallResFile(hInstance, MAKEINTRESOURCE(resourceId), L"BIN", staged.c_str()) != EXTRACT_RES::ExtractSuccess ||
+			!MoveFileEx(staged.c_str(), path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+			appLogger->LogError2(L"Unable to install embedded %s: %s (%d)", label, PRINT_LAST_ERROR_STR);
+			DeleteFile(staged.c_str());
+			return false;
+		}
+		appLogger->LogInfo(L"已释放内嵌 %s", label);
+		return true;
+	};
+	if (!stageCustomInjectResource(IDR_DLL_HOOKS64, fullHooker64Path.c_str(), L"DzjsTrainerHooks64.dll") ||
+		!stageCustomInjectResource(IDR_INJECTOR64_EXE, fullInjector64Path.c_str(), L"DzjsTrainerInjector64.exe"))
+		return -1;
+
 	// Reuse an installed driver after validating its protocol. Extract only when
 	// the service is missing, cannot start, or fails compatibility validation.
 	if (SysHlp::Is64BitOS() && !XTryReuseInstalledDriver()) {
@@ -821,6 +840,15 @@ int JTAppInternal::RunInternal()
 		AvIntegratedEnsureLoaded(fullAvDriverPath.c_str());
 
 	appWorker = new TrainerWorkerInternal();
+	// 命令行自定义注入：资源已释放、worker 已创建，直接执行一次后继续正常启动。
+	if (!appCustomInjectTarget.empty() && appWorker) {
+		std::wstring customStatus;
+		const bool customOk = appCustomInjectUnload
+			? appWorker->UninjectCustomProcess(appCustomInjectTarget.c_str(), &customStatus)
+			: appWorker->InjectCustomProcess(appCustomInjectTarget.c_str(), &customStatus);
+		appLogger->LogInfo(L"CLI custom inject target=%s unload=%d result=%d status=%s",
+			appCustomInjectTarget.c_str(), appCustomInjectUnload, customOk, customStatus.c_str());
+	}
 	appJyUdpAttack = new JyUdpAttack();
 	if (!ActiveDefenseDemoStart())
 		appLogger->LogWarn(L"[DEFENSE-DEMO] audit monitor failed to start");
@@ -1063,6 +1091,10 @@ LPCWSTR JTAppInternal::GetPartFullPath(int partId)
 		return fullIniPath.c_str();
 	if (partId == PART_HOOKER)
 		return fullHookerPath.c_str();
+	if (partId == PART_HOOKER64)
+		return fullHooker64Path.c_str();
+	if (partId == PART_INJECTOR64)
+		return fullInjector64Path.c_str();
 	if (partId == PART_DRIVER)
 		return fullDriverPath.c_str();
 	if (partId == PART_AV_DRIVER)
@@ -1157,6 +1189,9 @@ void JTAppInternal::MergePathString()
 	// 见 GenerateDateBasedAvServiceName / XGetAvDriverServiceName。
 	fullAvDriverPath = fullDir + L"\\" + GenerateDateBasedAvFileName() + L".sys";
 	fullHookerPath = fullDir + L"\\DzjsTrainerHooks.dll";
+	// 自定义进程注入：64 位目标用同目录下的 x64 hooks DLL 与 64 位助手
+	fullHooker64Path = fullDir + L"\\DzjsTrainerHooks64.dll";
+	fullInjector64Path = fullDir + L"\\DzjsTrainerInjector64.exe";
 }
 void JTAppInternal::InitPath()
 {
@@ -1201,6 +1236,17 @@ void JTAppInternal::InitArgs()
 	if (FindArgInCommandLine(appArgList, appArgCount, L"crash-test") != -1) appCrashTestMode = true;
 	if (FindArgInCommandLine(appArgList, appArgCount, L"killst") != -1) appKillStMode = true;
 	if (FindArgInCommandLine(appArgList, appArgCount, L"?") != -1) appCmdHelpMode = true;
+
+	int customInjectIndex = FindArgInCommandLine(appArgList, appArgCount, L"inject");
+	if (customInjectIndex >= 0 && customInjectIndex + 1 < appArgCount) {
+		appCustomInjectTarget = appArgList[customInjectIndex + 1];
+		appCustomInjectUnload = false;
+	}
+	customInjectIndex = FindArgInCommandLine(appArgList, appArgCount, L"uninject");
+	if (customInjectIndex >= 0 && customInjectIndex + 1 < appArgCount) {
+		appCustomInjectTarget = appArgList[customInjectIndex + 1];
+		appCustomInjectUnload = true;
+	}
 
 	int argFIndex = FindArgInCommandLine(appArgList, appArgCount, L"f");
 	if (argFIndex >= 0 && (argFIndex + 1) < appArgCount) {

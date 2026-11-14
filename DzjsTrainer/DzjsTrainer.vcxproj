@@ -279,6 +279,8 @@
     <EmbeddedDriverUnlockResource Include="$(SolutionDir)DzjsTrainerDriver.unlock.enc.sample" />
     <EmbeddedAvDriverResource Include="$(SolutionDir)JiYuAvRelease\JiYuAvKernel.sys" />
     <EmbeddedUpdaterResource Include="$(SolutionDir)$(Configuration)\DzjsTrainerUpdater.exe" />
+    <EmbeddedHooks64Resource Include="$(SolutionDir)x64\$(Configuration)\DzjsTrainerHooks.dll" />
+    <EmbeddedInjector64Resource Include="$(SolutionDir)x64\$(Configuration)\DzjsTrainerInjector64.exe" />
   </ItemGroup>
   <ItemGroup>
     <Image Include="..\DzjsTrainerLogo.ico" />
@@ -292,7 +294,7 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <Target Name="RefreshEmbeddedModuleResources"
           BeforeTargets="ResourceCompile"
-          Inputs="@(EmbeddedHooksResource);@(EmbeddedDriverResource);@(EmbeddedDriverUnlockResource);@(EmbeddedAvDriverResource);@(EmbeddedUpdaterResource)"
+          Inputs="@(EmbeddedHooksResource);@(EmbeddedDriverResource);@(EmbeddedDriverUnlockResource);@(EmbeddedAvDriverResource);@(EmbeddedUpdaterResource);@(EmbeddedHooks64Resource);@(EmbeddedInjector64Resource)"
           Outputs="$(IntDir)embedded-module-resources.stamp">
     <Delete Files="$(IntDir)DzjsTrainer.res" />
     <Touch Files="$(IntDir)embedded-module-resources.stamp" AlwaysCreate="true" />

@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #include "stdafx.h"
 #ifdef JTEXPORT
 #include "resource.h"
@@ -84,10 +84,16 @@ private:
 	std::wstring fullIniPath;
 	std::wstring fullLogPath;
 	std::wstring fullArgBuffer;
+	// CLI custom injection: -inject / -uninject <PID|process name>
+	std::wstring appCustomInjectTarget;
+	bool appCustomInjectUnload = false;
 
 	std::wstring fullDriverPath;
 	std::wstring fullAvDriverPath;
 	std::wstring fullHookerPath;
+	// 自定义进程注入：x64 hooks DLL 与 64 位注入助手（内嵌释放）
+	std::wstring fullHooker64Path;
+	std::wstring fullInjector64Path;
 
 	std::wstring existsAntiVirus;
 

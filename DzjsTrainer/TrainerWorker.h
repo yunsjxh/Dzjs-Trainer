@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #include "stdafx.h"
 #include <string>
 #include <list>
@@ -65,6 +65,14 @@ public:
 	virtual void HandleMessageFromVirus(LPCWSTR buf) {}
 	virtual void SendMessageToVirus(LPCWSTR buf) {}
 	virtual bool AppointStudentMainLocation(LPCWSTR fullPath) { return false; }
+
+	// 「进程注入」：target 可以是十进制 PID，也可以是进程名（如 notepad.exe）。
+	// status 返回可直接显示给用户的中文结果；实现负责位数判断、黑名单与卸载清理。
+	virtual bool InjectCustomProcess(LPCWSTR target, std::wstring* status) { return false; }
+	virtual bool UninjectCustomProcess(LPCWSTR target, std::wstring* status) { return false; }
+	virtual std::wstring GetCustomInjectedList() { return L""; }
+	// 进程选择器用 PID 查「已注入」标记。返回 bool 而不是容器，避免跨 DLL 传 STL。
+	virtual bool IsCustomInjected(DWORD pid) { return false; }
 };
 
 #ifdef JTEXPORT
@@ -97,6 +105,11 @@ public:
 	bool AppointStudentMainLocation(LPCWSTR fullPath);
 	DWORD GetStudentMainPid() { return _StudentMainPid; }
 
+	bool InjectCustomProcess(LPCWSTR target, std::wstring* status) override;
+	bool UninjectCustomProcess(LPCWSTR target, std::wstring* status) override;
+	std::wstring GetCustomInjectedList() override;
+	bool IsCustomInjected(DWORD pid) override;
+
 	bool Kill(bool autoWork = false);
 	bool KillStAuto();
 	bool Rerun(bool autoWork = false);
@@ -119,6 +132,19 @@ private:
 	std::wstring _TopDomainPassword;
 
 	std::list<IncorrectStudentMainFilterData> incorrectStudentMainPids;
+
+	// 用户通过「进程注入」显式指定的目标；退出时统一卸载，不自动扩散到子进程。
+	struct CustomInjectedProcess {
+		DWORD pid = 0;
+		std::wstring name;
+		bool is64 = false;
+	};
+	std::list<CustomInjectedProcess> _CustomInjected;
+	bool ResolveCustomTarget(LPCWSTR target, DWORD* outPid, std::wstring* outName, std::wstring* status);
+	bool IsSelfCustomTarget(DWORD pid, LPCWSTR name, std::wstring* status);
+	bool DetectTargetBitness(DWORD pid, bool* outIs64, std::wstring* status);
+	bool RunInjector64(DWORD pid, LPCWSTR dllPath, bool unload, std::wstring* status);
+	void UnloadAllCustomInjected();
 
 	HHOOK hMsgBoxHook;
 	HWND hWndMain;

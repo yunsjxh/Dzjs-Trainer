@@ -9,6 +9,8 @@
 #define IDR_DRIVER_UNLOCK_TOKEN         132
 #define IDR_AV_DRIVER                   133
 #define IDR_UPDATER_EXE                 134
+#define IDR_DLL_HOOKS64                 136
+#define IDR_INJECTOR64_EXE              137
 
 #define IDI_APP_MAIN                         135
 #define IDI_WARN                        147
