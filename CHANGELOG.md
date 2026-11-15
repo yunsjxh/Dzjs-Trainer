@@ -152,7 +152,7 @@ All notable changes to Dzjs Trainer are documented in this file.
 ### Added
 
 - Added a dedicated homepage/header action for super topmost.
-- Added runtime UIAccess relaunch and token verification based on the `D:\\原桌面\\class` implementation.
+- Added runtime UIAccess relaunch and token verification.
 
 ### Changed
 
