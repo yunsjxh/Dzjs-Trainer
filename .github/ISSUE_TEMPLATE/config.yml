@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 下载最新版本
+    url: https://github.com/yunsjxh/Dzjs-Trainer/releases
+    about: 发布包、校验文件和每次的更新说明都在这里。反馈问题前先确认是不是已经修过了。
+  - name: 官方网站
+    url: https://dzjstrainer.xn--9kq396ceqaq4si9m.cn/
+    about: 下载地址、版本更新记录与使用说明。
