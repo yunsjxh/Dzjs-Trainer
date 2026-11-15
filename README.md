@@ -1,6 +1,6 @@
 # Dzjs Trainer
 
-当前版本：`v1.0.3`
+当前版本：`v1.0.5`
 
 Dzjs Trainer 是基于 JiYu Trainer 翻新和持续维护的 Windows 桌面项目，面向经授权的教学机房、设备维护与兼容性研究场景。
 
@@ -28,6 +28,8 @@ Dzjs Trainer 是基于 JiYu Trainer 翻新和持续维护的 Windows 桌面项�
 - 可配置的设备防护策略和信息流保护开关。
 - x64 内核驱动与驱动签名验证链路。
 - 图片与视频预览、选择框与相关界面能力。
+- 可将兼容层注入指定进程，32 位与 64 位目标均可。
+- 可选的画面替换，覆盖 BitBlt、StretchBlt、PrintWindow、GetDIBits 等抓屏路径。
 - 极域电子教室、机房管理助手的兼容适配基础。
 
 ## 架构
@@ -48,7 +50,7 @@ Dzjs Trainer 是基于 JiYu Trainer 翻新和持续维护的 Windows 桌面项�
 ## 环境要求
 
 - Windows 10 或更高版本。
-- Visual Studio 2022，包含 C++ 桌面开发和 MSBuild。
+- Visual Studio 2022 或更高版本，包含 C++ 桌面开发和 MSBuild。
 - Windows 10/11 SDK。
 - 构建 `DzjsTrainerDriver` 时需要安装与系统匹配的 WDK。
 
@@ -96,7 +98,7 @@ openssl pkey -in update-server\ticket-sign.pem -pubout -outform DER -out update-
 
 > **注意：用上面的 MSBuild 命令构建出来的 exe，无法卸载自己加载的驱动。**
 >
-> `DzjsTrainer.vcxproj` 把 `IDR_DRIVER_UNLOAD_TOKEN` 固定绑定到
+> `DzjsTrainer.vcxproj` 把 `IDR_DRIVER_UNLOCK_TOKEN` 固定绑定到
 > `$(SolutionDir)DzjsTrainerDriver.unlock.enc.sample`，而该占位令牌与本次构建产出的
 > `.sys` 并不匹配。驱动会拒绝卸载，日志中出现：
 >
@@ -143,7 +145,7 @@ openssl pkey -in update-server\ticket-sign.pem -pubout -outform DER -out update-
 
 - JiYu Trainer 原作者：快乐的梦鱼。
 - 当前维护与翻新：云散皆星河。
-- 第三方组件包括 curl、mhook、MemoryModule、XZip/XUnZip、dnlib 等；请分别遵循其许可证要求。
+- 第三方组件包括 curl、MinHook、MemoryModule、XZip/XUnZip、dnlib 等；请分别遵循其许可证要求。
 
 ## 许可证
 
