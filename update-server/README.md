@@ -135,6 +135,20 @@ php sync-site.php --force      # 内容相同也重写
 将来仓库新增的文件也不会自动上线；要让它上线，必须在 `dzjs_site_allowed()` 里
 明确加一条。这个方向是刻意的：自动部署的失败方向应该是「没更新」，不是「覆盖了不该覆盖的」。
 
+### 站点发布包（`Release/`）
+
+首页「直接写入文件夹」读的是站点根 `Release/DzjsTrainer.exe`。这个二进制不进仓库，
+也不在白名单里，所以自动部署管不到它，每次发版要手动覆盖一次：
+
+```bash
+scp -i <key> Release/DzjsTrainer.exe root@<host>:"/www/wwwroot/DzjsTrainer.云散皆星河.cn/Release/DzjsTrainer.exe"
+ssh -i <key> root@<host> "sha256sum '/www/wwwroot/DzjsTrainer.云散皆星河.cn/Release/DzjsTrainer.exe'"
+```
+
+文件名固定、内容随版本覆盖，所以站点侧必须让它每次回源：`location ~ .*\.(js|css)?$`
+会连 `.exe` 一起缓存，nginx 里另加了 `location ^~ /Release/ { expires -1; }` 跳过这条规则。
+少了最后这段，覆盖成功后仍有几个小时在发旧文件。
+
 ### 几个实现取舍
 
 - **用 git blob SHA 判断有没有变化**，不维护状态文件：`sha1("blob <字节数>\0" + 内容)`
