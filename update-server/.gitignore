@@ -35,3 +35,7 @@ sync-site.log
 .site-backup/
 .github-token.php
 github-token.php
+
+# 站点发布包同步（sync-release.php）的日志与上次同步的资产指纹。
+sync-release.log
+.release-asset.state

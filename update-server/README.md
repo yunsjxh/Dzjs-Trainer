@@ -138,12 +138,20 @@ php sync-site.php --force      # 内容相同也重写
 ### 站点发布包（`Release/`）
 
 首页「直接写入文件夹」读的是站点根 `Release/DzjsTrainer.exe`。这个二进制不进仓库，
-也不在白名单里，所以自动部署管不到它，每次发版要手动覆盖一次：
+也不在静态文件白名单里，所以单独走一条同步：每小时第 37 分取最新 release 的资产，
+有裸 exe 就用它，没有就从发布 zip 里解出来，解之前先核对 zip 的 SHA-256。
 
 ```bash
-scp -i <key> Release/DzjsTrainer.exe root@<host>:"/www/wwwroot/DzjsTrainer.云散皆星河.cn/Release/DzjsTrainer.exe"
-ssh -i <key> root@<host> "sha256sum '/www/wwwroot/DzjsTrainer.云散皆星河.cn/Release/DzjsTrainer.exe'"
+php sync-release.php              # 内容没变就不下载
+php sync-release.php --dry-run    # 只下载并校验，不替换线上文件
+php sync-release.php --force      # 忽略上次记录，强制重新下载
 ```
+
+跳过要同时满足两条：release 资产没变过，且线上文件还是上次写下的那一份。只比资产会漏掉
+文件被换掉或截断的情况 —— 那种时候必须重新下载覆盖。替换前备份到 `.DzjsTrainer.exe.bak`，
+落盘用临时文件 + rename，下载者不会读到半截程序。
+
+cron 排在每小时第 37 分（与 version 的 :17、静态文件的 :27 错开），后台另有「立即同步发布包」按钮。
 
 文件名固定、内容随版本覆盖，所以站点侧必须让它每次回源：`location ~ .*\.(js|css)?$`
 会连 `.exe` 一起缓存，nginx 里另加了 `location ^~ /Release/ { expires -1; }` 跳过这条规则。
