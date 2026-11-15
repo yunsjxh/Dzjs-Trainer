@@ -1,68 +1,86 @@
-name: 问题反馈
-description: 程序用出问题了，按这个模板说清楚，方便快速定位
-title: "[问题] "
-labels: ["bug"]
+name: "问题反馈"
+description: 反馈 Bug / 使用问题 / 建议（请尽量附日志）
+title: "[Issue] "
 body:
   - type: markdown
     attributes:
       value: |
-        ## 先说日志
+        感谢反馈！为了更快定位问题，请尽量提供：
 
-        日志能把一半的问题直接指出来，**麻烦一定带上**：
+        - **日志**：主程序目录下的 `DzjsTrainer.log`
+        - **相关信息**：出问题的页面、涉及的进程名、极域版本
 
-        - 主程序目录下的 `DzjsTrainer.log`，直接把这个文件拖进下面的输入框就能上传；
-        - 如果程序装在 Program Files 里，日志会写不进去，改放到 `%LOCALAPPDATA%\DzjsTrainer\DzjsTrainer.log`，去这个路径找；
-        - 或者打开程序左边「日志」页，点「导出日志」，会生成一个 `DzjsTrainer-log-日期-时间.txt`，传这个也行。
+        > 日志在程序目录下：`DzjsTrainer.log`。装在 Program Files 里写不进去时，
+        > 会改写到 `%LOCALAPPDATA%\DzjsTrainer\DzjsTrainer.log`。
+        > 也可以打开程序左侧「日志」页点「导出日志」，会生成 `DzjsTrainer-log-日期-时间.txt`。
+        > 文件直接拖到下面的输入框就能上传。
 
-        崩溃、卡死、画面异常、更新失败这类问题，没有日志基本上只能靠猜。
-
-  - type: textarea
-    id: what
+  - type: dropdown
+    id: issue_type
     attributes:
-      label: 问题描述
-      description: 发生了什么？你期望的结果是什么？
-      placeholder: |
-        发生了什么：
-        点「开始运行」以后侧栏的驱动状态一直显示未加载，但驱动其实已经起来了。
-
-        期望的结果：
-        状态框应该显示「已加载」。
+      label: 问题类型
+      description: 请选择最接近的类型
+      options:
+        - Bug（功能异常/报错）
+        - Question（使用疑问）
+        - Enhancement（功能建议）
+        - Documentation（文档问题）
     validations:
       required: true
 
   - type: textarea
-    id: steps
+    id: summary
     attributes:
-      label: 复现步骤
-      description: 可选但建议。尽量按步骤描述，方便快速复现。
+      label: 问题描述
+      description: 发生了什么？你期望的结果是什么？
       placeholder: |
-        1. 打开 DzjsTrainer.exe
-        2. 进入「防护策略」页
-        3. 点「卸载主驱动」，再点一次「加载」
-        4. 状态框停在「未加载」
+        例如：点「开始运行」后侧栏驱动状态一直是「未加载」，但驱动其实已经起来了，
+        期望状态框能显示「已加载」。
+    validations:
+      required: true
+
+  - type: input
+    id: context
+    attributes:
+      label: 涉及页面或进程（可选但建议）
+      description: 若问题与某个页面、某个被注入的进程有关，请填写，方便对号入座
+      placeholder: 例如：防护策略页 / StudentMain.exe / 极域 2022 豪华版
     validations:
       required: false
 
   - type: textarea
-    id: environment
+    id: reproduce_steps
     attributes:
-      label: 环境信息
-      description: 可选。操作系统、程序版本等。程序版本在「关于」页能看到，程序自己也会写进日志第一行。
+      label: 复现步骤（可选但建议）
+      description: 尽量按步骤描述，方便快速复现
       placeholder: |
-        操作系统：Windows 11 26100 / 极域电子教室 2022 豪华版
-        程序版本：1.0.5.2
-        位数与权限：32 位主程序，管理员
+        1. 打开 DzjsTrainer.exe，进入「防护策略」页
+        2. 点「卸载主驱动」，再点一次「加载」
+        3. 状态框停在「未加载」
+    validations:
+      required: false
+
+  - type: input
+    id: env_info
+    attributes:
+      label: 环境信息（可选）
+      description: 操作系统、程序版本（「关于」页可见）、是否以管理员运行
+      placeholder: 例如：Windows 11 26100 / v1.0.5.2 / 管理员
     validations:
       required: false
 
   - type: textarea
     id: logs
     attributes:
-      label: 日志与附件
-      description: 建议上传程序日志。也可粘贴关键报错片段。截图、录像一并放这里。
+      label: 日志与附件（建议）
+      description: |
+        请上传程序目录下的 `DzjsTrainer.log`，或「导出日志」生成的 txt。
+        也可粘贴关键报错片段，截图、录像一并放这里。
       placeholder: |
-        把 DzjsTrainer.log 拖进来，或者粘贴关键几行：
-        [16:08:12] [I] 运行环境：Windows 11 26100.2314 · x64 · 管理员+UIAccess · 本地会话 · 会话 1
-        [16:08:12] [I] 抓屏排除：策略=1 生效=0x11（透过）
+        - 已附日志：是/否
+        - 关键几行：
+          [16:08:12] [I] 运行环境：Windows 11 26100.2314 · x64 · 管理员+UIAccess · 本地会话 · 会话 1
+          [16:08:12] [I] 抓屏排除：策略=1 生效=0x11（透过）
+        - 其他补充：
     validations:
       required: false
