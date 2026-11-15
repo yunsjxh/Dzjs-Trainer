@@ -34,6 +34,21 @@ UPDATE_DOWNLOAD_SCHEME=https
 
 如果使用 PHP-FPM/Nginx，请确认 `releases/` 可直接下载，并将 PHP `upload_max_filesize` 和 `post_max_size` 设置为至少 `200M`。
 
+## 脚本发布
+
+不走后台也可以在编译完之后直接发：
+
+```powershell
+.\publish-update.ps1 -Version 1.0.3 -ReleaseExe ..\Release\DzjsTrainerUpdater.exe -Notes "修复窗口识别并改进更新流程。"
+```
+
+它会生成 `releases\DzjsTrainerUpdater.exe`，算出 SHA-256，写好 `manifest.json`。
+然后把整个目录按 PHP/IIS/Apache 的方式发布出去，客户端已经内置接口地址，不用写 INI。
+
+客户端只请求 `?manifest=1`。`update.php` 里原先的 `checkupdate`、`getupdateinfo`、
+`getnewver`、`getupdate` 都删掉了：它们不做任何凭证校验，谁都能问出版本号和下载地址，
+票据签了也白签。认不出的请求现在返回 `400 missing action`。
+
 ## 站点更新日志自动同步
 
 站点首页的版本号与更新日志读的是站点根目录的 `version.txt`（`script.js` 里 `fetch('version.txt')`）。
@@ -160,18 +175,3 @@ python tools/make-ticket-key.py --check    # 确认头文件没有和 DER 脱节
 生成的 `UpdaterTicketKey.h` 被 `.gitignore` 挡住。仓库里带的是 `UpdaterTicketKey.h.example`（示例公钥），`UpdaterTicket.h` 用 `__has_include` 回退到它，因此开源克隆不换钥也能编译，只是运行期会以「内置的是开源示例公钥」拒绝连正式服务器。
 
 换钥流程：生成新私钥 → `openssl pkey -in ticket-sign.pem -pubout -outform DER -out ticket-sign.pub.der` → 跑一次 `tools/make-ticket-key.py` → 重新编译发布客户端，与服务端同时切换。旧客户端只认编进去的那把钥，只换服务端会让旧版本收不到更新。
-
-1. Run the publishing script after compiling:
-
-```powershell
-.\publish-update.ps1 -Version 1.0.3 -ReleaseExe ..\Release\DzjsTrainerUpdater.exe -Notes "修复窗口识别并改进更新流程。"
-```
-
-It creates `releases\DzjsTrainerUpdater.exe`, calculates SHA-256, and writes `manifest.json`.
-2. Publish this directory through PHP/IIS/Apache. The desktop client already contains the update endpoint and does not require an INI setting.
-
-The client requests `?manifest=1` only. The legacy `checkupdate`, `getupdateinfo`,
-`getnewver`, and `getupdate` parameters have been **removed** from `update.php`.
-They answered without any credential check, so anyone could poll the version number
-and fetch the package URL while bypassing the ticket entirely — the signature scheme
-would not have mattered. Unrecognised queries now return `400 missing action`.
