@@ -2,6 +2,25 @@
 
 All notable changes to Dzjs Trainer are documented in this file.
 
+## [1.0.5.2] - 2026-11-15
+
+### Added
+
+- The about page and the startup log show the run environment: Windows version with its patch
+  number, native architecture, elevation, UI access and session type.
+
+### Changed
+
+- Screen captures and desktop sharing see through the trainer window instead of getting a black
+  rectangle. `[JTSettings] CaptureExclusion` in the ini picks the behaviour: 1 see-through
+  (default), 2 black block, 0 visible as usual. Systems older than Windows 10 2004 fall back to
+  visible, because there the see-through flag renders as a black block.
+
+### Fixed
+
+- The sidebar hover no longer flashes brighter before settling darker in the light theme; both
+  ends of the hover gradient now sit on the same side of the sidebar colour.
+
 ## [1.0.5.1] - 2026-11-15
 
 ### Fixed

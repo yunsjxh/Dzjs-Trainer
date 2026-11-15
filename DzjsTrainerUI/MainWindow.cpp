@@ -4,6 +4,7 @@
 #include <unordered_map>
 #include "../DzjsTrainerUpdater/BuiltinUpdate.h"
 #include "../DzjsTrainerUpdater/BuildStamp.h"
+#include "../DzjsTrainerUpdater/RunEnvironment.h"
 #include "../WindowCaptureProtection.h"
 #include "DriverServiceActions.h"
 #include "resource.h"
@@ -76,6 +77,16 @@ const std::wstring& AboutBuildLine()
 {
 	static const std::wstring line = [] {
 		return std::wstring(L"\u6784\u5efa  ") + JTBuildDateWide();
+	}();
+	return line;
+}
+
+// 关于页的第三行。系统版本不是装饰：抓屏排除的「透过」只有 Win10 2004 以后
+// 成立，更早的系统上会退成「正常显示」，见 WindowCaptureProtection.h。
+const std::wstring& AboutEnvironmentLine()
+{
+	static const std::wstring line = [] {
+		return std::wstring(L"\u8fd0\u884c  ") + JTRunEnvSummary();
 	}();
 	return line;
 }
@@ -1166,7 +1177,7 @@ LRESULT CALLBACK AvTextPromptProc(HWND window, UINT message, WPARAM wParam, LPAR
 		context = static_cast<AvTextPromptContext*>(create->lpCreateParams);
 		SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(context));
 		context->window = window;
-		JiYuWindowCapture::ExcludeWindowFromCapture(window);
+		JiYuWindowCapture::ApplyCapturePolicy(window);
 	}
 	if (!context) return DefWindowProcW(window, message, wParam, lParam);
 	switch (message) {
@@ -1712,7 +1723,7 @@ LRESULT CALLBACK ExitConfirmProc(HWND window, UINT message, WPARAM wParam, LPARA
 		context = static_cast<ExitConfirmContext*>(create->lpCreateParams);
 		SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(context));
 		context->window = window;
-		JiYuWindowCapture::ExcludeWindowFromCapture(window);
+		JiYuWindowCapture::ApplyCapturePolicy(window);
 	}
 	if (!context) return DefWindowProcW(window, message, wParam, lParam);
 	switch (message) {
@@ -2052,7 +2063,7 @@ LRESULT CALLBACK AvProcessPickerProc(HWND window, UINT message, WPARAM wParam, L
 		context = static_cast<AvProcessPickerContext*>(create->lpCreateParams);
 		SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(context));
 		context->window = window;
-		JiYuWindowCapture::ExcludeWindowFromCapture(window);
+		JiYuWindowCapture::ApplyCapturePolicy(window);
 	}
 	if (!context) return DefWindowProcW(window, message, wParam, lParam);
 	switch (message) {
@@ -2345,7 +2356,7 @@ LRESULT CALLBACK SamplePickerWindowProc(HWND window, UINT message, WPARAM wParam
 			reinterpret_cast<CREATESTRUCTW*>(lParam)->lpCreateParams);
 		SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(context));
 		if (context) context->window = window;
-		JiYuWindowCapture::ExcludeWindowFromCapture(window);
+		JiYuWindowCapture::ApplyCapturePolicy(window);
 	}
 	if (!context) return DefWindowProcW(window, message, wParam, lParam);
 
@@ -2747,7 +2758,7 @@ LRESULT CALLBACK LogSavePickerProc(HWND window, UINT message, WPARAM wParam, LPA
 			reinterpret_cast<CREATESTRUCTW*>(lParam)->lpCreateParams);
 		SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(context));
 		if (context) context->window = window;
-		JiYuWindowCapture::ExcludeWindowFromCapture(window);
+		JiYuWindowCapture::ApplyCapturePolicy(window);
 	}
 	if (!context) return DefWindowProcW(window, message, wParam, lParam);
 	switch (message) {
@@ -3114,7 +3125,7 @@ LRESULT CALLBACK MediaPickerProc(HWND window, UINT message, WPARAM wParam, LPARA
 		context = reinterpret_cast<MediaPickerContext*>(reinterpret_cast<CREATESTRUCTW*>(lParam)->lpCreateParams);
 		SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(context));
 		if (context) context->window = window;
-		JiYuWindowCapture::ExcludeWindowFromCapture(window);
+		JiYuWindowCapture::ApplyCapturePolicy(window);
 	}
 	if (!context) return DefWindowProcW(window, message, wParam, lParam);
 	switch (message) {
@@ -3469,10 +3480,23 @@ bool MainWindow::Initialize()
 		_hWnd, WM_COPYGLOBALDATA_COMPAT, MSGFLT_ALLOW, &globalDataFilter);
 	const DWORD globalDataError = GetLastError();
 
+	// 排查时第一件要确认的事：什么系统、什么位数、有没有提权。放在日志最前面，
+	// 省得对着一份日志先猜环境。
+	currentLogger->LogInfo(L"运行环境：%s", JTRunEnvDetail());
+
 	currentLogger->LogInfo(
 		L"Control reply filter copyData=%d error=%lu status=%lu globalData=%d error=%lu status=%lu",
 		copyDataAllowed, copyDataError, copyDataFilter.ExtStatus,
 		globalDataAllowed, globalDataError, globalDataFilter.ExtStatus);
+
+	{
+		const DWORD affinity = JiYuWindowCapture::ApplyCapturePolicy(_hWnd);
+		const wchar_t* applied = L"正常显示";
+		if (affinity == JiYuWindowCapture::kSeeThrough) applied = L"透过";
+		else if (affinity == JiYuWindowCapture::kBlackBlock) applied = L"黑块";
+		currentLogger->LogInfo(L"抓屏排除：策略=%d 生效=0x%X（%s）",
+			JiYuWindowCapture::CapturePolicy(), affinity, applied);
+	}
 	CreateNetworkControls();
 	CreateAdvancedControls();
 	InstallInputOriginHooks();
@@ -3632,7 +3656,7 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 		self->_hWnd = hwnd;
 		SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
 #if DZJS_ENABLE_CAPTURE_EXCLUSION
-		JiYuWindowCapture::ExcludeWindowFromCapture(hwnd);
+		JiYuWindowCapture::ApplyCapturePolicy(hwnd);
 #endif
 	}
 	if (!self) return DefWindowProcW(hwnd, message, wParam, lParam);
@@ -4106,8 +4130,11 @@ void MainWindow::PaintNavigation(Graphics& g, int height)
 		navRects[i] = { 12, static_cast<LONG>(y), 208, static_cast<LONG>(y + 40) };
 		const bool active = static_cast<int>(page) == i;
 		if (!active && hoverProgress[i] > 0.002f) {
+			// 两个端点必须落在侧栏底色的同一侧。原来起点比底色亮、终点比底色暗，
+			// 浅色主题下悬停会先亮一下再暗回去，看着像两套配色打架。现在起点就是
+			// 底色本身，终点按主题往「远离底色」的方向走：深色加亮、浅色压暗。
 			FillRound(g, RectF(12, y, 196, 40), 20,
-				Blend(C(d, 235, 241, 238, 27, 33, 31), C(d, 220, 229, 225, 39, 47, 44), hoverProgress[i]));
+				Blend(C(d, 226, 234, 230, 24, 29, 27), C(d, 212, 224, 218, 41, 50, 47), hoverProgress[i]));
 		}
 	}
 	{
@@ -6449,6 +6476,10 @@ void MainWindow::PaintAbout(Graphics& g, int width, int height, int offsetY)
 	Text(g, AboutVersionLine().c_str(), x + 42, y + 160, 142, 16, 11, FontStyleBold, C(darkMode, 0, 81, 72, 177, 239, 228), StringAlignmentCenter);
 	Text(g, AboutBuildLine().c_str(), x + 42, y + 178, 142, 14, 9, FontStyleRegular, C(darkMode, 30, 114, 103, 140, 208, 195), StringAlignmentCenter);
 	aboutUpdateRect = { static_cast<LONG>(x + 204), static_cast<LONG>(y + 153), static_cast<LONG>(x + 354), static_cast<LONG>(y + 193) };
+	// 运行环境紧跟徽章与按钮这一组，横跨整行。9 号字高 14，到 y+213 结束，
+	// 不会压到 y+215 起的描述文字。
+	TextSingleLine(g, AboutEnvironmentLine().c_str(), x + 42, y + 199, w - 84, 14, 9, FontStyleRegular,
+		C(darkMode, 116, 125, 120, 146, 158, 152));
 	// 探测期间按钮改成「检查中…」并置灰。浮层只活 4 秒，而一次探测最坏要走一遍
 	// 子进程；中间这段时间如果没有持续可见的状态，看起来就是点了没反应。
 	const bool probing = updateProbeInFlight.load();

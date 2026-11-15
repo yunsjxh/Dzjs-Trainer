@@ -1313,7 +1313,7 @@ INT_PTR CALLBACK JTAppInternal::AVTipWndProc(HWND hDlg, UINT message, WPARAM wPa
 	switch (message)
 	{
 	case WM_INITDIALOG: {
-		JiYuWindowCapture::ExcludeWindowFromCapture(hDlg);
+		JiYuWindowCapture::ApplyCapturePolicy(hDlg);
 
 		SendMessage(hDlg, WM_SETICON, ICON_SMALL, (LPARAM)LoadIcon(hInstance, MAKEINTRESOURCE(IDI_APP_MAIN)));
 		SendMessage(hDlg, WM_SETICON, ICON_BIG, (LPARAM)LoadIcon(hInstance, MAKEINTRESOURCE(IDI_APP_MAIN)));
@@ -1338,7 +1338,7 @@ INT_PTR CALLBACK JTAppInternal::ArgeementWndProc(HWND hDlg, UINT message, WPARAM
 	switch (message)
 	{
 	case WM_INITDIALOG: {
-		JiYuWindowCapture::ExcludeWindowFromCapture(hDlg);
+		JiYuWindowCapture::ApplyCapturePolicy(hDlg);
 
 		SendMessage(hDlg, WM_SETICON, ICON_SMALL, (LPARAM)LoadIcon(hInstance, MAKEINTRESOURCE(IDI_APP_MAIN)));
 		SendMessage(hDlg, WM_SETICON, ICON_BIG, (LPARAM)LoadIcon(hInstance, MAKEINTRESOURCE(IDI_APP_MAIN)));

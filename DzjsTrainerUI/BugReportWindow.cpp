@@ -19,7 +19,7 @@ INT_PTR CALLBACK BugReportDlgFunc(HWND hDlg, UINT message, WPARAM wParam, LPARAM
 	switch (message)
 	{
 	case WM_INITDIALOG: {
-		JiYuWindowCapture::ExcludeWindowFromCapture(hDlg);
+		JiYuWindowCapture::ApplyCapturePolicy(hDlg);
 
 		SendMessage(hDlg, WM_SETICON, ICON_BIG, (LPARAM)LoadIcon(currentApp->GetInstance(), MAKEINTRESOURCE(IDI_BUG)));
 		SendMessage(hDlg, WM_SETICON, ICON_SMALL, (LPARAM)LoadIcon(currentApp->GetInstance(), MAKEINTRESOURCE(IDI_BUG)));
