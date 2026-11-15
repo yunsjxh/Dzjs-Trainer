@@ -3,6 +3,7 @@
 #include <cwctype>
 #include <unordered_map>
 #include "../DzjsTrainerUpdater/BuiltinUpdate.h"
+#include "../DzjsTrainerUpdater/BuildStamp.h"
 #include "../WindowCaptureProtection.h"
 #include "DriverServiceActions.h"
 #include "resource.h"
@@ -65,6 +66,16 @@ const std::wstring& AboutVersionLine()
 		std::wstring version = DisplayVersion(ReadOwnFileVersion());
 		if (version.empty()) version = L"\u672a\u77e5";
 		return std::wstring(L"\u7248\u672c  ") + version;
+	}();
+	return line;
+}
+
+// 关于页的第二行。日期来自 PE 头里的链接时间戳，不是编译期常量 —— 后者在
+// 增量构建时会停在 BuildStamp.cpp 上次被重编的那天。见 BuildStamp.h。
+const std::wstring& AboutBuildLine()
+{
+	static const std::wstring line = [] {
+		return std::wstring(L"\u6784\u5efa  ") + JTBuildDateWide();
 	}();
 	return line;
 }
@@ -6433,8 +6444,10 @@ void MainWindow::PaintAbout(Graphics& g, int width, int height, int offsetY)
 	Text(g, L"Dzjs Trainer", x + 154, y + 46, 420, 40, 27, FontStyleBold, titleColor);
 	Text(g, L"Windows \u8bbe\u5907\u9632\u62a4\u4e2d\u5fc3", x + 154, y + 89, 420, 24, 12, FontStyleRegular, C(darkMode, 84, 93, 88, 171, 183, 177));
 	Text(g, L"\u7531\u8001 JiYu Trainer \u5347\u7ea7\u800c\u6765\u3002\u4f5c\u8005\uff1a\u4e91\u6563\u7686\u661f\u6cb3 & \u5feb\u4e50\u7684\u68a6\u9c7c\uff08\u539f\u4f5c\u8005\uff09", x + 154, y + 116, 520, 22, 11, FontStyleRegular, bodyColor);
-	FillRound(g, RectF(x + 42, y + 158, 142, 30), 15, C(darkMode, 219, 238, 232, 43, 76, 69));
-	Text(g, AboutVersionLine().c_str(), x + 42, y + 166, 142, 18, 11, FontStyleBold, C(darkMode, 0, 81, 72, 177, 239, 228), StringAlignmentCenter);
+	// 版本和构建日期叠成两行，高度与右侧「检查更新」按钮对齐（y+153 起，44 高）。
+	FillRound(g, RectF(x + 42, y + 153, 142, 44), 12, C(darkMode, 219, 238, 232, 43, 76, 69));
+	Text(g, AboutVersionLine().c_str(), x + 42, y + 160, 142, 16, 11, FontStyleBold, C(darkMode, 0, 81, 72, 177, 239, 228), StringAlignmentCenter);
+	Text(g, AboutBuildLine().c_str(), x + 42, y + 178, 142, 14, 9, FontStyleRegular, C(darkMode, 30, 114, 103, 140, 208, 195), StringAlignmentCenter);
 	aboutUpdateRect = { static_cast<LONG>(x + 204), static_cast<LONG>(y + 153), static_cast<LONG>(x + 354), static_cast<LONG>(y + 193) };
 	// 探测期间按钮改成「检查中…」并置灰。浮层只活 4 秒，而一次探测最坏要走一遍
 	// 子进程；中间这段时间如果没有持续可见的状态，看起来就是点了没反应。
@@ -6485,9 +6498,11 @@ void MainWindow::PaintToast(Graphics& g, int width, int height)
 	const float w = (std::min)(520.0f, static_cast<float>(width - 320));
 	const float x = 220.0f + (static_cast<float>(width - 220) - w) / 2.0f;
 	const float y = static_cast<float>(height) - 62.0f + (1.0f - fadeIn) * 10.0f;
-	FillRound(g, RectF(x, y, w, 44), 22, faded(C(darkMode, 44, 51, 48, 214, 222, 218, 246)));
+	// C(dark, r,g,b, dr,dg,db): 前三个是浅色主题的值，后三个是深色主题的值。
+	// 这两行原来把两组写反了 —— 深色模式下取到浅底浅字，于是提示条一直是白的。
+	FillRound(g, RectF(x, y, w, 44), 22, faded(C(darkMode, 214, 222, 218, 44, 51, 48, 246)));
 	Text(g, toastText.c_str(), x + 18, y + 12, w - 36, 22, 11, FontStyleRegular,
-		faded(C(darkMode, 255, 255, 255, 36, 43, 40)), StringAlignmentCenter);
+		faded(C(darkMode, 36, 43, 40, 232, 238, 235)), StringAlignmentCenter);
 }
 
 // 更新对话框 —— 按 MD3 规范重做：

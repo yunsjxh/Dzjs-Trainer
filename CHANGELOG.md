@@ -2,6 +2,21 @@
 
 All notable changes to Dzjs Trainer are documented in this file.
 
+## [1.0.5.1] - 2026-11-15
+
+### Fixed
+
+- The first "check for updates" click no longer looks dead: the apex host is tried first, each
+  request allows 6 seconds instead of 8, and the bundled updater is reused instead of rewritten,
+  so no full antivirus scan runs on every click.
+- The toast at the bottom of the window follows the theme. It was drawing the light palette in
+  dark mode, which is why it always came out near-white.
+
+### Added
+
+- The about page and the update-probe log line show the build date, read from the PE header
+  timestamp so incremental builds do not report a stale day.
+
 ## [1.0.5] - 2026-11-15
 
 ### Added

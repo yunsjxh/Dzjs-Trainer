@@ -6,6 +6,7 @@
 
 #include "stdafx.h"
 #include "UpdaterManifest.h"
+#include "BuildStamp.h"
 #include <winhttp.h>
 #include "UpdaterTrust.h"
 #include "UpdaterTicket.h"
@@ -483,8 +484,8 @@ bool Fetch(Info& info)
 		GetUserNameW(user, &userSize);
 		WCHAR module[MAX_PATH] = {};
 		GetModuleFileNameW(nullptr, module, _countof(module));
-		LogTrace(L"更新探测[build=20260919-worker]: user=%s pid=%lu x86=%d module=%s",
-			user[0] ? user : L"(未知)", GetCurrentProcessId(),
+		LogTrace(L"更新探测[build=%s]: user=%s pid=%lu x86=%d module=%s",
+			JTBuildDateWide(), user[0] ? user : L"(未知)", GetCurrentProcessId(),
 #ifdef _WIN64
 			0,
 #else

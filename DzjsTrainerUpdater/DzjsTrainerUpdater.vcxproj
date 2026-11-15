@@ -175,6 +175,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="BuildStamp.h" />
     <ClInclude Include="DzjsTrainerUpdater.h" />
     <ClInclude Include="Resource.h" />
     <ClInclude Include="stdafx.h" />
@@ -182,6 +183,7 @@
     <ClInclude Include="UpdaterManifest.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="BuildStamp.cpp" />
     <ClCompile Include="BuiltinUpdate.cpp" />
     <ClCompile Include="DzjsTrainerUpdater.cpp" />
     <ClCompile Include="UpdaterManifest.cpp" />
