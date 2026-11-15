@@ -295,9 +295,13 @@ std::vector<std::wstring> UpdateEndpoints()
 {
 	std::vector<std::wstring> endpoints;
 	endpoints.reserve(3);
-	endpoints.push_back(std::wstring(L"https://") + RandomPrefix() + kUpdateHostSuffix);
-	endpoints.push_back(std::wstring(L"https://") + RandomPrefix() + kUpdateHostSuffix);
+	// 顶点域名排第一：三个地址指向同一台服务器，随机子域只是换个 SNI 外观，
+	// 没有额外冗余；而顶点域名一般已经在系统 DNS 缓存里，正常一两秒就出结果。
+	// 放前面还避开一种坏情况 —— 首个随机子域解析超时，后面两个排队等着，
+	// 累计时间超过主程序那边的等待上限，第一次点击就被判失败。
 	endpoints.push_back(ApexEndpoint());
+	endpoints.push_back(std::wstring(L"https://") + RandomPrefix() + kUpdateHostSuffix);
+	endpoints.push_back(std::wstring(L"https://") + RandomPrefix() + kUpdateHostSuffix);
 	return endpoints;
 }
 
@@ -447,7 +451,8 @@ bool HttpGetManifest(const std::wstring& endpoint, std::string& body, std::wstri
 
 	WinHttpGetSession http;
 	DWORD status = 0;
-	if (!WinHttpGetOpen(http, url, 8000, error, status)) {
+	// 每阶段 6 秒，三个端点最坏 36 秒，仍在主程序 60 秒的等待窗口内。
+	if (!WinHttpGetOpen(http, url, 6000, error, status)) {
 		if (status == 403) {
 			error = L"服务器拒绝了本次请求的签名（客户端与服务端密钥不一致）";
 		}

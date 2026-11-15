@@ -27,7 +27,8 @@
 using namespace std;
 
 // 前向声明：JUpdater_ProbeManifest 定义在 ExtractBundledUpdater 之前。
-static bool ExtractBundledUpdater(LPCWSTR currentDir, std::wstring& updaterPath);
+// reused 回传这次是复用已有文件还是重新写了一份，只用于打日志。
+static bool ExtractBundledUpdater(LPCWSTR currentDir, std::wstring& updaterPath, bool* reused = nullptr);
 
 UPEXPORT_CFUNC(BOOL) JUpdater_CheckInternet()
 {
@@ -291,9 +292,17 @@ UPEXPORT_CFUNC(BOOL) JUpdater_ProbeManifest(JUpdaterManifestInfo* info)
 	const ULONGLONG probeStartedAt = GetTickCount64();
 
 	std::wstring updaterPath;
-	if (!ExtractBundledUpdater(currentDir, updaterPath)) {
+	bool reusedUpdater = false;
+	const ULONGLONG extractStartedAt = GetTickCount64();
+	if (!ExtractBundledUpdater(currentDir, updaterPath, &reusedUpdater)) {
 		if (logger) logger->LogError(L"释放独立更新程序失败（探测清单）");
 		return FALSE;
+	}
+	// 复用还是重写，直接影响下一次「点更新没反应」还能不能查。
+	if (logger) {
+		logger->LogError2(L"更新器释放：%s，耗时=%llu ms",
+			reusedUpdater ? L"复用已有文件" : L"重新写入",
+			static_cast<unsigned long long>(GetTickCount64() - extractStartedAt));
 	}
 
 	WCHAR tempDir[MAX_PATH] = {};
@@ -341,7 +350,10 @@ UPEXPORT_CFUNC(BOOL) JUpdater_ProbeManifest(JUpdaterManifestInfo* info)
 	if (CreateProcessW(updaterPath.c_str(), commandLine.data(), nullptr, nullptr, FALSE,
 		CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
 		const ULONGLONG launchedAt = GetTickCount64();
-		const DWORD waitResult = WaitForSingleObject(process.hProcess, 30000);
+		// 60 秒而不是 30 秒：更新器要依次试三个端点，每个都可能在 TLS 握手或
+		// DNS 上耗掉好几秒；首次启动还要被杀软完整扫描一遍。30 秒会把「慢」判成
+		// 「失败」，用户只好再点一次。
+		const DWORD waitResult = WaitForSingleObject(process.hProcess, 60000);
 		DWORD exitCode = 1;
 		GetExitCodeProcess(process.hProcess, &exitCode);
 		CloseHandle(process.hThread);
@@ -454,11 +466,38 @@ UPEXPORT_CFUNC(BOOL) JUpdater_ProbeManifest(JUpdaterManifestInfo* info)
 	return ok ? TRUE : FALSE;
 }
 
-static bool WriteUpdaterTo(const std::wstring& directory, const BYTE* data, DWORD size, std::wstring& updaterPath)
+static bool WriteUpdaterTo(const std::wstring& directory, const BYTE* data, DWORD size,
+	std::wstring& updaterPath, bool* reused = nullptr)
 {
+	if (reused) *reused = false;
 	if (directory.empty()) return false;
 	CreateDirectoryW(directory.c_str(), nullptr);
 	updaterPath = directory + L"\\DzjsTrainerUpdater.exe";
+
+	// 已经释放过、内容又对得上，就直接用现成的。
+	//
+	// 原先每次点击都 CREATE_ALWAYS 重写一遍，等于把一个刚落地、UPX 压缩、没有
+	// 签名的 exe 重新交给杀软做一次完整扫描。首次通常要几十秒才放行，而探测那边
+	// 30 秒一到就判失败 —— 表现出来就是「点了一下没反应，等它报失败再点就好了」。
+	// 复用时只读 123 KB 比一次哈希还快，代价可以忽略。
+	HANDLE existing = CreateFileW(updaterPath.c_str(), GENERIC_READ,
+		FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (existing != INVALID_HANDLE_VALUE) {
+		LARGE_INTEGER fileSize = {};
+		bool same = GetFileSizeEx(existing, &fileSize) && fileSize.QuadPart == size;
+		if (same) {
+			std::vector<BYTE> buffer(size);
+			DWORD read = 0;
+			same = ReadFile(existing, buffer.data(), size, &read, nullptr) && read == size &&
+				memcmp(buffer.data(), data, size) == 0;
+		}
+		CloseHandle(existing);
+		if (same) {
+			if (reused) *reused = true;
+			return true;
+		}
+	}
+
 	HANDLE file = CreateFileW(updaterPath.c_str(), GENERIC_WRITE, 0, nullptr,
 		CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
 	if (file == INVALID_HANDLE_VALUE) return false;
@@ -473,8 +512,9 @@ static bool WriteUpdaterTo(const std::wstring& directory, const BYTE* data, DWOR
 // The updater is written next to the main program so the user can see it, re-run
 // it, and so it never runs elevated out of a user-writable temp directory. A
 // read-only install directory falls back to the per-user temp directory.
-static bool ExtractBundledUpdater(LPCWSTR currentDir, std::wstring& updaterPath)
+static bool ExtractBundledUpdater(LPCWSTR currentDir, std::wstring& updaterPath, bool* reused)
 {
+	if (reused) *reused = false;
 	HINSTANCE module = GetModuleHandleW(nullptr);
 	HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(IDR_UPDATER_EXE), L"BIN");
 	if (!resource) return false;
@@ -483,12 +523,18 @@ static bool ExtractBundledUpdater(LPCWSTR currentDir, std::wstring& updaterPath)
 	const DWORD size = loaded ? SizeofResource(module, resource) : 0;
 	if (!data || size < sizeof(IMAGE_DOS_HEADER)) return false;
 
-	if (currentDir && currentDir[0] != L'\0' && WriteUpdaterTo(currentDir, data, size, updaterPath))
+	bool hit = false;
+	if (currentDir && currentDir[0] != L'\0' &&
+		WriteUpdaterTo(currentDir, data, size, updaterPath, &hit)) {
+		if (reused) *reused = hit;
 		return true;
+	}
 
 	WCHAR tempRoot[MAX_PATH] = {};
 	if (!GetTempPathW(_countof(tempRoot), tempRoot)) return false;
-	return WriteUpdaterTo(std::wstring(tempRoot) + L"DzjsTrainerUpdater", data, size, updaterPath);
+	const bool ok = WriteUpdaterTo(std::wstring(tempRoot) + L"DzjsTrainerUpdater", data, size, updaterPath, &hit);
+	if (reused) *reused = hit;
+	return ok;
 }
 
 // 借子进程下载：主程序进程里 WinHTTP 的 TLS 会失败，这里的子进程是干净进程。

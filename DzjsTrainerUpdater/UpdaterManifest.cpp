@@ -90,9 +90,13 @@ static std::vector<std::wstring> UpdateEndpoints()
 {
 	std::vector<std::wstring> endpoints;
 	endpoints.reserve(3);
-	endpoints.push_back(std::wstring(L"https://") + RandomPrefix() + kUpdateHostSuffix);
-	endpoints.push_back(std::wstring(L"https://") + RandomPrefix() + kUpdateHostSuffix);
+	// 顶点域名排第一。三个地址指向同一台服务器，随机子域只是换个 SNI 外观，
+	// 没有额外冗余；而顶点域名通常已经在系统 DNS 缓存里，正常一两秒就能出结果。
+	// 放前面还顺手避开一种坏情况：首个随机子域解析超时，后面两个排队等着，
+	// 累计时间超过主程序那边的等待上限，第一次点击就被判失败。
 	endpoints.push_back(ApexEndpoint());
+	endpoints.push_back(std::wstring(L"https://") + RandomPrefix() + kUpdateHostSuffix);
+	endpoints.push_back(std::wstring(L"https://") + RandomPrefix() + kUpdateHostSuffix);
 	return endpoints;
 }
 
@@ -216,7 +220,9 @@ static HINTERNET OpenWinHttpSession()
 	HINTERNET session = WinHttpOpen(L"DzjsTrainer/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
 		WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
 	if (!session) return nullptr;
-	WinHttpSetTimeouts(session, 8000, 8000, 8000, 8000);
+	// 每个阶段 6 秒：三个端点各试两次，最坏 36 秒，仍在主程序 60 秒的等待窗口内。
+	// 原来 8 秒的配置下最坏要 48 秒，第一个端点只要卡住，整轮必然失败。
+	WinHttpSetTimeouts(session, 6000, 6000, 6000, 6000);
 	return session;
 }
 
