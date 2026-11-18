@@ -954,8 +954,10 @@ bool VerifyPayload(const std::wstring& payload, const Manifest& manifest, bool v
 	}
 	const std::string expected = Trim(manifest.sha256);
 	if (expected.empty()) {
-		if (verbose) PrintUtf8(L"服务端未提供 SHA-256，跳过校验。\n");
-		return true;
+		// 没有哈希就没有可比对的东西，装下去等于信任任何中间人。
+		PrintUtf8(L"清单没有提供 SHA-256，已拒绝安装。\n");
+		DeleteFileW(payload.c_str());
+		return false;
 	}
 	std::string actual;
 	if (!FileSha256(payload, actual) || _stricmp(actual.c_str(), expected.c_str()) != 0) {
