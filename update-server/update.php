@@ -18,11 +18,12 @@ if ($admin) {
     exit;
 }
 $manifest = [
-    'version' => '1.0.2',
+    'version' => '1.0.5.2',
     'notes' => 'No release notes supplied.',
     'url' => 'releases/DzjsTrainerUpdater.exe',
     'sha256' => '',
 ];
+$manifestLoaded = false;
 if (is_file($manifestPath)) {
     $raw = (string)file_get_contents($manifestPath);
     // PowerShell 的 Out-File / Set-Content 默认写 UTF-8 BOM，而 json_decode 不认
@@ -34,6 +35,16 @@ if (is_file($manifestPath)) {
     $decoded = json_decode($raw, true);
     if (is_array($decoded)) {
         $manifest = array_merge($manifest, $decoded);
+        $manifestLoaded = true;
+    }
+}
+if (!$manifestLoaded) {
+    // 没有清单就没有可签的正文。以前这里会把内置默认值当成清单签出去，
+    // 客户端拿到一张「合法签名 + 空 sha256」的票据，正好绕过哈希校验。
+    if (isset($_GET['manifest']) || (string)($_GET['action'] ?? '') === 'manifest') {
+        header('Content-Type: text/plain; charset=utf-8', true, 503);
+        echo 'manifest unavailable';
+        exit;
     }
 }
 

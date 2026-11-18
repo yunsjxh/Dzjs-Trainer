@@ -1,6 +1,6 @@
 {
-  "version": "1.0.3",
+  "version": "1.0.5.2",
   "notes": "修复窗口识别并改进更新流程。",
-  "url": "releases/DzjsTrainerUpdater.exe",
+  "url": "releases/DzjsTrainer-1.0.5.2-win32.zip",
   "sha256": "replace-with-lowercase-sha256"
 }
