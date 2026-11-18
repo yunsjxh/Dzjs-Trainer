@@ -106,14 +106,14 @@ $resourceBytes = [IO.File]::ReadAllBytes($resourceScript)
 try {
     $projectText = [Text.UTF8Encoding]::new($false, $true).GetString($projectBytes)
     $projectText = $projectText.Replace(
-        '$(SolutionDir)DzjsTrainerDriver.unlock.enc.sample',
+        '$(SolutionDir)resources\DzjsTrainerDriver.unlock.enc.sample',
         '$(SolutionDir)$(Configuration)\DzjsTrainerDriver\DzjsTrainerDriver.unlock.enc')
     [IO.File]::WriteAllBytes($mainProject, [Text.UTF8Encoding]::new($true).GetPreamble() + [Text.UTF8Encoding]::new($false, $true).GetBytes($projectText))
 
     $resourceEncoding = [Text.UnicodeEncoding]::new($false, $true)
     $resourceText = $resourceEncoding.GetString($resourceBytes)
     $resourceText = $resourceText.Replace(
-        '..\\DzjsTrainerDriver.unlock.enc.sample',
+        '..\\resources\\DzjsTrainerDriver.unlock.enc.sample',
         '..\\Release\\DzjsTrainerDriver\\DzjsTrainerDriver.unlock.enc')
     [IO.File]::WriteAllBytes($resourceScript, $resourceEncoding.GetPreamble() + $resourceEncoding.GetBytes($resourceText))
 

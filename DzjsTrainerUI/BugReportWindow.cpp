@@ -1,6 +1,6 @@
 ﻿#include "stdafx.h"
 #include "BugReportWindow.h"
-#include "../WindowCaptureProtection.h"
+#include "../include/WindowCaptureProtection.h"
 #include "resource.h"
 #include "../DzjsTrainer/AppPublic.h"
 #include "../DzjsTrainer/StringHlp.h"

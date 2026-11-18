@@ -276,14 +276,14 @@
   <ItemGroup>
     <EmbeddedHooksResource Include="$(SolutionDir)$(Configuration)\DzjsTrainerHooks.dll" />
     <EmbeddedDriverResource Include="$(SolutionDir)$(Configuration)\DzjsTrainerDriver\DzjsTrainerDriver.sys" />
-    <EmbeddedDriverUnlockResource Include="$(SolutionDir)DzjsTrainerDriver.unlock.enc.sample" />
+    <EmbeddedDriverUnlockResource Include="$(SolutionDir)resources\DzjsTrainerDriver.unlock.enc.sample" />
     <EmbeddedAvDriverResource Include="$(SolutionDir)JiYuAvRelease\JiYuAvKernel.sys" />
     <EmbeddedUpdaterResource Include="$(SolutionDir)$(Configuration)\DzjsTrainerUpdater.exe" />
     <EmbeddedHooks64Resource Include="$(SolutionDir)x64\$(Configuration)\DzjsTrainerHooks.dll" />
     <EmbeddedInjector64Resource Include="$(SolutionDir)x64\$(Configuration)\DzjsTrainerInjector64.exe" />
   </ItemGroup>
   <ItemGroup>
-    <Image Include="..\DzjsTrainerLogo.ico" />
+    <Image Include="..\assets\branding\DzjsTrainerLogo.ico" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\Debug\DzjsTrainerDriver.sys" />

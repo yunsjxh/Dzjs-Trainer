@@ -216,7 +216,7 @@
     </ResourceCompile>
   </ItemGroup>
   <ItemGroup>
-    <Image Include="..\DzjsTrainerLogo.ico">
+    <Image Include="..\assets\branding\DzjsTrainerLogo.ico">
       <Filter>资源文件</Filter>
     </Image>
   </ItemGroup>

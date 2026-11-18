@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions
 
-set "ROOT=%~dp0"
+set "ROOT=%~dp0..\"
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 set "MSBUILD="
 

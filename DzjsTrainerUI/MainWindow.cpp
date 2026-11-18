@@ -5,7 +5,7 @@
 #include "../DzjsTrainerUpdater/BuiltinUpdate.h"
 #include "../DzjsTrainerUpdater/BuildStamp.h"
 #include "../DzjsTrainerUpdater/RunEnvironment.h"
-#include "../WindowCaptureProtection.h"
+#include "../include/WindowCaptureProtection.h"
 #include "DriverServiceActions.h"
 #include "resource.h"
 #include "DzjsTrainerUI.h"

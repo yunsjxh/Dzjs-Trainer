@@ -81,7 +81,7 @@
     <Image Include="res\logo128.png">
       <Filter>资源文件</Filter>
     </Image>
-    <Image Include="..\DzjsTrainerLogo.ico">
+    <Image Include="..\assets\branding\DzjsTrainerLogo.ico">
       <Filter>资源文件</Filter>
     </Image>
     <Image Include="res\footer-mask.png">
@@ -99,7 +99,7 @@
     <Image Include="res\update_bg.png">
       <Filter>资源文件</Filter>
     </Image>
-    <Image Include="..\DzjsTrainerBug.ico">
+    <Image Include="..\assets\branding\DzjsTrainerBug.ico">
       <Filter>资源文件</Filter>
     </Image>
     <Image Include="res\DzjsTrainerHelp1.png">
@@ -129,10 +129,7 @@
     <Image Include="res\help-small.bmp">
       <Filter>资源文件</Filter>
     </Image>
-    <Image Include="..\icon1.ico">
-      <Filter>资源文件</Filter>
-    </Image>
-    <Image Include="..\DzjsTrainerWarn.ico">
+    <Image Include="..\assets\branding\DzjsTrainerWarn.ico">
       <Filter>资源文件</Filter>
     </Image>
   </ItemGroup>

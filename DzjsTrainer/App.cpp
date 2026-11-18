@@ -17,7 +17,7 @@
 #include "TxtUtils.h"
 #include "ActiveDefenseDemo.h"
 #include "AvIntegrated.h"
-#include "../WindowCaptureProtection.h"
+#include "../include/WindowCaptureProtection.h"
 
 #include <Shlwapi.h>
 #include <winioctl.h>

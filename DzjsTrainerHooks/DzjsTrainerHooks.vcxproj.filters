@@ -13,18 +13,6 @@
       <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
       <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
     </Filter>
-    <Filter Include="源文件\disasm">
-      <UniqueIdentifier>{81e57fb6-f559-49d2-a9f6-c263c8c74813}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="头文件\disasm">
-      <UniqueIdentifier>{852046e9-e93e-4e8b-a4c6-abf102d11e24}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="头文件\mhook">
-      <UniqueIdentifier>{324de12b-99cd-43c9-8e47-da1f5ba2b312}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="源文件\mhook">
-      <UniqueIdentifier>{fc859510-ad1f-430f-b484-9e3b64df213d}</UniqueIdentifier>
-    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="stdafx.h">
@@ -41,24 +29,6 @@
     </ClInclude>
     <ClInclude Include="StringSplit.h">
       <Filter>头文件</Filter>
-    </ClInclude>
-    <ClInclude Include="disasm-lib\disasm_x86_tables.h">
-      <Filter>头文件\disasm</Filter>
-    </ClInclude>
-    <ClInclude Include="disasm-lib\misc.h">
-      <Filter>头文件\disasm</Filter>
-    </ClInclude>
-    <ClInclude Include="disasm-lib\cpu.h">
-      <Filter>头文件\disasm</Filter>
-    </ClInclude>
-    <ClInclude Include="disasm-lib\disasm.h">
-      <Filter>头文件\disasm</Filter>
-    </ClInclude>
-    <ClInclude Include="disasm-lib\disasm_x86.h">
-      <Filter>头文件\disasm</Filter>
-    </ClInclude>
-    <ClInclude Include="mhook-lib\mhook.h">
-      <Filter>头文件\mhook</Filter>
     </ClInclude>
     <ClInclude Include="DzjsTrainerHooks.h">
       <Filter>头文件</Filter>
@@ -77,21 +47,6 @@
     <ClCompile Include="StringSplit.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
-    <ClCompile Include="disasm-lib\misc.c">
-      <Filter>源文件\disasm</Filter>
-    </ClCompile>
-    <ClCompile Include="disasm-lib\cpu.c">
-      <Filter>源文件\disasm</Filter>
-    </ClCompile>
-    <ClCompile Include="disasm-lib\disasm.c">
-      <Filter>源文件\disasm</Filter>
-    </ClCompile>
-    <ClCompile Include="disasm-lib\disasm_x86.c">
-      <Filter>源文件\disasm</Filter>
-    </ClCompile>
-    <ClCompile Include="mhook-lib\mhook.cpp">
-      <Filter>源文件\mhook</Filter>
-    </ClCompile>
     <ClCompile Include="DzjsTrainerHooks.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
@@ -102,7 +57,7 @@
     </ResourceCompile>
   </ItemGroup>
   <ItemGroup>
-    <Image Include="..\DzjsTrainerLogo.ico">
+    <Image Include="..\assets\branding\DzjsTrainerLogo.ico">
       <Filter>资源文件</Filter>
     </Image>
     <Image Include="..\DzjsTrainerUI\res\close.ico">

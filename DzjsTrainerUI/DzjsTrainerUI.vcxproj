@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|Win32">
@@ -217,10 +217,9 @@
     <ResourceCompile Include="MaterialIcons.rc" />
   </ItemGroup>
   <ItemGroup>
-    <Image Include="..\icon1.ico" />
-    <Image Include="..\DzjsTrainerBug.ico" />
-    <Image Include="..\DzjsTrainerLogo.ico" />
-    <Image Include="..\DzjsTrainerWarn.ico" />
+    <Image Include="..\assets\branding\DzjsTrainerBug.ico" />
+    <Image Include="..\assets\branding\DzjsTrainerLogo.ico" />
+    <Image Include="..\assets\branding\DzjsTrainerWarn.ico" />
     <Image Include="res\bg-main-state.png" />
     <Image Include="res\bg-shadow.png" />
     <Image Include="res\btn-close.png" />
