@@ -178,7 +178,7 @@
     </ResourceCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="..\..\DllInjector\DllInjector.h" />
+    <ClInclude Include="DllInjector\DllInjector.h" />
     <ClInclude Include="AppPublic.h" />
     <ClInclude Include="ActiveDefenseDemo.h" />
     <ClInclude Include="CAutoLock.h" />
@@ -213,7 +213,7 @@
     <ClInclude Include="VersionHelpers.h" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="..\..\DllInjector\DllInjector.cpp">
+    <ClCompile Include="DllInjector\DllInjector.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="CAutoLock.cpp" />

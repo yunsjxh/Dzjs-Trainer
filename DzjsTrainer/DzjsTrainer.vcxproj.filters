@@ -1,7 +1,7 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
-    <ClInclude Include="..\..\DllInjector\DllInjector.h">
+    <ClInclude Include="DllInjector\DllInjector.h">
       <Filter>头文件\Utils</Filter>
     </ClInclude>
     <Filter Include="源文件">
@@ -24,7 +24,7 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="..\..\DllInjector\DllInjector.cpp">
+    <ClCompile Include="DllInjector\DllInjector.cpp">
       <Filter>源文件\Utils</Filter>
     </ClCompile>
     <ClInclude Include="stdafx.h">

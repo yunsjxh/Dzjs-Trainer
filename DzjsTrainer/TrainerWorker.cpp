@@ -1,6 +1,6 @@
 ﻿#include "stdafx.h"
 #include "TrainerWorker.h"
-#include "../../DllInjector/DllInjector.h"
+#include "DllInjector/DllInjector.h"
 #include "DzjsTrainer.h"
 #include "AppPublic.h"
 #include "NtHlp.h"
