@@ -1,0 +1,89 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  repo-hygiene:
+    name: 仓库自检（路径/产物/冲突标记）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: verify_repo
+        run: python tools/verify_repo.py --strict
+
+  scripts:
+    name: 脚本语法（PowerShell / PHP / Python）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python 语法
+        run: python -m py_compile tools/*.py
+      - name: PowerShell 语法
+        shell: pwsh
+        run: |
+          $failed = $false
+          $files = Get-ChildItem -Path tools -Filter *.ps1 -Recurse
+          foreach ($file in $files) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              $file.FullName, [ref]$tokens, [ref]$errors) > $null
+            if ($errors.Count -gt 0) {
+              foreach ($e in $errors) {
+                Write-Host "::error file=$($file.FullName),line=$($e.Extent.StartLineNumber)::$($e.Message)"
+              }
+              $failed = $true
+            }
+          }
+          "checked $($files.Count) PowerShell file(s)"
+          if ($failed) { exit 1 }
+      - name: PHP 语法
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq php-cli >/dev/null
+          find update-server website -name '*.php' -print0 \
+            | xargs -0 -r -n1 php -l
+
+  build-hooks:
+    name: 编译 DzjsTrainerHooks（不需要 WDK）
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [Win32, x64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: microsoft/setup-msbuild@v2
+      - name: MSBuild
+        run: >
+          msbuild DzjsTrainerHooks\DzjsTrainerHooks.vcxproj
+          /p:Configuration=Release
+          /p:Platform=${{ matrix.platform }}
+          /m /v:minimal
+      - name: 产物检查
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem -Path . -Filter DzjsTrainerHooks.dll -Recurse -ErrorAction SilentlyContinue
+          if (-not $dll) { throw "DzjsTrainerHooks.dll 未生成" }
+          $dll | ForEach-Object { "{0}  {1:N0} bytes" -f $_.FullName, $_.Length }
+
+  # 驱动与主程序需要 WDK 和预先构建好的内嵌资源，GitHub 托管 runner 默认没有
+  # WDK，因此在本地按 docs/BUILD.md 的顺序构建。这里只记录期望的 target：
+  #
+  # build-driver:
+  #   runs-on: windows-2022
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - run: msbuild DzjsTrainerDriver\DzjsTrainerDriver.vcxproj /p:Configuration=Release /p:Platform=x64
