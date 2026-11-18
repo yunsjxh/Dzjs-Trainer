@@ -1,4 +1,4 @@
-# Wraps a raw 144-byte unload token into the container the driver expects.
+﻿# Wraps a raw 144-byte unload token into the container the driver expects.
 #
 # This is obfuscation, not protection: the AES key is derived from two constants
 # that ship in DzjsTrainer/KernelUtils.cpp and in Test-DriverUnlockToken.ps1.
