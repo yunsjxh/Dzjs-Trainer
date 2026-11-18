@@ -1,0 +1,33 @@
+# Editor defaults for Dzjs Trainer.
+#
+# Encoding is deliberately not enforced: the tree carries GBK (legacy x86
+# driver), UTF-16LE (resource scripts) and UTF-8 (everything current). Convert a
+# file's encoding only together with the code that reads it.
+root = true
+
+[*]
+end_of_line = crlf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{c,h,cpp,hpp}]
+# The C/C++ sources are tab-indented; keep diffs free of whitespace churn.
+indent_style = tab
+indent_size = 4
+
+[*.{ps1,psm1,psd1}]
+indent_style = space
+indent_size = 4
+
+[*.{php,js,mjs,css,json,yml,yaml}]
+indent_style = space
+indent_size = 2
+
+[*.md]
+trim_trailing_whitespace = false
+
+[*.{vcxproj,vcxproj.filters,props,targets,sln}]
+indent_style = space
+indent_size = 2

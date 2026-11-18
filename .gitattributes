@@ -1,2 +1,21 @@
-# Auto detect text files and perform LF normalization
+# Auto detect text files and normalise line endings to LF in the repository.
+# The .rc files are left to auto detection on purpose: the driver and hook
+# scripts are UTF-16LE (git sees NUL bytes and treats them as binary), while
+# DzjsTrainerUI.rc is GBK text. Forcing `text` or `-text` on all .rc files
+# breaks one of the two groups.
 * text=auto
+
+# Binary assets: never diff or normalise.
+*.ico     binary
+*.bmp     binary
+*.png     binary
+*.psd     binary
+*.ttf     binary
+*.sys     binary
+*.cat     binary
+*.enc     binary
+*.sample  -text
+
+# Windows command scripts must keep CRLF.
+*.cmd     text eol=crlf
+*.bat     text eol=crlf
