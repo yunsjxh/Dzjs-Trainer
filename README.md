@@ -32,18 +32,35 @@ Dzjs Trainer 是基于 JiYu Trainer 翻新和持续维护的 Windows 桌面项�
 - 可选的画面替换，覆盖 BitBlt、StretchBlt、PrintWindow、GetDIBits 等抓屏路径。
 - 极域电子教室、机房管理助手的兼容适配基础。
 
+## 文档
+
+| 文档 | 内容 |
+| --- | --- |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 进程/驱动/Hook/网络/更新的整体结构与关键机制 |
+| [docs/BUILD.md](docs/BUILD.md) | 从零复现构建的顺序、期望产物、常见报错 |
+| [docs/RELEASE-PIPELINE.md](docs/RELEASE-PIPELINE.md) | 签名、打包、更新服务与站点同步的现状 |
+| [docs/REPO-LAYOUT.md](docs/REPO-LAYOUT.md) | 目录职责与不可移动的构建绑定文件 |
+| [docs/DRIVER-SIGNATURE-POLICY.md](docs/DRIVER-SIGNATURE-POLICY.md) | 驱动发布者白名单与内核 guard 规则 |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | 提交流程、代码风格、禁提交清单 |
+
 ## 架构
 
 | 目录 | 说明 |
 | --- | --- |
 | `DzjsTrainer` | 主程序、驱动加载和资源嵌入逻辑 |
 | `DzjsTrainerUI` | 原生 Windows UI 与交互逻辑 |
-| `DzjsTrainerDriver` | x64 WDM 驱动源码 |
+| `DzjsTrainerDriver` | x64 WDM 驱动源码（`legacy-x86/` 为 2019 年存档，不参与编译） |
 | `DzjsTrainerHooks` | 兼容层与 Hook 模块源码 |
 | `DzjsTrainerUpdater` | 更新组件源码 |
 | `JiYuAvKernel` / `JiYuAvCtl` | 辅助驱动与控制工具 |
 | `tools` | 驱动构建、签名、令牌与验证脚本 |
+| `docs` | 架构、构建、发布与目录说明 |
+| `assets` / `include` / `resources` | 品牌资源、跨工程共享头、构建期固定输入 |
+| `scripts` | 开发者本地脚本 |
+| `third_party` | curl、MemoryModule、XZip 等上游源码（详见其 README） |
 | `DzjsTrainer.sln` | 主解决方案 |
+
+目录职责、哪些文件必须留在根目录、以及各第三方组件的编译状态，见 [docs/REPO-LAYOUT.md](docs/REPO-LAYOUT.md)。
 
 主程序使用 x86 配置构建；驱动使用 x64 配置构建。解决方案已配置二者的依赖关系。
 
@@ -71,6 +88,8 @@ MSBuild.exe DzjsTrainerDriver\DzjsTrainerDriver.vcxproj /t:Build /p:Configuratio
 ```
 
 构建产物会写入被 Git 忽略的 `Release` 目录，不应提交到源码仓库。
+
+> **干净 clone 不能一次编完。** 主程序把驱动、两份 Hook DLL、注入助手与更新器作为 BIN 资源内嵌，这些文件必须先由各自的工程生成；此外 32 位注入实现（`DllInjector`）不在仓库内。完整的真实顺序、期望产物和常见报错见 [docs/BUILD.md](docs/BUILD.md)。
 
 ### 更新通道公钥
 
@@ -132,12 +151,17 @@ openssl pkey -in update-server\ticket-sign.pem -pubout -outform DER -out update-
 
 ## 贡献
 
-欢迎提交 Issue、修复建议和 Pull Request。提交前请确保：
+欢迎提交 Issue、修复建议和 Pull Request。完整约定见 [CONTRIBUTING.md](CONTRIBUTING.md)，提交前请确保：
 
 - 不提交 `Release`、`obj`、`bin`、日志、PDB 或其他构建产物。
 - 不提交证书、私钥、令牌、设备标识或包含敏感环境信息的日志。
 - 为功能修改提供可复现的测试步骤。
 - 保持现有 C++ 与 PowerShell 代码风格，避免无关格式化。
+- 本地先跑一遍仓库自检：
+
+  ```powershell
+  python tools\verify_repo.py --strict
+  ```
 
 安全问题请不要在公开 Issue 中披露可复现细节，应先联系维护者。
 
@@ -145,7 +169,7 @@ openssl pkey -in update-server\ticket-sign.pem -pubout -outform DER -out update-
 
 - JiYu Trainer 原作者：快乐的梦鱼。
 - 当前维护与翻新：云散皆星河。
-- 第三方组件包括 curl、MinHook、MemoryModule、XZip/XUnZip、dnlib 等；请分别遵循其许可证要求。
+- 第三方组件包括 curl、MinHook、MemoryModule、XZip/XUnZip、dnlib 等；各自的版本、许可证与是否参与编译见 [third_party/README.md](third_party/README.md)。
 
 ## 许可证
 
