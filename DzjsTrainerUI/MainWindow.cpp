@@ -628,7 +628,8 @@ constexpr UINT TIMER_ANIMATION = 20;
 // 服务轮询和动画分开：轮询 5 次/秒足够，动画只在有东西在动时才跑 60 帧。
 constexpr UINT TIMER_SERVICE_POLL = 23;
 constexpr UINT TIMER_TRAY_REPAIR = 21;
-constexpr UINT TIMER_RERUN = 21;
+// 21 已被 TIMER_TRAY_REPAIR 占用；两者共用会让托盘修复顺带触发一次 1 号操作。
+constexpr UINT TIMER_RERUN = 25;
 constexpr UINT TIMER_AUTO_SHUT = 22;
 // 更新替换完成后停一下再退出，让「更新完成」这一帧留得住。
 constexpr UINT TIMER_UPDATE_RESTART = 24;
@@ -1379,7 +1380,6 @@ struct ExitConfirmContext {
 	bool darkMode = false;
 	bool accepted = false;
 	bool sawPhysicalKeyboard = false;
-	bool injectedInput = false;
 	bool invalidInput = false;
 	bool updatingEdit = false;
 };
@@ -1826,7 +1826,7 @@ LRESULT CALLBACK ExitConfirmProc(HWND window, UINT message, WPARAM wParam, LPARA
 			wchar_t buffer[64]{};
 			GetWindowTextW(context->edit, buffer, _countof(buffer));
 			context->value = buffer;
-			context->accepted = context->sawPhysicalKeyboard && !context->injectedInput &&
+			context->accepted = context->sawPhysicalKeyboard &&
 				context->value == context->challenge;
 			if (context->accepted) DestroyWindow(window);
 			else {
@@ -3199,6 +3199,9 @@ bool ChooseMediaPath(HWND owner, bool image, std::wstring* path)
 	if (!registered) {
 		WNDCLASSEXW windowClass{};
 		windowClass.cbSize = sizeof(windowClass);
+		// 没有 CS_DBLCLKS 时系统只发两次 WM_LBUTTONDOWN，双击进入文件夹/选文件
+		// 永远不会触发（窗口提示却写着「双击」）。
+		windowClass.style = CS_DBLCLKS;
 		windowClass.lpfnWndProc = MediaPickerProc;
 		windowClass.hInstance = JTAppGetInstanceDirect();
 		windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
