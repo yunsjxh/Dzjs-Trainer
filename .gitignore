@@ -57,7 +57,6 @@ unlock-key-material/
 /sc0.png
 /sc1.png
 /*帮助.png
-/tools/Protect-DriverUnlockToken.ps1
 
 # Local versioned build staging directories
 /Release-v1.0.0/
