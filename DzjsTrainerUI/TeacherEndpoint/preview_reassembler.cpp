@@ -7,6 +7,10 @@
 
 namespace jiyu {
 
+// A preview frame is a JPEG produced by the student encoder; anything past a
+// few megabytes is a malformed or hostile LANT packet, not a real frame.
+constexpr std::uint32_t kMaxPreviewBytes = 8u * 1024u * 1024u;
+
 std::optional<CompletedPreview> PreviewReassembler::accept(const std::string& student_ip, const std::uint8_t* data, std::size_t size) {
     if (!data || size < 48) {
         return std::nullopt;
@@ -15,7 +19,7 @@ std::optional<CompletedPreview> PreviewReassembler::accept(const std::string& st
     const auto total = protocol::readLe32(data + 36);
     const auto offset = protocol::readLe32(data + 40);
     const auto frag_len = protocol::readLe32(data + 44);
-    if (total == 0 || frag_len == 0 || offset >= total || size < 48) {
+    if (total == 0 || total > kMaxPreviewBytes || frag_len == 0 || offset >= total || size < 48) {
         return std::nullopt;
     }
 
