@@ -234,6 +234,23 @@ def check_solutions(files, findings) -> None:
                 findings.append(f"missing solution project: {rel(path)} -> {project}")
 
 
+def is_ignored(name: str) -> bool:
+    """True when .gitignore (or .git/info/exclude) hides this root entry.
+
+    Build outputs such as dist/ are intentionally absent from the tree, so they
+    must not be reported as layout violations.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "check-ignore", "--quiet", "--no-index", name],
+            cwd=ROOT,
+            capture_output=True,
+        )
+    except OSError:  # pragma: no cover - git missing
+        return False
+    return result.returncode == 0
+
+
 def check_root(findings, warnings) -> None:
     for entry in sorted(ROOT.iterdir()):
         if entry.name.startswith(".tmp-"):
@@ -241,7 +258,7 @@ def check_root(findings, warnings) -> None:
             continue
         if entry.name == ".git":
             continue
-        if entry.name not in ROOT_ALLOWLIST:
+        if entry.name not in ROOT_ALLOWLIST and not is_ignored(entry.name):
             findings.append(f"unexpected root entry: {entry.name}")
 
 
