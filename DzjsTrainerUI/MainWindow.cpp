@@ -3375,7 +3375,9 @@ MainWindow::MainWindow()
 	GdiplusStartup(&gdiplusToken, &input, nullptr);
 	if (!RegisterWindowClass()) return;
 
-	RECT desired{ 0, 0, 1120, 760 };
+	const int systemDpi = SystemDpi();
+	dpiScale = systemDpi > 0 ? static_cast<double>(systemDpi) / 96.0 : 1.0;
+	RECT desired{ 0, 0, static_cast<LONG>(1120 * dpiScale), static_cast<LONG>(760 * dpiScale) };
 	AdjustWindowRectEx(&desired, WS_OVERLAPPEDWINDOW, FALSE, 0);
 	_hWnd = CreateWindowExW(0, MAIN_WND_CLS_NAME, MAIN_WND_NAME, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
 		CW_USEDEFAULT, CW_USEDEFAULT, desired.right - desired.left, desired.bottom - desired.top,
@@ -3389,6 +3391,25 @@ MainWindow::MainWindow()
 
 // 切换浅色/深色。fromSystem = true 表示这是系统设置变更触发的，
 // 手动选过主题之后就不该再被系统顶掉；fromSystem = false 表示用户点了主题按钮。
+int MainWindow::SystemDpi() const
+{
+	HDC dc = GetDC(nullptr);
+	const int dpi = dc ? GetDeviceCaps(dc, LOGPIXELSX) : 96;
+	if (dc) ReleaseDC(nullptr, dc);
+	return dpi > 0 ? dpi : 96;
+}
+
+int MainWindow::Scale(int value) const
+{
+	return static_cast<int>(lround(static_cast<double>(value) * dpiScale));
+}
+
+POINT MainWindow::ToLogical(POINT point) const
+{
+	if (dpiScale <= 0.0) return point;
+	return POINT{ static_cast<LONG>(lround(point.x / dpiScale)), static_cast<LONG>(lround(point.y / dpiScale)) };
+}
+
 void MainWindow::ApplyTheme(bool dark, bool fromSystem)
 {
 	if (fromSystem && !themeFollowsSystem) return;
@@ -3690,11 +3711,23 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 	}
 	case WM_GETMINMAXINFO: {
 		auto info = reinterpret_cast<MINMAXINFO*>(lParam);
-		info->ptMinTrackSize = { 960, 760 };
+		info->ptMinTrackSize = { self->Scale(960), self->Scale(760) };
+		return 0;
+	}
+	case WM_DPICHANGED: {
+		const UINT newDpi = HIWORD(wParam);
+		if (newDpi != 0) self->dpiScale = static_cast<double>(newDpi) / 96.0;
+		const RECT* suggested = reinterpret_cast<const RECT*>(lParam);
+		if (suggested) {
+			SetWindowPos(hwnd, nullptr, suggested->left, suggested->top,
+				suggested->right - suggested->left, suggested->bottom - suggested->top,
+				SWP_NOZORDER | SWP_NOACTIVATE);
+		}
+		InvalidateRect(hwnd, nullptr, FALSE);
 		return 0;
 	}
 	case WM_MOUSEMOVE: {
-		POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+		POINT point = self->ToLogical(POINT{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) });
 		self->UpdateHover(point);
 		if (!self->mouseTracking) {
 			TRACKMOUSEEVENT track{ sizeof(track), TME_LEAVE, hwnd, 0 };
@@ -3713,6 +3746,7 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 	case WM_MOUSEWHEEL: {
 		POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
 		ScreenToClient(hwnd, &point);
+		point = self->ToLogical(point);
 		if (self->ProcessPickerVisible()) {
 			const int notches = GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA;
 			const int rows = (std::max)(1, self->processPicker.rowCount);
@@ -3753,7 +3787,7 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 		break;
 	case WM_LBUTTONDOWN: {
 		// 只是记住按下的目标，用来给按钮画"按下去"的样子；真正的动作仍在抬起时执行。
-		POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+		POINT point = self->ToLogical(POINT{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) });
 		if (self->ProcessPickerVisible()) {
 			self->pressTarget = self->HitProcessPickerAt(point);
 			if (self->pressTarget >= 0) {
@@ -3779,7 +3813,7 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 		return 0;
 	}
 	case WM_LBUTTONUP: {
-		POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+		POINT point = self->ToLogical(POINT{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) });
 		self->HandleClick(point);
 		self->pressTarget = -1;
 		self->EnsureAnimationTimer();
@@ -4040,6 +4074,8 @@ void MainWindow::Paint()
 		return;
 	}
 	Graphics g(backBuffer);
+	// 逻辑坐标 → 物理像素。下面所有绘制仍按 96 DPI 的常量写。
+	g.ScaleTransform(static_cast<REAL>(dpiScale), static_cast<REAL>(dpiScale));
 	g.SetSmoothingMode(SmoothingModeAntiAlias);
 	// ClearType assumes an opaque target; the ARGB back buffer needs alpha-safe antialiasing.
 	g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
@@ -4049,19 +4085,21 @@ void MainWindow::Paint()
 
 	PaintNavigation(g, height);
 	PaintHeader(g, width);
+	const int logicalWidth = static_cast<int>(lround(width / dpiScale));
+	const int logicalHeight = static_cast<int>(lround(height / dpiScale));
 	const double easedMotion = 1.0 - pow(1.0 - pageMotion, 4.0);
 	const int offset = static_cast<int>((1.0 - easedMotion) * 22.0);
 	switch (page) {
-	case Page::Overview: PaintOverview(g, width, height, offset); break;
-	case Page::Protection: PaintProtection(g, width, height, offset); break;
-	case Page::Replacement: PaintProtection(g, width, height, offset); break;
-	case Page::Antivirus: PaintAntivirus(g, width, height, offset); break;
-	case Page::Advanced: PaintAdvanced(g, width, height, offset); break;
-	case Page::Network: PaintNetwork(g, width, height, offset); break;
-	case Page::Diagnostics: PaintDiagnostics(g, width, height, offset); break;
-	case Page::Logs: PaintLogs(g, width, height, offset); break;
-	case Page::About: PaintAbout(g, width, height, offset); break;
-	case Page::Injection: PaintInjection(g, width, height, offset); break;
+	case Page::Overview: PaintOverview(g, logicalWidth, logicalHeight, offset); break;
+	case Page::Protection: PaintProtection(g, logicalWidth, logicalHeight, offset); break;
+	case Page::Replacement: PaintProtection(g, logicalWidth, logicalHeight, offset); break;
+	case Page::Antivirus: PaintAntivirus(g, logicalWidth, logicalHeight, offset); break;
+	case Page::Advanced: PaintAdvanced(g, logicalWidth, logicalHeight, offset); break;
+	case Page::Network: PaintNetwork(g, logicalWidth, logicalHeight, offset); break;
+	case Page::Diagnostics: PaintDiagnostics(g, logicalWidth, logicalHeight, offset); break;
+	case Page::Logs: PaintLogs(g, logicalWidth, logicalHeight, offset); break;
+	case Page::About: PaintAbout(g, logicalWidth, logicalHeight, offset); break;
+	case Page::Injection: PaintInjection(g, logicalWidth, logicalHeight, offset); break;
 	}
 	// 键盘焦点环。只在 Tab 导航时出现，鼠标点击会清掉。
 	// 更新弹窗有自己的一套焦点环（画在卡片里），这里跳过，免得环被卡片盖住。
@@ -4075,10 +4113,10 @@ void MainWindow::Paint()
 			StrokeRound(g, ring, ringRadius, C(darkMode, 0, 107, 95, 130, 213, 199), 2.0f);
 		}
 	}
-	PaintToast(g, width, height);
+	PaintToast(g, logicalWidth, logicalHeight);
 	// 弹窗画在最后：提示条、页面内容、焦点环都得在它下面。
-	PaintUpdateDialog(g, width, height);
-	PaintProcessPicker(g, width, height);
+	PaintUpdateDialog(g, logicalWidth, logicalHeight);
+	PaintProcessPicker(g, logicalWidth, logicalHeight);
 	// 直接 BitBlt 到窗口 DC：比 Graphics::DrawImage 快约 45 倍。
 	// BeginPaint 拿到的 DC 已经按更新区裁剪，被子控件挡住的部分不会覆盖。
 	BitBlt(dc, 0, 0, width, height, backBufferDc, 0, 0, SRCCOPY);

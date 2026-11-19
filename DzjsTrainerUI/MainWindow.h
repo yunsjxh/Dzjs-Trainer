@@ -110,6 +110,12 @@ private:
 	HGDIOBJ backBufferPreviousBitmap = nullptr;
 	void* backBufferBits = nullptr;
 	bool EnsureBackBuffer(int width, int height);
+	// 设计基线是 96 DPI；高分屏上窗口按 dpiScale 放大，绘制统一走缩放变换，
+	// 鼠标坐标在进入命中测试前换算回逻辑坐标。
+	double dpiScale = 1.0;
+	int Scale(int value) const;
+	POINT ToLogical(POINT point) const;
+	int SystemDpi() const;
 	void ReleaseBackBuffer();
 	void LogPaintDuration(double milliseconds);
 	NOTIFYICONDATAW nid{};

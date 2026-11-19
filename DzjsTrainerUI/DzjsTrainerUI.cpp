@@ -12,8 +12,31 @@
 MainWindow *currentMainWindow = nullptr;
 extern JTApp * currentApp;
 
+// Windows 会用位图拉伸"非 DPI 感知"进程的窗口，高分屏上整窗发虚。
+// 在创建任何窗口之前声明 Per-Monitor V2（Win10 1703+），失败再退回旧接口。
+static void EnableDpiAwareness()
+{
+	HMODULE user32 = GetModuleHandleW(L"user32.dll");
+	if (user32) {
+		using SetContextFn = BOOL(WINAPI*)(HANDLE);
+		auto setContext = reinterpret_cast<SetContextFn>(
+			GetProcAddress(user32, "SetProcessDpiAwarenessContext"));
+		if (setContext && setContext(reinterpret_cast<HANDLE>(-4))) return; // PER_MONITOR_AWARE_V2
+	}
+	HMODULE shcore = LoadLibraryW(L"shcore.dll");
+	if (shcore) {
+		using SetAwarenessFn = HRESULT(WINAPI*)(int);
+		auto setAwareness = reinterpret_cast<SetAwarenessFn>(
+			GetProcAddress(shcore, "SetProcessDpiAwareness"));
+		if (setAwareness && SUCCEEDED(setAwareness(2))) { FreeLibrary(shcore); return; }
+		FreeLibrary(shcore);
+	}
+	SetProcessDPIAware();
+}
+
 int DzjsTrainerUIRunMain()
 {
+	EnableDpiAwareness();
 	currentMainWindow = new MainWindow();
 	int result = currentMainWindow->RunLoop();
 	delete currentMainWindow;
