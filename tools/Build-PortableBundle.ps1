@@ -16,7 +16,9 @@ param(
     [string]$SourceExe = '',
     [string]$OutputDir = '',
     [switch]$Zip,
-    [switch]$KeepExisting
+    [switch]$KeepExisting,
+    # Optional teacher-endpoint GUI (JiYuTeacherGui.exe) to drop next to the exe.
+    [string]$TeacherGui = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -41,6 +43,43 @@ if ((Test-Path -LiteralPath $OutputDir) -and -not $KeepExisting) {
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 
 Copy-Item -LiteralPath $SourceExe -Destination $OutputDir -Force
+
+# --- Components that are embedded in the exe but useful to have loose -------
+# The executable extracts its own copies at startup; shipping them next to it
+# makes the bundle auditable and lets someone load the driver manually.
+$components = Join-Path $OutputDir 'components'
+New-Item -ItemType Directory -Path $components -Force | Out-Null
+$componentSources = [ordered]@{
+    'DzjsTrainerDriver.sys'     = Join-Path $root 'Release\DzjsTrainerDriver\DzjsTrainerDriver.sys'
+    'JiYuAvKernel.sys'          = Join-Path $root 'JiYuAvRelease\JiYuAvKernel.sys'
+    'DzjsTrainerHooks.dll'      = Join-Path $root 'Release\DzjsTrainerHooks.dll'
+    'DzjsTrainerHooks64.dll'    = Join-Path $root 'x64\Release\DzjsTrainerHooks.dll'
+    'DzjsTrainerInjector64.exe' = Join-Path $root 'x64\Release\DzjsTrainerInjector64.exe'
+    'DzjsTrainerUpdater.exe'    = Join-Path $root 'Release\DzjsTrainerUpdater.exe'
+}
+$missingComponents = @()
+foreach ($name in $componentSources.Keys) {
+    $source = $componentSources[$name]
+    if (Test-Path -LiteralPath $source) {
+        Copy-Item -LiteralPath $source -Destination (Join-Path $components $name) -Force
+    } else {
+        $missingComponents += $name
+    }
+}
+foreach ($name in $missingComponents) {
+    Write-Warning "Component not built, skipped: $name"
+}
+
+# --- Optional teacher-endpoint GUI -----------------------------------------
+if ($TeacherGui) {
+    if (Test-Path -LiteralPath $TeacherGui) {
+        $teacherDir = Join-Path $OutputDir 'TeacherEndpoint'
+        New-Item -ItemType Directory -Path $teacherDir -Force | Out-Null
+        Copy-Item -LiteralPath $TeacherGui -Destination (Join-Path $teacherDir 'JiYuTeacherGui.exe') -Force
+    } else {
+        Write-Warning "TeacherGui not found: $TeacherGui"
+    }
+}
 
 # --- VC++ runtime -----------------------------------------------------------
 # Find the redist that belongs to the installed toolset, not whatever happens
@@ -113,7 +152,11 @@ $readme = @(
     '驱动',
     '----',
     '主程序把驱动、两份 Hook DLL、64 位注入助手、更新器和 AV 驱动都内嵌在 exe 里，',
-    '运行时释放到本目录（隐藏属性），所以不需要额外文件。',
+    '运行时释放到本目录（隐藏属性）。components\\ 里是同样的文件散件，方便核对、',
+    '手工安装驱动或替换组件；删掉也不影响运行。',
+    '',
+    'TeacherEndpoint\\JiYuTeacherGui.exe 是第三方教师端模拟器（Python + PyInstaller），',
+    '界面里"网络工具 / 启动教师服务"会调用它；没有它那个按钮会提示未找到。',
     '',
     '注意：自行编译出来的驱动没有微软认可的签名，普通系统会拒绝加载，日志里会出现',
     '驱动加载失败，但窗口化/注入等主要功能仍然可用。要在自己机器上启用驱动，需要',
