@@ -8811,9 +8811,14 @@ void MainWindow::LaunchEmbeddedTeacherGui()
 		StopEmbeddedTeacherGui();
 		return;
 	}
-	wchar_t modulePath[MAX_PATH]{};
-	GetModuleFileNameW(nullptr, modulePath, _countof(modulePath));
-	std::wstring base = modulePath;
+	// 路径可能超过 MAX_PATH（用户目录很深时），用大缓冲并检查返回值，
+	// 否则 GetModuleFileNameW 会截断，拼出来的候选路径必然不存在。
+	std::vector<wchar_t> modulePath(32768, L'\0');
+	const DWORD moduleLength = GetModuleFileNameW(nullptr, modulePath.data(),
+		static_cast<DWORD>(modulePath.size()));
+	std::wstring base = moduleLength > 0
+		? std::wstring(modulePath.data(), moduleLength)
+		: std::wstring();
 	const size_t slash = base.find_last_of(L"\\/");
 	base = slash == std::wstring::npos ? L"." : base.substr(0, slash);
 	std::vector<std::wstring> candidates = {
@@ -8822,15 +8827,28 @@ void MainWindow::LaunchEmbeddedTeacherGui()
 	};
 	std::wstring executable;
 	for (const auto& candidate : candidates) {
-		if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) {
+		SetLastError(ERROR_SUCCESS);
+		const DWORD attributes = GetFileAttributesW(candidate.c_str());
+		const DWORD attributeError = (attributes == INVALID_FILE_ATTRIBUTES) ? GetLastError() : ERROR_SUCCESS;
+		if (currentLogger) {
+			currentLogger->LogInfo(L"teacher-gui probe: path=%s attrs=0x%08X error=%lu",
+				candidate.c_str(), attributes, attributeError);
+		}
+		if (attributes != INVALID_FILE_ATTRIBUTES) {
 			executable = candidate;
 			break;
 		}
 	}
 	if (executable.empty()) {
-		MessageBoxW(_hWnd, L"\u672a\u627e\u5230 TeacherEndpoint\\JiYuTeacherGui.exe\uff0c\u8bf7\u5148\u6784\u5efa\u5e76\u653e\u5165\u4e3b\u7a0b\u5e8f\u76ee\u5f55\u3002", L"\u7f51\u7edc\u5de5\u5177", MB_OK | MB_ICONERROR);
+		// 把尝试过的路径直接写进弹窗和日志：下次不用再猜。
+		std::wstring detail = L"\u672a\u627e\u5230 TeacherEndpoint\\JiYuTeacherGui.exe\u3002\n\u5df2\u5c1d\u8bd5\uff1a\n";
+		for (const auto& candidate : candidates) detail += candidate + L"\n";
+		detail += L"\n\u4e3b\u7a0b\u5e8f\u76ee\u5f55\uff1a" + base;
+		if (currentLogger) currentLogger->LogError(L"teacher-gui missing, base=%s", base.c_str());
+		MessageBoxW(_hWnd, detail.c_str(), L"\u7f51\u7edc\u5de5\u5177", MB_OK | MB_ICONERROR);
 		return;
 	}
+	if (currentLogger) currentLogger->LogInfo(L"teacher-gui launch: %s", executable.c_str());
 	std::wstring commandLine = L"\"" + executable + L"\"";
 	std::wstring workingDirectory = executable;
 	const size_t executableSlash = workingDirectory.find_last_of(L"\\/");
