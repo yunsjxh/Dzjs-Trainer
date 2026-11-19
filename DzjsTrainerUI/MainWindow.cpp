@@ -3281,6 +3281,9 @@ std::wstring StripMarkup(LPCWSTR input) {
 struct TeacherWindowSearch {
 	DWORD processId = 0;
 	HWND window = nullptr;
+	// 只有在尝试嵌入/已经嵌入时才隐藏控制台；以独立窗口运行时要留着它，
+	// 否则 Python 版教师端（唯一的交互界面就是控制台）会完全看不见。
+	bool hideConsole = true;
 };
 
 BOOL CALLBACK FindTeacherWindow(HWND hwnd, LPARAM parameter)
@@ -3296,7 +3299,7 @@ BOOL CALLBACK FindTeacherWindow(HWND hwnd, LPARAM parameter)
 	// of the teacher UI and must never become visible beside the embedded FLTK
 	// window, even when it was created before CREATE_NO_WINDOW took effect.
 	if (lstrcmpW(className, L"ConsoleWindowClass") == 0) {
-		ShowWindow(hwnd, SW_HIDE);
+		if (search->hideConsole) ShowWindow(hwnd, SW_HIDE);
 		return TRUE;
 	}
 	if (search->window || lstrcmpW(className, L"FLTK") != 0 || GetWindow(hwnd, GW_OWNER) != nullptr)
@@ -8855,12 +8858,15 @@ void MainWindow::LaunchEmbeddedTeacherGui()
 	workingDirectory = executableSlash == std::wstring::npos ? base : workingDirectory.substr(0, executableSlash);
 	std::vector<wchar_t> command(commandLine.begin(), commandLine.end());
 	command.push_back(L'\0');
+	// 只有 FLTK 版教师端才有可嵌入的窗口；Python 版是控制台 REPL，
+	// 把控制台藏起来等于让它完全不可用。先按可见启动，真找到 FLTK
+	// 窗口时再由 FindTeacherWindow 把控制台隐藏。
 	STARTUPINFOW startup{ sizeof(startup) };
 	startup.dwFlags = STARTF_USESHOWWINDOW;
-	startup.wShowWindow = SW_HIDE;
+	startup.wShowWindow = SW_SHOWNORMAL;
 	PROCESS_INFORMATION process{};
 	if (!CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE,
-		CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW, nullptr, workingDirectory.c_str(), &startup, &process)) {
+		CREATE_NEW_PROCESS_GROUP, nullptr, workingDirectory.c_str(), &startup, &process)) {
 		MessageBoxW(_hWnd, L"\u542f\u52a8\u6559\u5e08\u7aef\u5931\u8d25\uff0c\u8bf7\u68c0\u67e5 TeacherEndpoint \u6587\u4ef6\u548c\u4f9d\u8d56\u5e93\u3002", L"\u7f51\u7edc\u5de5\u5177", MB_OK | MB_ICONERROR);
 		return;
 	}
@@ -8910,7 +8916,8 @@ void MainWindow::PollEmbeddedTeacherGui()
 	}
 	// The endpoint can create its console after the FLTK window. Sweep on every
 	// timer tick so a late console cannot remain visible after embedding.
-	TeacherWindowSearch consoleSweep{ teacherProcessId, nullptr };
+	TeacherWindowSearch consoleSweep{ teacherProcessId, nullptr,
+		teacherLaunchPending || teacherChildWindow != nullptr };
 	EnumWindows(FindTeacherWindow, reinterpret_cast<LPARAM>(&consoleSweep));
 	if (teacherChildWindow && !IsWindow(teacherChildWindow)) {
 		teacherChildWindow = nullptr;
@@ -8920,9 +8927,17 @@ void MainWindow::PollEmbeddedTeacherGui()
 	if (!teacherChildWindow) {
 		if (AttachEmbeddedTeacherGui()) return;
 		if (teacherLaunchPending && teacherLaunchDeadline && GetTickCount64() >= teacherLaunchDeadline) {
-			StopEmbeddedTeacherGui();
-			AppendNetworkResult(L"\u6559\u5e08\u7aef\u7a97\u53e3\u521b\u5efa\u8d85\u65f6");
-			ShowFastTip(L"\u6559\u5e08\u7aef\u542f\u52a8\u8d85\u65f6");
+			// 不是失败：这个版本没有 FLTK 窗口（Python 控制台版就是如此）。
+			// 进程继续跑，只是不嵌入，按钮改成「关闭教师端」。
+			teacherLaunchPending = false;
+			teacherLaunchDeadline = 0;
+			if (currentLogger) {
+				currentLogger->LogWarn(L"teacher-gui: no FLTK window after timeout; running standalone (pid=%lu)",
+					teacherProcessId);
+			}
+			AppendNetworkResult(L"\u6559\u5e08\u7aef\u5df2\u542f\u52a8\uff08\u6b64\u7248\u672c\u65e0\u5d4c\u5165\u754c\u9762\uff0c\u6b63\u5728\u72ec\u7acb\u7a97\u53e3\u8fd0\u884c\uff09");
+			ShowFastTip(L"\u6559\u5e08\u7aef\u4ee5\u72ec\u7acb\u7a97\u53e3\u8fd0\u884c");
+			if (teacherLaunchButton) SetWindowTextW(teacherLaunchButton, L"\u5173\u95ed\u6559\u5e08\u7aef");
 		}
 		return;
 	}
