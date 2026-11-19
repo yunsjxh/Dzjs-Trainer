@@ -5,8 +5,10 @@ rem Output: <repo>\JiYuAvRelease\JiYuAvKernel.sys (unsigned).
 
 set "ROOT=%~dp0..\"
 set "KITS=C:\Program Files (x86)\Windows Kits\10"
-set "SDKVER=10.0.26100.0"
-set "VCVARS=D:\VS\Community\VC\Auxiliary\Build\vcvarsall.bat"
+set "SDKVER="
+set "VCVARS="
+set "VSW=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+if exist "%VSW%" for /f "usebackq tokens=*" %%I in (`"%VSW%" -latest -products * -find VC\Auxiliary\Build\vcvarsall.bat`) do if not defined VCVARS set "VCVARS=%%I"
 
 if not exist "%VCVARS%" (
   echo ERROR: vcvarsall.bat not found: %VCVARS%
@@ -21,6 +23,17 @@ set "OUT=%ROOT%JiYuAvRelease"
 set "OBJ=%OUT%\obj"
 if not exist "%OUT%" mkdir "%OUT%"
 if not exist "%OBJ%" mkdir "%OBJ%"
+
+rem Pick the newest SDK that actually ships kernel-mode headers.
+if not defined SDKVER for /f "delims=" %%D in ('dir /b /ad /o-n "%KITS%\Include" 2^>nul') do (
+  if not defined SDKVER if exist "%KITS%\Include\%%D\km" set "SDKVER=%%D"
+)
+if not defined SDKVER (
+  echo ERROR: no Windows SDK with km headers found under "%KITS%\Include"
+  exit /b 6
+)
+echo [env] vcvars=%VCVARS%
+echo [env] sdk=%SDKVER%
 
 set "INCS=/I"%SRC%" /I"%SHARED%" /I"%KITS%\Include\%SDKVER%\km" /I"%KITS%\Include\%SDKVER%\shared" /I"%KITS%\Include\%SDKVER%\ucrt""
 set "DEFS=/D_WIN64 /D_AMD64_ /DAMD64 /D_NT_TARGET_VERSION=0xA000010 /DSUBSYSTEM_VERSION=10.00 /D_WIN32_WINNT=0x0A00 /D_WIN32_LEAN_AND_MEAN /DPOOL_NX_OPTIN=1"

@@ -52,12 +52,12 @@ if (Test-Path -LiteralPath $vswhere) {
     foreach ($install in $installs) {
         $redistRoot = Join-Path $install 'VC\Redist\MSVC'
         if (-not (Test-Path -LiteralPath $redistRoot)) { continue }
-        $crt = Get-ChildItem -LiteralPath $redistRoot -Directory |
-            Sort-Object Name -Descending |
-            ForEach-Object { Join-Path $_.FullName 'x86\Microsoft.VC143.CRT' } |
-            Where-Object { Test-Path -LiteralPath $_ } |
+        # Toolset folders are named Microsoft.VC143.CRT / VC145.CRT depending on
+        # the VS version, so match the pattern instead of pinning 143.
+        $crt = Get-ChildItem -Path (Join-Path $redistRoot '*\x86\Microsoft.VC*.CRT') -Directory -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending |
             Select-Object -First 1
-        if ($crt) { $runtimeFiles += Get-ChildItem -LiteralPath $crt -Filter '*.dll' -File }
+        if ($crt) { $runtimeFiles += Get-ChildItem -LiteralPath $crt.FullName -Filter '*.dll' -File }
     }
 }
 
