@@ -49,10 +49,19 @@ Dzjs Trainer 是基于 JiYu Trainer 翻新和持续维护的 Windows 桌面项�
 
 ## 环境要求
 
-- Windows 10 或更高版本。
+- Windows 10 或更高版本；内核驱动另需 Windows 10 2004（19041）起，见下面的运行限制。
 - Visual Studio 2022 或更高版本，包含 C++ 桌面开发和 MSBuild。
 - Windows 10/11 SDK。
 - 构建 `DzjsTrainerDriver` 时需要安装与系统匹配的 WDK。
+- Boost 头文件（`DzjsTrainerUI` 的 `TeacherEndpoint/` 用到 asio），路径通过 `BoostIncludeDir` 传入。
+
+### 运行限制
+
+- **驱动不是运行前提。** 没开测试模式、驱动没加载上，程序照样能用：窗口化、进程注入、替换画面/涂黑都在。缺的只有三样依赖内核的能力——内核级杀进程、进程自保护、AV 驱动扫描。
+- **发布包里的驱动可以直接加载**，不用开测试模式，也不要求关闭 Secure Boot。
+- **自己编译的版本不一样。** 没有签名证书时驱动只能自签，这种驱动在 Windows 10 1607 之后必须开测试模式才能加载；Secure Boot 开着的机器还要先在 BIOS 里关掉，否则 `StartService` 返回 577，日志里是 `Load driver error in StartService : 577`。
+- **驱动要求 Windows 10 2004（19041）或更高。** 驱动里用了 `ExAllocatePool2`，更早的系统（含 Windows 7）内核里没有这个导入，开测试模式也加载不了。
+- **教师端嵌入只接受 FLTK 窗口。** 公开的 `Third-party-JiYu-Teacher-Endpoint` 是 Python 版，只有控制台；等不到 FLTK 窗口时会自动改成独立窗口运行，不会结束进程。
 
 ## 构建
 
@@ -63,6 +72,18 @@ Dzjs Trainer 是基于 JiYu Trainer 翻新和持续维护的 Windows 桌面项�
 ```powershell
 MSBuild.exe DzjsTrainer.sln /t:Build /p:Configuration=Release /p:Platform=x86 /m
 ```
+
+`DzjsTrainerUI` 通过 `TeacherEndpoint/` 用 Boost.Asio 和教师端通信，仓库不含 Boost 本体。工程里留了维护者本机的默认路径，换机器要显式指定：
+
+```powershell
+MSBuild.exe DzjsTrainer.sln /t:Build /p:Configuration=Release /p:Platform=x86 /p:BoostIncludeDir=D:\vcpkg\installed\x64-windows\include
+```
+
+路径不对时会直接报「找不到 Boost 头文件」并带出当前值，不会编到一半才失败。
+
+单独构建各工程时按这个顺序：驱动（x64）→ `DzjsTrainerHooks` / `DzjsTrainerHooks64` → `DzjsTrainerInjector64` → `DzjsTrainerUpdater` → `DzjsTrainerUI` → `DzjsTrainer`。用解决方案构建就不用管，依赖已经配好。
+
+DLL 注入模块在 `DzjsTrainer/DllInjector/`，随主工程一起编译，不需要额外的克隆步骤。
 
 驱动可单独构建：
 
