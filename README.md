@@ -153,6 +153,8 @@ openssl pkey -in update-server\ticket-sign.pem -pubout -outform DER -out update-
 
 ## 贡献
 
+动手改代码前先看 [开发者说明](DEVELOPMENT.md)：模块划分、构建约束、调试开关和几个不要踩的坑都写在那里，这份 README 只讲使用。
+
 欢迎提交 Issue、修复建议和 Pull Request。提交前请确保：
 
 - 不提交 `Release`、`obj`、`bin`、日志、PDB 或其他构建产物。
