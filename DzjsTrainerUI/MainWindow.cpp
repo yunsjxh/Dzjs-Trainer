@@ -19,6 +19,24 @@
 #define DZJS_ENABLE_CAPTURE_EXCLUSION 1
 #endif
 
+// 进程 DPI 感知由 exe 清单声明为 Per-Monitor V2。GetDpiForWindow 是 1607 才有的
+// 导出，静态导入会让程序在更早的系统上启动就报缺导入，所以按需取。
+UINT QueryWindowDpi(HWND window)
+{
+	typedef UINT(WINAPI* GetDpiForWindowFn)(HWND);
+	static GetDpiForWindowFn getDpiForWindow = reinterpret_cast<GetDpiForWindowFn>(
+		GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow"));
+	if (getDpiForWindow != nullptr) {
+		const UINT dpi = getDpiForWindow(window);
+		if (dpi != 0) return dpi;
+	}
+	HDC dc = GetDC(window);
+	if (dc == nullptr) return 96;
+	const int dpi = GetDeviceCaps(dc, LOGPIXELSX);
+	ReleaseDC(window, dc);
+	return dpi > 0 ? static_cast<UINT>(dpi) : 96;
+}
+
 // 进程图标缓存定义在后面的「进程选择器」一节，析构路径上要先用到。
 void ClearProcessIconCache();
 
@@ -3406,7 +3424,9 @@ MainWindow::MainWindow()
 	GdiplusStartup(&gdiplusToken, &input, nullptr);
 	if (!RegisterWindowClass()) return;
 
-	RECT desired{ 0, 0, 1120, 760 };
+	// 默认客户区 1120×760 是逻辑像素；真正建窗口时换成当前 DPI 的物理像素。
+	uiScale = static_cast<float>(QueryWindowDpi(nullptr)) / 96.0f;
+	RECT desired{ 0, 0, ToPhysical(1120), ToPhysical(760) };
 	AdjustWindowRectEx(&desired, WS_OVERLAPPEDWINDOW, FALSE, 0);
 	_hWnd = CreateWindowExW(0, MAIN_WND_CLS_NAME, MAIN_WND_NAME, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
 		CW_USEDEFAULT, CW_USEDEFAULT, desired.right - desired.left, desired.bottom - desired.top,
@@ -3416,6 +3436,51 @@ MainWindow::MainWindow()
 	Initialize();
 	ShowWindow(_hWnd, JTAppGetShowCmdDirect());
 	UpdateWindow(_hWnd);
+}
+
+void MainWindow::ApplyDpiChange(int dpi, const RECT* suggested)
+{
+	if (dpi <= 0) return;
+	const float scale = static_cast<float>(dpi) / 96.0f;
+	if (fabsf(scale - uiScale) < 0.001f) return;
+	uiScale = scale;
+	// 建议矩形已经是物理像素、也含非客户区，直接采用，别按逻辑尺寸重推一遍。
+	if (suggested != nullptr) {
+		SetWindowPos(_hWnd, nullptr, suggested->left, suggested->top,
+			suggested->right - suggested->left, suggested->bottom - suggested->top,
+			SWP_NOZORDER | SWP_NOACTIVATE);
+	}
+	// 原生控件用的是像素高度的 HFONT，不重建的话到了新 DPI 下字会小一半。
+	RebuildControlFont();
+	LayoutEmbeddedWindows();
+	PositionProcessPickerSearchEdit();
+	InvalidateRect(_hWnd, nullptr, FALSE);
+}
+
+void MainWindow::PointToLogical(POINT& point) const
+{
+	if (uiScale <= 0.0f || fabsf(uiScale - 1.0f) < 0.001f) return;
+	point.x = static_cast<LONG>(lround(static_cast<double>(point.x) / uiScale));
+	point.y = static_cast<LONG>(lround(static_cast<double>(point.y) / uiScale));
+}
+
+void MainWindow::RebuildControlFont()
+{
+	HFONT font = CreateFontW(-ToPhysical(14), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+		OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+		DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+	if (font == nullptr) return;
+	HFONT previous = controlFont;
+	controlFont = font;
+	for (HWND control : networkControls)
+		if (control) SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(controlFont), TRUE);
+	for (HWND control : advancedControls)
+		if (control) SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(controlFont), TRUE);
+	if (processPickerSearchEdit)
+		SendMessageW(processPickerSearchEdit, WM_SETFONT, reinterpret_cast<WPARAM>(controlFont), TRUE);
+	if (teacherLaunchButton)
+		SendMessageW(teacherLaunchButton, WM_SETFONT, reinterpret_cast<WPARAM>(controlFont), TRUE);
+	if (previous) DeleteObject(previous);
 }
 
 // 切换浅色/深色。fromSystem = true 表示这是系统设置变更触发的，
@@ -3721,11 +3786,17 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 	}
 	case WM_GETMINMAXINFO: {
 		auto info = reinterpret_cast<MINMAXINFO*>(lParam);
-		info->ptMinTrackSize = { 960, 760 };
+		// 和默认客户区一样按逻辑像素写，换算成物理像素交给系统。
+		info->ptMinTrackSize = { self->ToPhysical(960), self->ToPhysical(760) };
+		return 0;
+	}
+	case WM_DPICHANGED: {
+		self->ApplyDpiChange(HIWORD(wParam), reinterpret_cast<const RECT*>(lParam));
 		return 0;
 	}
 	case WM_MOUSEMOVE: {
 		POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+		self->PointToLogical(point);
 		self->UpdateHover(point);
 		if (!self->mouseTracking) {
 			TRACKMOUSEEVENT track{ sizeof(track), TME_LEAVE, hwnd, 0 };
@@ -3744,6 +3815,7 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 	case WM_MOUSEWHEEL: {
 		POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
 		ScreenToClient(hwnd, &point);
+		self->PointToLogical(point);
 		if (self->ProcessPickerVisible()) {
 			const int notches = GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA;
 			const int rows = (std::max)(1, self->processPicker.rowCount);
@@ -3785,6 +3857,7 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 	case WM_LBUTTONDOWN: {
 		// 只是记住按下的目标，用来给按钮画"按下去"的样子；真正的动作仍在抬起时执行。
 		POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+		self->PointToLogical(point);
 		if (self->ProcessPickerVisible()) {
 			self->pressTarget = self->HitProcessPickerAt(point);
 			if (self->pressTarget >= 0) {
@@ -3811,6 +3884,7 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 	}
 	case WM_LBUTTONUP: {
 		POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+		self->PointToLogical(point);
 		self->HandleClick(point);
 		self->pressTarget = -1;
 		self->EnsureAnimationTimer();
@@ -4064,9 +4138,11 @@ void MainWindow::Paint()
 	}
 	RECT client{};
 	GetClientRect(_hWnd, &client);
-	const int width = client.right;
-	const int height = client.bottom;
-	if (width <= 0 || height <= 0 || !EnsureBackBuffer(width, height)) {
+	// 位图按物理像素建，绘制坐标按逻辑像素给，两者之间只差这一次 ScaleTransform。
+	// 于是所有 Paint* 里的硬编码数字不用改，125% / 150% 下自动等比放大。
+	const int pixelWidth = client.right;
+	const int pixelHeight = client.bottom;
+	if (pixelWidth <= 0 || pixelHeight <= 0 || !EnsureBackBuffer(pixelWidth, pixelHeight)) {
 		EndPaint(_hWnd, &ps);
 		return;
 	}
@@ -4077,6 +4153,9 @@ void MainWindow::Paint()
 	// 三层表面明度：侧栏 (226,234,230) 低于 画布 (237,242,239) 低于 卡片 (255,255,255)。
 	// 原来画布 (246,248,246) 与白卡只差 9 级，卡片完全浮不起来。
 	g.Clear(C(darkMode, 237, 242, 239, 15, 18, 17));
+	if (fabsf(uiScale - 1.0f) > 0.001f) g.ScaleTransform(uiScale, uiScale);
+	const int width = ToLogical(pixelWidth);
+	const int height = ToLogical(pixelHeight);
 
 	PaintNavigation(g, height);
 	PaintHeader(g, width);
@@ -4112,7 +4191,7 @@ void MainWindow::Paint()
 	PaintProcessPicker(g, width, height);
 	// 直接 BitBlt 到窗口 DC：比 Graphics::DrawImage 快约 45 倍。
 	// BeginPaint 拿到的 DC 已经按更新区裁剪，被子控件挡住的部分不会覆盖。
-	BitBlt(dc, 0, 0, width, height, backBufferDc, 0, 0, SRCCOPY);
+	BitBlt(dc, 0, 0, pixelWidth, pixelHeight, backBufferDc, 0, 0, SRCCOPY);
 	EndPaint(_hWnd, &ps);
 	LARGE_INTEGER paintEnded{};
 	QueryPerformanceCounter(&paintEnded);
@@ -5172,14 +5251,14 @@ void MainWindow::PositionProcessPickerSearchEdit()
 	if (!processPickerSearchEdit || !ProcessPickerVisible()) return;
 	RECT client{};
 	GetClientRect(_hWnd, &client);
-	const PickerGeometry geom = ComputePickerGeometry(client.right, client.bottom);
+	const PickerGeometry geom = ComputePickerGeometry(ToLogical(client.right), ToLogical(client.bottom));
 	RECT target{};
-	target.left = static_cast<LONG>(geom.search.X);
-	target.top = static_cast<LONG>(geom.search.Y);
-	target.right = static_cast<LONG>(geom.search.GetRight());
-	target.bottom = static_cast<LONG>(geom.search.GetBottom());
+	target.left = ToPhysical(static_cast<int>(geom.search.X));
+	target.top = ToPhysical(static_cast<int>(geom.search.Y));
+	target.right = ToPhysical(static_cast<int>(geom.search.GetRight()));
+	target.bottom = ToPhysical(static_cast<int>(geom.search.GetBottom()));
 	// 圆角画在父窗口上，EDIT 是方的：四周各让 10 / 7 像素，贴边会把圆角削掉。
-	InflateRect(&target, -10, -7);
+	InflateRect(&target, -ToPhysical(10), -ToPhysical(7));
 	RECT current{};
 	GetWindowRect(processPickerSearchEdit, &current);
 	MapWindowPoints(HWND_DESKTOP, _hWnd, reinterpret_cast<POINT*>(&current), 2);
@@ -8294,8 +8373,9 @@ void MainWindow::LayoutAdvancedControls()
 	RECT client{};
 	GetClientRect(_hWnd, &client);
 	const bool showCompat = page == Page::Advanced && advancedTab == 1;
-	// 和 PaintAdvanced 用同一组公式；输入框缩进圆角框内 4px。
-	MoveWindow(advancedControls[2], client.right - 238, 286, 182, 30, TRUE);
+	// 和 PaintAdvanced 用同一组公式（逻辑像素）；输入框缩进圆角框内 4px。
+	MoveWindow(advancedControls[2], ToPhysical(ToLogical(client.right) - 238), ToPhysical(286),
+		ToPhysical(182), ToPhysical(30), TRUE);
 	ShowWindow(advancedControls[2], showCompat ? SW_SHOW : SW_HIDE);
 }
 
@@ -8487,13 +8567,16 @@ void MainWindow::LayoutNetworkControls()
 	if (!networkControls[0]) return;
 	RECT client{};
 	GetClientRect(_hWnd, &client);
+	// 公式按逻辑像素算，MoveWindow 之前再换成物理像素。
+	const int clientWidth = ToLogical(client.right);
+	const int clientHeight = ToLogical(client.bottom);
 	const bool visible = false;
 	const int x = 280;
 	const int y = 185;
-	const int w = client.right > 308 ? static_cast<int>(client.right - 308) : 596;
+	const int w = clientWidth > 308 ? static_cast<int>(clientWidth - 308) : 596;
 	const int fieldW = std::max(174, w - 422);
 	auto place = [&](int index, int px, int py, int pw, int ph) {
-		MoveWindow(networkControls[index], px, py, pw, ph, TRUE);
+		MoveWindow(networkControls[index], ToPhysical(px), ToPhysical(py), ToPhysical(pw), ToPhysical(ph), TRUE);
 		ShowWindow(networkControls[index], visible ? SW_SHOW : SW_HIDE);
 	};
 	for (int index : { 0, 2, 5, 8 }) ShowWindow(networkControls[index], SW_HIDE);
@@ -8507,7 +8590,7 @@ void MainWindow::LayoutNetworkControls()
 	place(11, x, y + 199, 126, 36);
 	place(12, x + 136, y + 199, 84, 36);
 	place(13, x + 230, y + 199, 84, 36);
-	place(14, x, y + 291, w, std::max(72, static_cast<int>(client.bottom) - y - 319));
+	place(14, x, y + 291, w, std::max(72, clientHeight - y - 319));
 	LayoutTeacherControls();
 }
 
@@ -8517,19 +8600,21 @@ void MainWindow::LayoutTeacherControls()
 	{
 	RECT client{};
 	GetClientRect(_hWnd, &client);
+	const int clientWidth = ToLogical(client.right);
+	const int clientHeight = ToLogical(client.bottom);
 	const bool visible = page == Page::Network;
 	const int hostX = 264;
 	const int hostY = 170;
-	const int hostW = std::max(560, static_cast<int>(client.right) - hostX - 24);
-	const int hostH = std::max(320, static_cast<int>(client.bottom) - hostY - 24);
+	const int hostW = std::max(560, clientWidth - hostX - 24);
+	const int hostH = std::max(320, clientHeight - hostY - 24);
 	if (teacherHostWindow) {
-		MoveWindow(teacherHostWindow, hostX, hostY, hostW, hostH, TRUE);
+		MoveWindow(teacherHostWindow, ToPhysical(hostX), ToPhysical(hostY), ToPhysical(hostW), ToPhysical(hostH), TRUE);
 		// 只在真正嵌入原教师端窗口时才显示宿主框。没有嵌入时它是一个空的
 		// WS_EX_CLIENTEDGE STATIC，会盖住 PaintNetwork 画好的圆角卡片。
 		const bool hostVisible = visible && teacherChildWindow != nullptr && IsWindow(teacherChildWindow);
 		ShowWindow(teacherHostWindow, hostVisible ? SW_SHOW : SW_HIDE);
 	}
-	MoveWindow(teacherLaunchButton, hostX, 120, 144, 34, TRUE);
+	MoveWindow(teacherLaunchButton, ToPhysical(hostX), ToPhysical(120), ToPhysical(144), ToPhysical(34), TRUE);
 	ShowWindow(teacherLaunchButton, visible ? SW_SHOW : SW_HIDE);
 	for (HWND control : { teacherRefreshButton, teacherViewButton, teacherStudentList, teacherChatInput, teacherChatButton,
 		teacherBlackButton, teacherUnlockButton, teacherShutdownButton, teacherRebootButton })

@@ -89,6 +89,14 @@
     <LinkIncremental>false</LinkIncremental>
     <IntDir>$(SolutionDir)$(Configuration)\obj-main-$(Platform)\</IntDir>
   </PropertyGroup>
+  <ItemDefinitionGroup>
+    <!-- Manifest 任务（mt.exe）把这份片段合并进链接器生成的清单。
+         用 AdditionalManifestFiles，不要用 AdditionalManifestDependencies —— 后者是
+         /MANIFESTDEPENDENCY，会把文件名写成一条 assemblyIdentity 垃圾依赖。 -->
+    <Manifest>
+      <AdditionalManifestFiles>DzjsTrainer.manifest</AdditionalManifestFiles>
+    </Manifest>
+  </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
       <PrecompiledHeader>Use</PrecompiledHeader>

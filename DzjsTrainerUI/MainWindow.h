@@ -99,6 +99,15 @@ private:
 	};
 
 	HWND _hWnd = nullptr;
+	// 自绘、命中测试、布局都按 96 DPI 的逻辑坐标写；物理像素只出现在三处：
+	// 后备位图尺寸、BitBlt、原生子窗口的 HWND 位置。uiScale = 当前 DPI / 96，
+	// Per-Monitor V2 下窗口被拖到另一块屏时会变。
+	float uiScale = 1.0f;
+	void ApplyDpiChange(int dpi, const RECT* suggested);
+	void PointToLogical(POINT& point) const;
+	void RebuildControlFont();
+	int ToPhysical(int logical) const { return static_cast<int>(lround(static_cast<double>(logical) * uiScale)); }
+	int ToLogical(int physical) const { return static_cast<int>(lround(static_cast<double>(physical) / uiScale)); }
 	ULONG_PTR gdiplusToken = 0;
 	Gdiplus::Bitmap* backBuffer = nullptr;
 	int backBufferWidth = 0;
