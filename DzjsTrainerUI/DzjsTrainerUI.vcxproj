@@ -25,6 +25,11 @@
     <RootNamespace>DzjsTrainerUI</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
+  <PropertyGroup Label="Dependencies">
+    <!-- Boost 只被 TeacherEndpoint 用到（asio / system）。默认值是本机 vcpkg 布局，
+         换机器时用 -p:BoostIncludeDir=<路径> 覆盖，不要改这里。 -->
+    <BoostIncludeDir Condition="'$(BoostIncludeDir)' == ''">D:\原桌面\极域第三方教师端\cpp-gui\vcpkg_installed\x64-windows\include</BoostIncludeDir>
+  </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
     <ConfigurationType>StaticLibrary</ConfigurationType>
@@ -100,7 +105,7 @@
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>$(ProjectDir)TeacherEndpoint;D:\原桌面\极域第三方教师端\cpp-gui\vcpkg_installed\x64-windows\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)TeacherEndpoint;$(BoostIncludeDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <AdditionalOptions>/utf-8 /Zc:char8_t- %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
@@ -143,7 +148,7 @@
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>$(ProjectDir)TeacherEndpoint;D:\原桌面\极域第三方教师端\cpp-gui\vcpkg_installed\x64-windows\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)TeacherEndpoint;$(BoostIncludeDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <AdditionalOptions>/utf-8 /Zc:char8_t- %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
@@ -254,6 +259,10 @@
     </ProjectReference>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="CheckBoostIncludeDir" BeforeTargets="ClCompile">
+    <Error Condition="!Exists('$(BoostIncludeDir)\boost\asio.hpp')"
+           Text="找不到 Boost 头文件：$(BoostIncludeDir)。用 -p:BoostIncludeDir=&lt;路径&gt; 指定包含 boost/asio.hpp 的目录。" />
+  </Target>
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
 </Project>
