@@ -37,6 +37,68 @@ UINT QueryWindowDpi(HWND window)
 	return dpi > 0 ? static_cast<UINT>(dpi) : 96;
 }
 
+// 辅助窗口（输入提示、退出确认、三个选择器）要么堆原生控件，要么是固定像素的
+// 自绘布局，都没有主窗口那套逻辑坐标系。这里按窗口所在监视器的 DPI 把 96 DPI
+// 下写的数值换一遍：布局本身一个数不改，只换单位。
+int AuxPx(HWND window, int value)
+{
+	return MulDiv(value, static_cast<int>(QueryWindowDpi(window)), 96);
+}
+
+float AuxScale(HWND window)
+{
+	return static_cast<float>(QueryWindowDpi(window)) / 96.0f;
+}
+
+// 原生控件的默认字体是 96 DPI 的位图字体，Per-Monitor 感知的进程里它不会自己
+// 变大 —— 高 DPI 下这些窗口看起来就是「整块缩水」，原因一半在字体。取目标
+// DPI 的 message font：100% 下和默认外观完全一致，高 DPI 下才是系统本来会给的那一档。
+HFONT CreateAuxUiFont(HWND window)
+{
+	NONCLIENTMETRICSW metrics = {};
+	metrics.cbSize = sizeof(metrics);
+	typedef BOOL(WINAPI* ForDpiFn)(UINT, UINT, PVOID, UINT, UINT);
+	static ForDpiFn forDpi = reinterpret_cast<ForDpiFn>(
+		GetProcAddress(GetModuleHandleW(L"user32.dll"), "SystemParametersInfoForDpi"));
+	BOOL ok = FALSE;
+	if (forDpi != nullptr)
+		ok = forDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, QueryWindowDpi(window));
+	if (!ok) SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0);
+	return CreateFontIndirectW(&metrics.lfMessageFont);
+}
+
+void ApplyAuxFont(HWND parent, HFONT font)
+{
+	if (!font) return;
+	EnumChildWindows(parent, [](HWND child, LPARAM value) -> BOOL {
+		SendMessageW(child, WM_SETFONT, static_cast<WPARAM>(value), TRUE);
+		return TRUE;
+	}, reinterpret_cast<LPARAM>(font));
+}
+
+// 弹窗按「属主所在那块屏」的可用区域居中。SPI_GETWORKAREA 只给主显示器，
+// 主窗口搬到副屏之后这些弹窗会跑到另一块屏上去。
+RECT AuxWorkArea(HWND owner)
+{
+	MONITORINFO info = {};
+	info.cbSize = sizeof(info);
+	HMONITOR monitor = MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST);
+	if (monitor && GetMonitorInfoW(monitor, &info)) return info.rcWork;
+	RECT area = {};
+	SystemParametersInfoW(SPI_GETWORKAREA, 0, &area, 0);
+	return area;
+}
+
+// 居中到属主那块屏。width / height 是已经换算过的物理像素尺寸。
+POINT AuxCenterOn(HWND owner, int width, int height)
+{
+	const RECT area = AuxWorkArea(owner);
+	POINT point{};
+	point.x = area.left + ((area.right - area.left) - width) / 2;
+	point.y = area.top + ((area.bottom - area.top) - height) / 2;
+	return point;
+}
+
 // 进程图标缓存定义在后面的「进程选择器」一节，析构路径上要先用到。
 void ClearProcessIconCache();
 
@@ -1181,6 +1243,7 @@ struct AvTextPromptContext {
 	HWND owner = nullptr;
 	HWND window = nullptr;
 	HWND edit = nullptr;
+	HFONT font = nullptr;
 	std::wstring title;
 	std::wstring prompt;
 	std::wstring value;
@@ -1200,15 +1263,21 @@ LRESULT CALLBACK AvTextPromptProc(HWND window, UINT message, WPARAM wParam, LPAR
 	if (!context) return DefWindowProcW(window, message, wParam, lParam);
 	switch (message) {
 	case WM_CREATE:
+		context->font = CreateAuxUiFont(window);
 		CreateWindowExW(0, L"STATIC", context->prompt.c_str(), WS_CHILD | WS_VISIBLE,
-			18, 16, 444, 28, window, nullptr, GetModuleHandleW(nullptr), nullptr);
+			AuxPx(window, 18), AuxPx(window, 16), AuxPx(window, 444), AuxPx(window, 28),
+			window, nullptr, GetModuleHandleW(nullptr), nullptr);
 		context->edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", context->value.c_str(),
 			WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL,
-			18, 50, 444, 170, window, reinterpret_cast<HMENU>(IDC_AV_PROMPT_EDIT), GetModuleHandleW(nullptr), nullptr);
+			AuxPx(window, 18), AuxPx(window, 50), AuxPx(window, 444), AuxPx(window, 170),
+			window, reinterpret_cast<HMENU>(IDC_AV_PROMPT_EDIT), GetModuleHandleW(nullptr), nullptr);
 		CreateWindowExW(0, L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-			276, 230, 88, 30, window, reinterpret_cast<HMENU>(IDC_AV_PROMPT_OK), GetModuleHandleW(nullptr), nullptr);
+			AuxPx(window, 276), AuxPx(window, 230), AuxPx(window, 88), AuxPx(window, 30),
+			window, reinterpret_cast<HMENU>(IDC_AV_PROMPT_OK), GetModuleHandleW(nullptr), nullptr);
 		CreateWindowExW(0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-			374, 230, 88, 30, window, reinterpret_cast<HMENU>(IDC_AV_PROMPT_CANCEL), GetModuleHandleW(nullptr), nullptr);
+			AuxPx(window, 374), AuxPx(window, 230), AuxPx(window, 88), AuxPx(window, 30),
+			window, reinterpret_cast<HMENU>(IDC_AV_PROMPT_CANCEL), GetModuleHandleW(nullptr), nullptr);
+		ApplyAuxFont(window, context->font);
 		SetFocus(context->edit);
 		return 0;
 	case WM_COMMAND:
@@ -1223,6 +1292,12 @@ LRESULT CALLBACK AvTextPromptProc(HWND window, UINT message, WPARAM wParam, LPAR
 		if (LOWORD(wParam) == IDC_AV_PROMPT_CANCEL) { DestroyWindow(window); return 0; }
 		break;
 	case WM_CLOSE: DestroyWindow(window); return 0;
+	case WM_DESTROY:
+		if (context->font) {
+			DeleteObject(context->font);
+			context->font = nullptr;
+		}
+		return 0;
 	}
 	return DefWindowProcW(window, message, wParam, lParam);
 }
@@ -1247,13 +1322,12 @@ bool PromptAvText(HWND owner, LPCWSTR title, LPCWSTR prompt, std::wstring* value
 	context.title = title ? title : L"输入";
 	context.prompt = prompt ? prompt : L"请输入：";
 	context.value = *value;
-	RECT work = {};
-	SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-	const int x = work.left + ((work.right - work.left) - 480) / 2;
-	const int y = work.top + ((work.bottom - work.top) - 305) / 2;
+	const int width = AuxPx(owner, 480);
+	const int height = AuxPx(owner, 305);
+	const POINT origin = AuxCenterOn(owner, width, height);
 	HWND window = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_APPWINDOW | WS_EX_TOPMOST, kAvPromptClass,
 		context.title.c_str(), WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-		x, y, 480, 305, owner, nullptr, GetModuleHandleW(nullptr), &context);
+		origin.x, origin.y, width, height, owner, nullptr, GetModuleHandleW(nullptr), &context);
 	if (!window) return false;
 	if (owner && IsWindowEnabled(owner)) EnableWindow(owner, FALSE);
 	ShowWindow(window, SW_SHOW);
@@ -1383,8 +1457,9 @@ struct ExitConfirmContext {
 	std::unique_ptr<Gdiplus::Bitmap> blurredWallpaper;
 	ExitBackBuffer backBuffer;
 	std::wstring wallpaperPath;
-	int panelX = 0;
+	int panelX = 0;      // 逻辑坐标，绘制前统一 ScaleTransform
 	int panelY = 0;
+	float scale = 1.0f;
 	HWND edit = nullptr;
 	HFONT font = nullptr;
 	HBRUSH editBrush = nullptr;
@@ -1497,12 +1572,8 @@ DWORD WINAPI ExitConfirmDesktopThreadProc(LPVOID parameter)
 		return context->desktopFailure;
 	}
 
-	const int width = kExitPanelWidth;
-	const int height = kExitPanelHeight;
 	const int screenWidth = GetSystemMetrics(SM_CXSCREEN);
 	const int screenHeight = GetSystemMetrics(SM_CYSCREEN);
-	context->panelX = (screenWidth - width) / 2;
-	context->panelY = (screenHeight - height) / 2;
 	context->blurredWallpaper = BuildExitWallpaper(context->wallpaperPath.c_str());
 	// 去掉 WS_EX_DLGMODALFRAME 和 WS_BORDER：这是个铺满整屏的窗口，系统会在
 	// 暗化后的壁纸边缘画一圈 1px 边框，看起来像一道黑线。
@@ -1645,11 +1716,16 @@ void PaintExitConfirm(HWND window, ExitConfirmContext* context)
 	HDC dc = BeginPaint(window, &ps);
 	RECT client{};
 	GetClientRect(window, &client);
-	const int width = client.right;
-	const int height = client.bottom;
+	const int pixelWidth = client.right;
+	const int pixelHeight = client.bottom;
+	// 面板按 96 DPI 的逻辑坐标画，绘制前统一缩放 —— 和主窗口一个路数。
+	// 后备缓冲和脏矩形仍然是物理像素，只有绘制坐标系是逻辑的。
+	const float scale = context->scale > 0.0f ? context->scale : 1.0f;
+	const float width = static_cast<float>(pixelWidth) / scale;
+	const float height = static_cast<float>(pixelHeight) / scale;
 	ExitBackBuffer& back = context->backBuffer;
-	if (!back.surface || back.width != width || back.height != height) {
-		if (!back.Create(width, height)) {
+	if (!back.surface || back.width != pixelWidth || back.height != pixelHeight) {
+		if (!back.Create(pixelWidth, pixelHeight)) {
 			// 拿不到后备缓冲就退回直接画。会有中间态，但总比不画强。
 			Graphics fallback(dc);
 			fallback.Clear(Color(255, 18, 18, 18));
@@ -1659,9 +1735,11 @@ void PaintExitConfirm(HWND window, ExitConfirmContext* context)
 	}
 	// 只渲染脏矩形，别每秒把 1920x1080 整屏重画一遍。
 	Graphics graphics(back.surface.get());
-	graphics.SetClip(RectF(static_cast<REAL>(ps.rcPaint.left), static_cast<REAL>(ps.rcPaint.top),
-		static_cast<REAL>(ps.rcPaint.right - ps.rcPaint.left),
-		static_cast<REAL>(ps.rcPaint.bottom - ps.rcPaint.top)));
+	if (scale != 1.0f) graphics.ScaleTransform(scale, scale);
+	// rcPaint 是物理坐标，先折算回逻辑坐标再设裁剪，否则高 DPI 下只画左上角一块。
+	graphics.SetClip(RectF(static_cast<REAL>(ps.rcPaint.left) / scale, static_cast<REAL>(ps.rcPaint.top) / scale,
+		static_cast<REAL>(ps.rcPaint.right - ps.rcPaint.left) / scale,
+		static_cast<REAL>(ps.rcPaint.bottom - ps.rcPaint.top) / scale));
 	// 抗锯齿只影响边缘质量，不改任何几何或配色：圆角不再有台阶，小字不再发虚。
 	graphics.SetSmoothingMode(SmoothingModeAntiAlias);
 	graphics.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
@@ -1672,9 +1750,9 @@ void PaintExitConfirm(HWND window, ExitConfirmContext* context)
 	// 换成中性深灰，壁纸自己的颜色才能透出来。
 	graphics.Clear(Color(255, 18, 18, 18));
 	if (context->blurredWallpaper && context->blurredWallpaper->GetLastStatus() == Ok)
-		graphics.DrawImage(context->blurredWallpaper.get(), 0, 0, width, height);
+		graphics.DrawImage(context->blurredWallpaper.get(), 0.0f, 0.0f, width, height);
 	SolidBrush dimmer(Color(d ? 172 : 136, 10, 10, 10));
-	graphics.FillRectangle(&dimmer, 0, 0, width, height);
+	graphics.FillRectangle(&dimmer, 0.0f, 0.0f, width, height);
 
 	const float panelX = static_cast<float>(context->panelX);
 	const float panelY = static_cast<float>(context->panelY);
@@ -1746,15 +1824,25 @@ LRESULT CALLBACK ExitConfirmProc(HWND window, UINT message, WPARAM wParam, LPARA
 	if (!context) return DefWindowProcW(window, message, wParam, lParam);
 	switch (message) {
 	case WM_CREATE: {
-		context->font = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+		context->scale = AuxScale(window);
+		{
+			// 面板在逻辑坐标里居中：窗口铺满整块屏，除以缩放比就是逻辑客户区。
+			RECT client{};
+			GetClientRect(window, &client);
+			const float logicalWidth = static_cast<float>(client.right) / context->scale;
+			const float logicalHeight = static_cast<float>(client.bottom) / context->scale;
+			context->panelX = static_cast<int>(lround((logicalWidth - kExitPanelWidth) / 2.0));
+			context->panelY = static_cast<int>(lround((logicalHeight - kExitPanelHeight) / 2.0));
+		}
+		context->font = CreateFontW(AuxPx(window, 16), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
 			OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
 		// 与面板同色：外框填充也是这个色，所以输入框看起来只是「面板上的一个描边框」。
 		context->editBrush = CreateSolidBrush(ExitPanelColor(context->darkMode));
 		// 去掉 WS_EX_CLIENTEDGE（3D 凹陷直角边），缩进自绘圆角框里，四周各留 6px。
 		context->edit = CreateWindowExW(0, L"EDIT", L"",
 			WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_CENTER | ES_AUTOHSCROLL | ES_NUMBER,
-			context->panelX + kExitPadX + 11, context->panelY + kExitEditY + 6,
-			kExitContentWidth - 22, kExitEditHeight - 12, window,
+			AuxPx(window, context->panelX + kExitPadX + 11), AuxPx(window, context->panelY + kExitEditY + 6),
+			AuxPx(window, kExitContentWidth - 22), AuxPx(window, kExitEditHeight - 12), window,
 			reinterpret_cast<HMENU>(IDC_EXIT_CONFIRM_EDIT), GetModuleHandleW(nullptr), nullptr);
 		if (context->font) SendMessageW(context->edit, WM_SETFONT, reinterpret_cast<WPARAM>(context->font), TRUE);
 		SetWindowLongPtrW(context->edit, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(context));
@@ -2011,6 +2099,7 @@ struct AvProcessPickerContext {
 	HWND window = nullptr;
 	HWND list = nullptr;
 	HWND status = nullptr;
+	HFONT font = nullptr;
 	std::vector<AvProcessEntry> entries;
 	DWORD selectedProcessId = 0;
 	std::wstring selectedName;
@@ -2086,26 +2175,33 @@ LRESULT CALLBACK AvProcessPickerProc(HWND window, UINT message, WPARAM wParam, L
 	if (!context) return DefWindowProcW(window, message, wParam, lParam);
 	switch (message) {
 	case WM_CREATE: {
+		context->font = CreateAuxUiFont(window);
 		context->list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
 			WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
-			16, 16, 572, 344, window, reinterpret_cast<HMENU>(IDC_AV_PROCESS_LIST), GetModuleHandleW(nullptr), nullptr);
+			AuxPx(window, 16), AuxPx(window, 16), AuxPx(window, 572), AuxPx(window, 344),
+			window, reinterpret_cast<HMENU>(IDC_AV_PROCESS_LIST), GetModuleHandleW(nullptr), nullptr);
 		ListView_SetExtendedListViewStyle(context->list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_GRIDLINES);
 		LVCOLUMNW column = {};
 		column.mask = LVCF_TEXT | LVCF_WIDTH;
-		column.cx = 420;
+		column.cx = AuxPx(window, 420);
 		column.pszText = const_cast<LPWSTR>(L"进程名称");
 		ListView_InsertColumn(context->list, 0, &column);
-		column.cx = 120;
+		column.cx = AuxPx(window, 120);
 		column.pszText = const_cast<LPWSTR>(L"PID");
 		ListView_InsertColumn(context->list, 1, &column);
 		context->status = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
-			16, 370, 280, 28, window, nullptr, GetModuleHandleW(nullptr), nullptr);
+			AuxPx(window, 16), AuxPx(window, 370), AuxPx(window, 280), AuxPx(window, 28),
+			window, nullptr, GetModuleHandleW(nullptr), nullptr);
 		CreateWindowExW(0, L"BUTTON", L"刷新", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-			308, 366, 82, 32, window, reinterpret_cast<HMENU>(IDC_AV_PROCESS_REFRESH), GetModuleHandleW(nullptr), nullptr);
+			AuxPx(window, 308), AuxPx(window, 366), AuxPx(window, 82), AuxPx(window, 32),
+			window, reinterpret_cast<HMENU>(IDC_AV_PROCESS_REFRESH), GetModuleHandleW(nullptr), nullptr);
 		CreateWindowExW(0, L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-			400, 366, 88, 32, window, reinterpret_cast<HMENU>(IDC_AV_PROCESS_OK), GetModuleHandleW(nullptr), nullptr);
+			AuxPx(window, 400), AuxPx(window, 366), AuxPx(window, 88), AuxPx(window, 32),
+			window, reinterpret_cast<HMENU>(IDC_AV_PROCESS_OK), GetModuleHandleW(nullptr), nullptr);
 		CreateWindowExW(0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-			498, 366, 88, 32, window, reinterpret_cast<HMENU>(IDC_AV_PROCESS_CANCEL), GetModuleHandleW(nullptr), nullptr);
+			AuxPx(window, 498), AuxPx(window, 366), AuxPx(window, 88), AuxPx(window, 32),
+			window, reinterpret_cast<HMENU>(IDC_AV_PROCESS_CANCEL), GetModuleHandleW(nullptr), nullptr);
+		ApplyAuxFont(window, context->font);
 		PopulateAvProcessPicker(context);
 		SetFocus(context->list);
 		return 0;
@@ -2123,6 +2219,12 @@ LRESULT CALLBACK AvProcessPickerProc(HWND window, UINT message, WPARAM wParam, L
 		}
 		break;
 	case WM_CLOSE: DestroyWindow(window); return 0;
+	case WM_DESTROY:
+		if (context->font) {
+			DeleteObject(context->font);
+			context->font = nullptr;
+		}
+		return 0;
 	}
 	return DefWindowProcW(window, message, wParam, lParam);
 }
@@ -2144,15 +2246,12 @@ bool ChooseAvProcess(HWND owner, DWORD* processId, std::wstring* processName)
 	}
 	AvProcessPickerContext context;
 	context.owner = owner;
-	RECT work = {};
-	SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-	const int width = 620;
-	const int height = 450;
-	const int x = work.left + ((work.right - work.left) - width) / 2;
-	const int y = work.top + ((work.bottom - work.top) - height) / 2;
+	const int width = AuxPx(owner, 620);
+	const int height = AuxPx(owner, 450);
+	const POINT origin = AuxCenterOn(owner, width, height);
 	HWND window = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_APPWINDOW | WS_EX_TOPMOST, kAvProcessPickerClass,
 		L"选择运行进程", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-		x, y, width, height, owner, nullptr, GetModuleHandleW(nullptr), &context);
+		origin.x, origin.y, width, height, owner, nullptr, GetModuleHandleW(nullptr), &context);
 	if (!window) return false;
 	if (owner && IsWindowEnabled(owner)) EnableWindow(owner, FALSE);
 	ShowWindow(window, SW_SHOW);
@@ -2381,7 +2480,7 @@ LRESULT CALLBACK SamplePickerWindowProc(HWND window, UINT message, WPARAM wParam
 	switch (message) {
 	case WM_CREATE:
 	{
-		context->font = CreateFontW(-15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+		context->font = CreateFontW(-AuxPx(window, 15), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
 			DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
 			DEFAULT_PITCH, L"Microsoft YaHei UI");
 		context->pathEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
@@ -2411,9 +2510,9 @@ LRESULT CALLBACK SamplePickerWindowProc(HWND window, UINT message, WPARAM wParam
 			LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_CHECKBOXES);
 		LVCOLUMNW column = {};
 		column.mask = LVCF_TEXT | LVCF_WIDTH;
-		column.cx = 510; column.pszText = const_cast<LPWSTR>(L"名称");
+		column.cx = AuxPx(window, 510); column.pszText = const_cast<LPWSTR>(L"名称");
 		ListView_InsertColumn(context->list, 0, &column);
-		column.cx = 120; column.pszText = const_cast<LPWSTR>(L"类型");
+		column.cx = AuxPx(window, 120); column.pszText = const_cast<LPWSTR>(L"类型");
 		ListView_InsertColumn(context->list, 1, &column);
 
 		wchar_t modulePath[32768] = {};
@@ -2427,15 +2526,39 @@ LRESULT CALLBACK SamplePickerWindowProc(HWND window, UINT message, WPARAM wParam
 	{
 		const int width = LOWORD(lParam);
 		const int height = HIWORD(lParam);
-		MoveWindow(context->pathEdit, 16, 16, (std::max)(160, width - 190), 30, TRUE);
-		MoveWindow(GetDlgItem(window, IDC_SAMPLE_GO), width - 164, 16, 68, 30, TRUE);
-		MoveWindow(GetDlgItem(window, IDC_SAMPLE_UP), width - 88, 16, 72, 30, TRUE);
-		MoveWindow(context->list, 16, 58, width - 32, (std::max)(120, height - 136), TRUE);
-		MoveWindow(context->status, 18, height - 66, (std::max)(120, width - 330), 24, TRUE);
-		MoveWindow(GetDlgItem(window, IDC_SAMPLE_ALL), width - 306, height - 72, 94, 32, TRUE);
-		MoveWindow(GetDlgItem(window, IDC_SAMPLE_OK), width - 202, height - 72, 88, 32, TRUE);
-		MoveWindow(GetDlgItem(window, IDC_SAMPLE_CANCEL), width - 104, height - 72, 88, 32, TRUE);
+		MoveWindow(context->pathEdit, AuxPx(window, 16), AuxPx(window, 16),
+			(std::max)(AuxPx(window, 160), width - AuxPx(window, 190)), AuxPx(window, 30), TRUE);
+		MoveWindow(GetDlgItem(window, IDC_SAMPLE_GO), width - AuxPx(window, 164), AuxPx(window, 16),
+			AuxPx(window, 68), AuxPx(window, 30), TRUE);
+		MoveWindow(GetDlgItem(window, IDC_SAMPLE_UP), width - AuxPx(window, 88), AuxPx(window, 16),
+			AuxPx(window, 72), AuxPx(window, 30), TRUE);
+		MoveWindow(context->list, AuxPx(window, 16), AuxPx(window, 58), width - AuxPx(window, 32),
+			(std::max)(AuxPx(window, 120), height - AuxPx(window, 136)), TRUE);
+		MoveWindow(context->status, AuxPx(window, 18), height - AuxPx(window, 66),
+			(std::max)(AuxPx(window, 120), width - AuxPx(window, 330)), AuxPx(window, 24), TRUE);
+		MoveWindow(GetDlgItem(window, IDC_SAMPLE_ALL), width - AuxPx(window, 306), height - AuxPx(window, 72),
+			AuxPx(window, 94), AuxPx(window, 32), TRUE);
+		MoveWindow(GetDlgItem(window, IDC_SAMPLE_OK), width - AuxPx(window, 202), height - AuxPx(window, 72),
+			AuxPx(window, 88), AuxPx(window, 32), TRUE);
+		MoveWindow(GetDlgItem(window, IDC_SAMPLE_CANCEL), width - AuxPx(window, 104), height - AuxPx(window, 72),
+			AuxPx(window, 88), AuxPx(window, 32), TRUE);
 		return 0;
+	}
+	case WM_DPICHANGED:
+	{
+		// 拖到另一块屏：字号和列宽都要换。几何不自己算 —— 交给 DefWindowProc
+		// 按系统建议的矩形改尺寸，随后那条 WM_SIZE 会用新 DPI 重排。
+		HFONT replacement = CreateFontW(-AuxPx(window, 15), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+			DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+			DEFAULT_PITCH, L"Microsoft YaHei UI");
+		if (replacement) {
+			if (context->font) DeleteObject(context->font);
+			context->font = replacement;
+			ApplyAuxFont(window, context->font);
+		}
+		ListView_SetColumnWidth(context->list, 0, AuxPx(window, 510));
+		ListView_SetColumnWidth(context->list, 1, AuxPx(window, 120));
+		break;
 	}
 	case WM_COMMAND:
 		switch (LOWORD(wParam)) {
@@ -2530,12 +2653,11 @@ DWORD WINAPI ChooseExecutableSamplesThreadProc(LPVOID parameter)
 		return context->failure;
 	}
 
-	RECT workArea = {};
-	SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+	RECT workArea = AuxWorkArea(context->owner);
 	RECT ownerRect = workArea;
 	if (context->owner) GetWindowRect(context->owner, &ownerRect);
-	const int width = 760;
-	const int height = 540;
+	const int width = AuxPx(context->owner, 760);
+	const int height = AuxPx(context->owner, 540);
 	const int x = (std::max)(workArea.left,
 		(std::min)(workArea.right - width, ownerRect.left + (ownerRect.right - ownerRect.left - width) / 2));
 	const int y = (std::max)(workArea.top,
@@ -2781,7 +2903,7 @@ LRESULT CALLBACK LogSavePickerProc(HWND window, UINT message, WPARAM wParam, LPA
 	if (!context) return DefWindowProcW(window, message, wParam, lParam);
 	switch (message) {
 	case WM_CREATE: {
-		context->font = CreateFontW(-15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+		context->font = CreateFontW(-AuxPx(window, 15), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
 			DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
 			DEFAULT_PITCH, L"Microsoft YaHei UI");
 		context->pathEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
@@ -2815,9 +2937,9 @@ LRESULT CALLBACK LogSavePickerProc(HWND window, UINT message, WPARAM wParam, LPA
 		ListView_SetExtendedListViewStyle(context->list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
 		LVCOLUMNW column = {};
 		column.mask = LVCF_TEXT | LVCF_WIDTH;
-		column.cx = 520; column.pszText = const_cast<LPWSTR>(L"名称");
+		column.cx = AuxPx(window, 520); column.pszText = const_cast<LPWSTR>(L"名称");
 		ListView_InsertColumn(context->list, 0, &column);
-		column.cx = 120; column.pszText = const_cast<LPWSTR>(L"类型");
+		column.cx = AuxPx(window, 120); column.pszText = const_cast<LPWSTR>(L"类型");
 		ListView_InsertColumn(context->list, 1, &column);
 		wchar_t modulePath[32768] = {};
 		GetModuleFileNameW(nullptr, modulePath, _countof(modulePath));
@@ -2831,17 +2953,41 @@ LRESULT CALLBACK LogSavePickerProc(HWND window, UINT message, WPARAM wParam, LPA
 	case WM_SIZE: {
 		const int width = LOWORD(lParam);
 		const int height = HIWORD(lParam);
-		MoveWindow(context->pathEdit, 16, 16, (std::max)(160, width - 190), 30, TRUE);
-		MoveWindow(GetDlgItem(window, IDC_LOG_SAVE_GO), width - 164, 16, 68, 30, TRUE);
-		MoveWindow(GetDlgItem(window, IDC_LOG_SAVE_UP), width - 88, 16, 72, 30, TRUE);
-		MoveWindow(context->list, 16, 58, width - 32, (std::max)(120, height - 180), TRUE);
-		MoveWindow(context->status, 18, height - 150, width - 36, 24, TRUE);
-		MoveWindow(GetDlgItem(window, IDC_LOG_SAVE_LABEL), 18, height - 112, 48, 30, TRUE);
-		MoveWindow(GetDlgItem(window, IDC_LOG_SAVE_NAME), 72, height - 112, (std::max)(180, width - 440), 30, TRUE);
-		MoveWindow(GetDlgItem(window, IDC_LOG_SAVE_REFRESH), width - 350, height - 112, 78, 30, TRUE);
-		MoveWindow(GetDlgItem(window, IDC_LOG_SAVE_OK), width - 256, height - 112, 88, 30, TRUE);
-		MoveWindow(GetDlgItem(window, IDC_LOG_SAVE_CANCEL), width - 158, height - 112, 88, 30, TRUE);
+		MoveWindow(context->pathEdit, AuxPx(window, 16), AuxPx(window, 16),
+			(std::max)(AuxPx(window, 160), width - AuxPx(window, 190)), AuxPx(window, 30), TRUE);
+		MoveWindow(GetDlgItem(window, IDC_LOG_SAVE_GO), width - AuxPx(window, 164), AuxPx(window, 16),
+			AuxPx(window, 68), AuxPx(window, 30), TRUE);
+		MoveWindow(GetDlgItem(window, IDC_LOG_SAVE_UP), width - AuxPx(window, 88), AuxPx(window, 16),
+			AuxPx(window, 72), AuxPx(window, 30), TRUE);
+		MoveWindow(context->list, AuxPx(window, 16), AuxPx(window, 58), width - AuxPx(window, 32),
+			(std::max)(AuxPx(window, 120), height - AuxPx(window, 180)), TRUE);
+		MoveWindow(context->status, AuxPx(window, 18), height - AuxPx(window, 150),
+			width - AuxPx(window, 36), AuxPx(window, 24), TRUE);
+		MoveWindow(GetDlgItem(window, IDC_LOG_SAVE_LABEL), AuxPx(window, 18), height - AuxPx(window, 112),
+			AuxPx(window, 48), AuxPx(window, 30), TRUE);
+		MoveWindow(GetDlgItem(window, IDC_LOG_SAVE_NAME), AuxPx(window, 72), height - AuxPx(window, 112),
+			(std::max)(AuxPx(window, 180), width - AuxPx(window, 440)), AuxPx(window, 30), TRUE);
+		MoveWindow(GetDlgItem(window, IDC_LOG_SAVE_REFRESH), width - AuxPx(window, 350), height - AuxPx(window, 112),
+			AuxPx(window, 78), AuxPx(window, 30), TRUE);
+		MoveWindow(GetDlgItem(window, IDC_LOG_SAVE_OK), width - AuxPx(window, 256), height - AuxPx(window, 112),
+			AuxPx(window, 88), AuxPx(window, 30), TRUE);
+		MoveWindow(GetDlgItem(window, IDC_LOG_SAVE_CANCEL), width - AuxPx(window, 158), height - AuxPx(window, 112),
+			AuxPx(window, 88), AuxPx(window, 30), TRUE);
 		return 0;
+	}
+	case WM_DPICHANGED: {
+		// 同「录入版本样本」：换屏只换字号和列宽，几何交给 DefWindowProc。
+		HFONT replacement = CreateFontW(-AuxPx(window, 15), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+			DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+			DEFAULT_PITCH, L"Microsoft YaHei UI");
+		if (replacement) {
+			if (context->font) DeleteObject(context->font);
+			context->font = replacement;
+			ApplyAuxFont(window, context->font);
+		}
+		ListView_SetColumnWidth(context->list, 0, AuxPx(window, 520));
+		ListView_SetColumnWidth(context->list, 1, AuxPx(window, 120));
+		break;
 	}
 	case WM_COMMAND:
 		switch (LOWORD(wParam)) {
@@ -2910,12 +3056,11 @@ bool ChooseLogSavePath(HWND owner, std::wstring* path)
 	LogSavePickerContext context;
 	context.owner = owner;
 	context.initialName = *path;
-	RECT workArea = {};
-	SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+	RECT workArea = AuxWorkArea(owner);
 	RECT ownerRect = workArea;
 	if (owner) GetWindowRect(owner, &ownerRect);
-	const int width = 760;
-	const int height = 540;
+	const int width = AuxPx(owner, 760);
+	const int height = AuxPx(owner, 540);
 	const int x = (std::max)(workArea.left,
 		(std::min)(workArea.right - width, ownerRect.left + (ownerRect.right - ownerRect.left - width) / 2));
 	const int y = (std::max)(workArea.top,
@@ -3050,61 +3195,64 @@ void MediaPickerPaint(MediaPickerContext* context, HDC dc)
 {
 	RECT client{};
 	GetClientRect(context->window, &client);
+	// 这个窗口整块是固定像素画的，没有逻辑坐标系可借。所有字面量都是 96 DPI
+	// 下的数值，统一走 px() 换算 —— 换完仍然是物理像素，命中测试不用反算。
+	const auto px = [window = context->window](int value) { return AuxPx(window, value); };
 	HBRUSH background = CreateSolidBrush(RGB(245, 249, 247));
 	FillRect(dc, &client, background);
 	DeleteObject(background);
 
-	RECT header{ 0, 0, client.right, 72 };
+	RECT header{ 0, 0, client.right, px(72) };
 	HBRUSH headerBrush = CreateSolidBrush(RGB(24, 50, 44));
 	FillRect(dc, &header, headerBrush);
 	DeleteObject(headerBrush);
 	SetBkMode(dc, TRANSPARENT);
 	SetTextColor(dc, RGB(255, 255, 255));
 	HFONT oldTitle = static_cast<HFONT>(SelectObject(dc, context->titleFont));
-	RECT title{ 22, 15, client.right - 22, 40 };
+	RECT title{ px(22), px(15), client.right - px(22), px(40) };
 	DrawTextW(dc, context->image ? L"选择图片" : L"选择视频", -1, &title, DT_SINGLELINE | DT_VCENTER);
 	SelectObject(dc, oldTitle);
 	SetTextColor(dc, RGB(197, 222, 214));
 	HFONT oldFont = static_cast<HFONT>(SelectObject(dc, context->font));
-	RECT subtitle{ 22, 42, client.right - 22, 64 };
+	RECT subtitle{ px(22), px(42), client.right - px(22), px(64) };
 	DrawTextW(dc, context->image ? L"BMP / JPG / PNG" : L"MP4 / WMV / AVI / MOV / MKV", -1, &subtitle, DT_SINGLELINE | DT_VCENTER);
 
-	RECT path{ 22, 90, client.right - 122, 122 };
+	RECT path{ px(22), px(90), client.right - px(122), px(122) };
 	HBRUSH pathBrush = CreateSolidBrush(RGB(255, 255, 255));
 	FillRect(dc, &path, pathBrush);
 	DeleteObject(pathBrush);
 	FrameRect(dc, &path, static_cast<HBRUSH>(GetStockObject(LTGRAY_BRUSH)));
 	SetTextColor(dc, RGB(53, 67, 62));
-	RECT pathText{ path.left + 10, path.top, path.right - 10, path.bottom };
+	RECT pathText{ path.left + px(10), path.top, path.right - px(10), path.bottom };
 	const wchar_t* location = context->currentDirectory.empty() ? L"此电脑" : context->currentDirectory.c_str();
 	DrawTextW(dc, location, -1, &pathText, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-	context->upRect = { client.right - 108, 90, client.right - 22, 122 };
+	context->upRect = { client.right - px(108), px(90), client.right - px(22), px(122) };
 	MediaPickerDrawButton(dc, context->upRect, L"上一级", false, context->font);
 
-	context->listRect = { 22, 140, client.right - 22, client.bottom - 76 };
+	context->listRect = { px(22), px(140), client.right - px(22), client.bottom - px(76) };
 	HBRUSH listBrush = CreateSolidBrush(RGB(255, 255, 255));
 	FillRect(dc, &context->listRect, listBrush);
 	DeleteObject(listBrush);
 	FrameRect(dc, &context->listRect, static_cast<HBRUSH>(GetStockObject(LTGRAY_BRUSH)));
-	const int rowHeight = 32;
+	const int rowHeight = px(32);
 	const int visibleRows = (std::max)(1, static_cast<int>((context->listRect.bottom - context->listRect.top) / rowHeight));
 	const int first = (std::min)(context->scrollOffset, (std::max)(0, static_cast<int>(context->entries.size()) - visibleRows));
 	context->scrollOffset = first;
 	for (int slot = 0; slot < visibleRows; ++slot) {
 		const int index = first + slot;
 		if (index >= static_cast<int>(context->entries.size())) break;
-		RECT row{ context->listRect.left + 1, context->listRect.top + slot * rowHeight + 1,
-			context->listRect.right - 1, context->listRect.top + (slot + 1) * rowHeight };
+		RECT row{ context->listRect.left + px(1), context->listRect.top + slot * rowHeight + px(1),
+			context->listRect.right - px(1), context->listRect.top + (slot + 1) * rowHeight };
 		if (index == context->selectedIndex) {
 			HBRUSH selectedBrush = CreateSolidBrush(RGB(216, 238, 231));
 			FillRect(dc, &row, selectedBrush);
 			DeleteObject(selectedBrush);
 		}
 		SetTextColor(dc, context->entries[index].directory ? RGB(0, 98, 84) : RGB(53, 67, 62));
-		RECT name{ row.left + 12, row.top, row.right - 110, row.bottom };
+		RECT name{ row.left + px(12), row.top, row.right - px(110), row.bottom };
 		DrawTextW(dc, context->entries[index].name.c_str(), -1, &name, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 		SetTextColor(dc, RGB(112, 125, 120));
-		RECT type{ row.right - 96, row.top, row.right - 12, row.bottom };
+		RECT type{ row.right - px(96), row.top, row.right - px(12), row.bottom };
 		DrawTextW(dc, context->entries[index].directory ? L"文件夹" : L"媒体文件", -1, &type, DT_SINGLELINE | DT_VCENTER | DT_RIGHT);
 	}
 	if (context->entries.empty()) {
@@ -3113,12 +3261,12 @@ void MediaPickerPaint(MediaPickerContext* context, HDC dc)
 		DrawTextW(dc, L"此位置没有可选文件", -1, &empty, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
 	}
 
-	context->cancelRect = { client.right - 118, client.bottom - 54, client.right - 22, client.bottom - 20 };
-	context->useRect = { client.right - 224, client.bottom - 54, client.right - 128, client.bottom - 20 };
+	context->cancelRect = { client.right - px(118), client.bottom - px(54), client.right - px(22), client.bottom - px(20) };
+	context->useRect = { client.right - px(224), client.bottom - px(54), client.right - px(128), client.bottom - px(20) };
 	MediaPickerDrawButton(dc, context->useRect, L"使用文件", true, context->font);
 	MediaPickerDrawButton(dc, context->cancelRect, L"取消", false, context->font);
 	SetTextColor(dc, RGB(86, 101, 95));
-	RECT hint{ 22, client.bottom - 54, client.right - 238, client.bottom - 20 };
+	RECT hint{ px(22), client.bottom - px(54), client.right - px(238), client.bottom - px(20) };
 	DrawTextW(dc, L"双击文件夹进入，双击媒体文件选择", -1, &hint, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 	SelectObject(dc, oldFont);
 }
@@ -3148,9 +3296,9 @@ LRESULT CALLBACK MediaPickerProc(HWND window, UINT message, WPARAM wParam, LPARA
 	if (!context) return DefWindowProcW(window, message, wParam, lParam);
 	switch (message) {
 	case WM_CREATE:
-		context->font = CreateFontW(-15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+		context->font = CreateFontW(-AuxPx(window, 15), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
 			OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
-		context->titleFont = CreateFontW(-20, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+		context->titleFont = CreateFontW(-AuxPx(window, 20), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
 			OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
 		{
 			wchar_t modulePath[32768] = {};
@@ -3188,7 +3336,8 @@ LRESULT CALLBACK MediaPickerProc(HWND window, UINT message, WPARAM wParam, LPARA
 		if (PtInRect(&context->useRect, point)) { MediaPickerAccept(context); return 0; }
 		if (PtInRect(&context->cancelRect, point)) { DestroyWindow(window); return 0; }
 		if (PtInRect(&context->listRect, point)) {
-			const int row = (point.y - context->listRect.top) / 32;
+			const int rowHeight = AuxPx(window, 32);
+			const int row = rowHeight > 0 ? (point.y - context->listRect.top) / rowHeight : -1;
 			const int index = context->scrollOffset + row;
 			if (index >= 0 && index < static_cast<int>(context->entries.size())) {
 				context->selectedIndex = index;
@@ -3197,6 +3346,23 @@ LRESULT CALLBACK MediaPickerProc(HWND window, UINT message, WPARAM wParam, LPARA
 			}
 			return 0;
 		}
+		break;
+	}
+	case WM_DPICHANGED: {
+		// 几何全在 WM_PAINT 里按 AuxPx 现算，换屏只要把两档字号换掉。
+		HFONT replacement = CreateFontW(-AuxPx(window, 15), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+			OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
+		HFONT replacementTitle = CreateFontW(-AuxPx(window, 20), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+			OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
+		if (replacement) {
+			if (context->font) DeleteObject(context->font);
+			context->font = replacement;
+		}
+		if (replacementTitle) {
+			if (context->titleFont) DeleteObject(context->titleFont);
+			context->titleFont = replacementTitle;
+		}
+		InvalidateRect(window, nullptr, TRUE);
 		break;
 	}
 	case WM_CLOSE: DestroyWindow(window); return 0;
@@ -3232,15 +3398,12 @@ bool ChooseMediaPath(HWND owner, bool image, std::wstring* path)
 	MediaPickerContext context;
 	context.owner = owner;
 	context.image = image;
-	RECT work{};
-	SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-	const int width = 720;
-	const int height = 560;
-	const int x = work.left + ((work.right - work.left) - width) / 2;
-	const int y = work.top + ((work.bottom - work.top) - height) / 2;
+	const int width = AuxPx(owner, 720);
+	const int height = AuxPx(owner, 560);
+	const POINT origin = AuxCenterOn(owner, width, height);
 	HWND window = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_APPWINDOW | WS_EX_TOPMOST, kMediaPickerClass,
 		image ? L"选择图片" : L"选择视频", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_SIZEBOX,
-		x, y, width, height, owner, nullptr, JTAppGetInstanceDirect(), &context);
+		origin.x, origin.y, width, height, owner, nullptr, JTAppGetInstanceDirect(), &context);
 	if (!window) return false;
 	const BOOL ownerWasEnabled = owner && IsWindowEnabled(owner);
 	if (ownerWasEnabled) EnableWindow(owner, FALSE);
