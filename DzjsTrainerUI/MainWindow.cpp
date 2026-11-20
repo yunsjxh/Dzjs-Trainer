@@ -3199,6 +3199,9 @@ bool ChooseMediaPath(HWND owner, bool image, std::wstring* path)
 	if (!registered) {
 		WNDCLASSEXW windowClass{};
 		windowClass.cbSize = sizeof(windowClass);
+		// 列表是自绘的，进入子目录/选中媒体全靠 WM_LBUTTONDBLCLK；
+		// 不注册 CS_DBLCLKS 时系统只发两次 WM_LBUTTONDOWN，双击永远进不去下一级。
+		windowClass.style = CS_DBLCLKS;
 		windowClass.lpfnWndProc = MediaPickerProc;
 		windowClass.hInstance = JTAppGetInstanceDirect();
 		windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
@@ -3278,6 +3281,8 @@ std::wstring StripMarkup(LPCWSTR input) {
 struct TeacherWindowSearch {
 	DWORD processId = 0;
 	HWND window = nullptr;
+	// 独立运行模式下要把控制台留着给用户看，不能再扫一遍藏起来。
+	bool hideConsole = true;
 };
 
 BOOL CALLBACK FindTeacherWindow(HWND hwnd, LPARAM parameter)
@@ -3291,9 +3296,9 @@ BOOL CALLBACK FindTeacherWindow(HWND hwnd, LPARAM parameter)
 		return TRUE;
 	// JiYuTeacherGui is a console-subsystem executable. Its console is not part
 	// of the teacher UI and must never become visible beside the embedded FLTK
-	// window, even when it was created before CREATE_NO_WINDOW took effect.
+	// window, even if it ignored the hidden STARTUPINFO show state.
 	if (lstrcmpW(className, L"ConsoleWindowClass") == 0) {
-		ShowWindow(hwnd, SW_HIDE);
+		if (search->hideConsole) ShowWindow(hwnd, SW_HIDE);
 		return TRUE;
 	}
 	if (search->window || lstrcmpW(className, L"FLTK") != 0 || GetWindow(hwnd, GW_OWNER) != nullptr)
@@ -3301,6 +3306,35 @@ BOOL CALLBACK FindTeacherWindow(HWND hwnd, LPARAM parameter)
 	RECT client{};
 	if (GetClientRect(hwnd, &client) && client.right >= 320 && client.bottom >= 200) {
 		search->window = hwnd;
+	}
+	return TRUE;
+}
+
+struct TeacherStandaloneSearch {
+	DWORD processId = 0;
+	HWND console = nullptr;
+	HWND other = nullptr;
+};
+
+// 没等到 FLTK 窗口时用：优先把控制台翻出来（Python 版只有控制台），
+// 没有控制台就找教师端自己的顶层窗口。只认无主窗口，子窗口不碰。
+BOOL CALLBACK FindStandaloneTeacherWindow(HWND hwnd, LPARAM parameter)
+{
+	auto* search = reinterpret_cast<TeacherStandaloneSearch*>(parameter);
+	if (!search) return TRUE;
+	DWORD pid = 0;
+	GetWindowThreadProcessId(hwnd, &pid);
+	if (pid != search->processId || GetWindow(hwnd, GW_OWNER) != nullptr) return TRUE;
+	wchar_t className[64]{};
+	if (GetClassNameW(hwnd, className, _countof(className)) == 0) return TRUE;
+	if (lstrcmpW(className, L"ConsoleWindowClass") == 0) {
+		if (!search->console) search->console = hwnd;
+		return TRUE;
+	}
+	if (!search->other) {
+		RECT client{};
+		if (GetClientRect(hwnd, &client) && client.right >= 160 && client.bottom >= 80)
+			search->other = hwnd;
 	}
 	return TRUE;
 }
@@ -8755,8 +8789,9 @@ bool MainWindow::AttachEmbeddedTeacherGui()
 	SetWindowPos(teacherChildWindow, HWND_TOP, 0, 0, 0, 0,
 		SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 	ShowWindow(teacherChildWindow, SW_SHOW);
-	SetWindowTextW(teacherLaunchButton, L"\u5173\u95ed\u6559\u5e08\u7aef");
+	SetWindowTextW(teacherLaunchButton, L"关闭教师端");
 	teacherLaunchPending = false;
+	teacherStandalone = false;
 	teacherLaunchDeadline = 0;
 	LayoutEmbeddedTeacherGui();
 	AppendNetworkResult(L"\u6559\u5e08\u7aef\u5df2\u5d4c\u5165\u5230\u7f51\u7edc\u5de5\u5177");
@@ -8800,8 +8835,10 @@ void MainWindow::LaunchEmbeddedTeacherGui()
 	startup.dwFlags = STARTF_USESHOWWINDOW;
 	startup.wShowWindow = SW_HIDE;
 	PROCESS_INFORMATION process{};
+	// 不再用 CREATE_NO_WINDOW：那样连控制台都不创建，嵌入失败后没有窗口能交给
+	// 用户。改成创建一个隐藏的控制台，嵌入成功就扫掉，失败就把它显示出来。
 	if (!CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE,
-		CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW, nullptr, workingDirectory.c_str(), &startup, &process)) {
+		CREATE_NEW_PROCESS_GROUP, nullptr, workingDirectory.c_str(), &startup, &process)) {
 		MessageBoxW(_hWnd, L"\u542f\u52a8\u6559\u5e08\u7aef\u5931\u8d25\uff0c\u8bf7\u68c0\u67e5 TeacherEndpoint \u6587\u4ef6\u548c\u4f9d\u8d56\u5e93\u3002", L"\u7f51\u7edc\u5de5\u5177", MB_OK | MB_ICONERROR);
 		return;
 	}
@@ -8815,9 +8852,35 @@ void MainWindow::LaunchEmbeddedTeacherGui()
 	AttachEmbeddedTeacherGui();
 }
 
+void MainWindow::EnterStandaloneTeacherGui()
+{
+	teacherLaunchPending = false;
+	teacherLaunchDeadline = 0;
+	teacherStandalone = true;
+	TeacherStandaloneSearch search{ teacherProcessId, nullptr, nullptr };
+	EnumWindows(FindStandaloneTeacherWindow, reinterpret_cast<LPARAM>(&search));
+	HWND target = search.console ? search.console : search.other;
+	if (target) {
+		ShowWindow(target, SW_SHOW);
+		SetForegroundWindow(target);
+	}
+	if (teacherLaunchButton) SetWindowTextW(teacherLaunchButton, L"关闭教师端");
+	AppendNetworkResult(target
+		? L"教师端没有 FLTK 窗口，已改为独立窗口运行"
+		: L"教师端没有可嵌入的 FLTK 窗口，已在后台独立运行（没有可见窗口）");
+	InvalidateRect(_hWnd, nullptr, FALSE);
+}
+
 void MainWindow::StopEmbeddedTeacherGui()
 {
 	if (teacherChildWindow && IsWindow(teacherChildWindow)) PostMessageW(teacherChildWindow, WM_CLOSE, 0, 0);
+	if (teacherStandalone && teacherProcessId) {
+		// 独立运行的是它自己的窗口，先让它自己收尾，关不掉再结束进程。
+		TeacherStandaloneSearch search{ teacherProcessId, nullptr, nullptr };
+		EnumWindows(FindStandaloneTeacherWindow, reinterpret_cast<LPARAM>(&search));
+		HWND target = search.console ? search.console : search.other;
+		if (target) PostMessageW(target, WM_CLOSE, 0, 0);
+	}
 	if (teacherProcess) {
 		if (WaitForSingleObject(teacherProcess, 1200) == WAIT_TIMEOUT)
 			TerminateProcess(teacherProcess, 0);
@@ -8828,8 +8891,9 @@ void MainWindow::StopEmbeddedTeacherGui()
 	teacherProcessId = 0;
 	teacherChildWindow = nullptr;
 	teacherLaunchPending = false;
+	teacherStandalone = false;
 	teacherLaunchDeadline = 0;
-	if (teacherLaunchButton) SetWindowTextW(teacherLaunchButton, L"\u542f\u52a8\u6559\u5e08\u7aef");
+	if (teacherLaunchButton) SetWindowTextW(teacherLaunchButton, L"启动教师端");
 	InvalidateRect(_hWnd, nullptr, FALSE);
 }
 
@@ -8843,15 +8907,17 @@ void MainWindow::PollEmbeddedTeacherGui()
 		teacherProcessId = 0;
 		teacherChildWindow = nullptr;
 		teacherLaunchPending = false;
+		teacherStandalone = false;
 		teacherLaunchDeadline = 0;
-		if (teacherLaunchButton) SetWindowTextW(teacherLaunchButton, L"\u542f\u52a8\u6559\u5e08\u7aef");
-		AppendNetworkResult(L"\u6559\u5e08\u7aef\u5df2\u9000\u51fa");
+		if (teacherLaunchButton) SetWindowTextW(teacherLaunchButton, L"启动教师端");
+		AppendNetworkResult(L"教师端已退出");
 		InvalidateRect(_hWnd, nullptr, FALSE);
 		return;
 	}
 	// The endpoint can create its console after the FLTK window. Sweep on every
 	// timer tick so a late console cannot remain visible after embedding.
-	TeacherWindowSearch consoleSweep{ teacherProcessId, nullptr };
+	// 独立运行时反过来，控制台是用户唯一能操作的窗口，必须留着。
+	TeacherWindowSearch consoleSweep{ teacherProcessId, nullptr, !teacherStandalone };
 	EnumWindows(FindTeacherWindow, reinterpret_cast<LPARAM>(&consoleSweep));
 	if (teacherChildWindow && !IsWindow(teacherChildWindow)) {
 		teacherChildWindow = nullptr;
@@ -8861,9 +8927,10 @@ void MainWindow::PollEmbeddedTeacherGui()
 	if (!teacherChildWindow) {
 		if (AttachEmbeddedTeacherGui()) return;
 		if (teacherLaunchPending && teacherLaunchDeadline && GetTickCount64() >= teacherLaunchDeadline) {
-			StopEmbeddedTeacherGui();
-			AppendNetworkResult(L"\u6559\u5e08\u7aef\u7a97\u53e3\u521b\u5efa\u8d85\u65f6");
-			ShowFastTip(L"\u6559\u5e08\u7aef\u542f\u52a8\u8d85\u65f6");
+			// 不再 TerminateProcess：非 FLTK 的教师端（公开的 Python 版）根本没有
+			// FLTK 窗口，杀掉它等于把唯一能用的界面也一起收走。
+			EnterStandaloneTeacherGui();
+			ShowFastTip(L"教师端未提供可嵌入窗口，已独立运行");
 		}
 		return;
 	}

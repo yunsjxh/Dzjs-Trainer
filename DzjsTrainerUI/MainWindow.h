@@ -143,6 +143,8 @@ private:
 	DWORD teacherProcessId = 0;
 	HWND teacherChildWindow = nullptr;
 	bool teacherLaunchPending = false;
+	// 没等到 FLTK 窗口时不再杀进程，而是让教师端以自己的窗口独立运行。
+	bool teacherStandalone = false;
 	ULONGLONG teacherLaunchDeadline = 0;
 	HWND teacherRefreshButton = nullptr;
 	HWND teacherViewButton = nullptr;
@@ -481,6 +483,7 @@ private:
 	void StopEmbeddedTeacherGui();
 	void PollEmbeddedTeacherGui();
 	bool AttachEmbeddedTeacherGui();
+	void EnterStandaloneTeacherGui();
 	void LayoutEmbeddedTeacherGui();
 	void StartTeacherService();
 	void StopTeacherService();
