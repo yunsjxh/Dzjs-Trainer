@@ -3428,8 +3428,19 @@ MainWindow::MainWindow()
 	uiScale = static_cast<float>(QueryWindowDpi(nullptr)) / 96.0f;
 	RECT desired{ 0, 0, ToPhysical(1120), ToPhysical(760) };
 	AdjustWindowRectEx(&desired, WS_OVERLAPPEDWINDOW, FALSE, 0);
+	int windowWidth = desired.right - desired.left;
+	int windowHeight = desired.bottom - desired.top;
+	// 150% 的 1080p 上，逻辑 1120×760 换算是 1680×1140，比屏幕还高。
+	// 夹到工作区，宁可让页面内容挤一点，也不要开出来就有一截在屏幕外。
+	RECT work{};
+	if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0)) {
+		const int workWidth = work.right - work.left;
+		const int workHeight = work.bottom - work.top;
+		if (workWidth > 0) windowWidth = (std::min)(windowWidth, workWidth);
+		if (workHeight > 0) windowHeight = (std::min)(windowHeight, workHeight);
+	}
 	_hWnd = CreateWindowExW(0, MAIN_WND_CLS_NAME, MAIN_WND_NAME, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-		CW_USEDEFAULT, CW_USEDEFAULT, desired.right - desired.left, desired.bottom - desired.top,
+		CW_USEDEFAULT, CW_USEDEFAULT, windowWidth, windowHeight,
 		nullptr, nullptr, JTAppGetInstanceDirect(), this);
 	if (!_hWnd) return;
 
@@ -3787,7 +3798,19 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 	case WM_GETMINMAXINFO: {
 		auto info = reinterpret_cast<MINMAXINFO*>(lParam);
 		// 和默认客户区一样按逻辑像素写，换算成物理像素交给系统。
-		info->ptMinTrackSize = { self->ToPhysical(960), self->ToPhysical(760) };
+		int minWidth = self->ToPhysical(960);
+		int minHeight = self->ToPhysical(760);
+		// 高缩放下这两个值可能超过屏幕（150% 时最小高就是 1140），窗口会被
+		// 顶到屏幕外、底部永远看不见。上限夹到当前显示器工作区。
+		MONITORINFO monitor{};
+		monitor.cbSize = sizeof(monitor);
+		if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &monitor)) {
+			const int workWidth = monitor.rcWork.right - monitor.rcWork.left;
+			const int workHeight = monitor.rcWork.bottom - monitor.rcWork.top;
+			if (workWidth > 0) minWidth = (std::min)(minWidth, workWidth);
+			if (workHeight > 0) minHeight = (std::min)(minHeight, workHeight);
+		}
+		info->ptMinTrackSize = { minWidth, minHeight };
 		return 0;
 	}
 	case WM_DPICHANGED: {
@@ -8497,7 +8520,9 @@ void MainWindow::CreateNetworkControls()
 	controlSurfaceBrush = CreateSolidBrush(darkMode ? RGB(38, 45, 42) : RGB(255, 255, 255));
 	advancedFieldBrush = CreateSolidBrush(darkMode ? RGB(26, 33, 30) : RGB(255, 255, 255));
 	processPickerFieldBrush = CreateSolidBrush(darkMode ? RGB(26, 33, 30) : RGB(255, 255, 255));
-	controlFont = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+	// 像素高度必须跟着当前 DPI 走：RebuildControlFont 只在 WM_DPICHANGED 里调用，
+	// 首帧若还是写死 -14，150% 下原生控件里的字会明显比周边自绘文字小一圈。
+	controlFont = CreateFontW(-ToPhysical(14), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
 		OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
 		DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
 	auto make = [this](int index, LPCWSTR cls, LPCWSTR text, DWORD style, int id, DWORD exStyle = 0) {
