@@ -707,7 +707,10 @@ constexpr UINT WM_COPYGLOBALDATA_COMPAT = 0x0049;
 constexpr UINT TIMER_ANIMATION = 20;
 // 服务轮询和动画分开：轮询 5 次/秒足够，动画只在有东西在动时才跑 60 帧。
 constexpr UINT TIMER_SERVICE_POLL = 23;
-constexpr UINT TIMER_TRAY_REPAIR = 21;
+// 托盘修复原来和 TIMER_RERUN 都写了 21：SetTimer 互相顶掉，WM_TIMER 里先命中的
+// 是 TIMER_RERUN 分支，修复分支永远走不到；更糟的是首次显示排的 2 秒修复会在
+// 两秒后当成「重跑」调用一次 RunOperation。这里独占一个号。
+constexpr UINT TIMER_TRAY_REPAIR = 25;
 constexpr UINT TIMER_RERUN = 21;
 constexpr UINT TIMER_AUTO_SHUT = 22;
 // 更新替换完成后停一下再退出，让「更新完成」这一帧留得住。
@@ -1281,7 +1284,9 @@ LRESULT CALLBACK AvTextPromptProc(HWND window, UINT message, WPARAM wParam, LPAR
 		SetFocus(context->edit);
 		return 0;
 	case WM_COMMAND:
-		if (LOWORD(wParam) == IDC_AV_PROMPT_OK) {
+		// IDOK / IDCANCEL 来自 IsDialogMessage：回车和 Esc 走的是这两个命令，
+		// 不接就等于那两个键完全没反应。
+		if (LOWORD(wParam) == IDC_AV_PROMPT_OK || LOWORD(wParam) == IDOK) {
 			wchar_t buffer[2048] = {};
 			GetWindowTextW(context->edit, buffer, _countof(buffer));
 			context->value = buffer;
@@ -1289,7 +1294,7 @@ LRESULT CALLBACK AvTextPromptProc(HWND window, UINT message, WPARAM wParam, LPAR
 			DestroyWindow(window);
 			return 0;
 		}
-		if (LOWORD(wParam) == IDC_AV_PROMPT_CANCEL) { DestroyWindow(window); return 0; }
+		if (LOWORD(wParam) == IDC_AV_PROMPT_CANCEL || LOWORD(wParam) == IDCANCEL) { DestroyWindow(window); return 0; }
 		break;
 	case WM_CLOSE: DestroyWindow(window); return 0;
 	case WM_DESTROY:
@@ -1334,8 +1339,12 @@ bool PromptAvText(HWND owner, LPCWSTR title, LPCWSTR prompt, std::wstring* value
 	UpdateWindow(window);
 	MSG message = {};
 	while (IsWindow(window) && GetMessageW(&message, nullptr, 0, 0) > 0) {
-		TranslateMessage(&message);
-		DispatchMessageW(&message);
+		// 和其它几个选择器一致：Tab 在控件间走、Esc 发 IDCANCEL、回车发 IDOK。
+		// 多行编辑框自己会吃掉回车，所以这里不会把换行抢走。
+		if (!IsDialogMessageW(window, &message)) {
+			TranslateMessage(&message);
+			DispatchMessageW(&message);
+		}
 	}
 	if (owner && IsWindow(owner)) { EnableWindow(owner, TRUE); SetForegroundWindow(owner); }
 	if (!context.accepted) return false;
@@ -2208,8 +2217,8 @@ LRESULT CALLBACK AvProcessPickerProc(HWND window, UINT message, WPARAM wParam, L
 	}
 	case WM_COMMAND:
 		if (LOWORD(wParam) == IDC_AV_PROCESS_REFRESH) { PopulateAvProcessPicker(context); return 0; }
-		if (LOWORD(wParam) == IDC_AV_PROCESS_OK) { AcceptAvProcessSelection(context); return 0; }
-		if (LOWORD(wParam) == IDC_AV_PROCESS_CANCEL) { DestroyWindow(window); return 0; }
+		if (LOWORD(wParam) == IDC_AV_PROCESS_OK || LOWORD(wParam) == IDOK) { AcceptAvProcessSelection(context); return 0; }
+		if (LOWORD(wParam) == IDC_AV_PROCESS_CANCEL || LOWORD(wParam) == IDCANCEL) { DestroyWindow(window); return 0; }
 		break;
 	case WM_NOTIFY:
 		if (reinterpret_cast<NMHDR*>(lParam)->idFrom == IDC_AV_PROCESS_LIST &&
@@ -2595,9 +2604,11 @@ LRESULT CALLBACK SamplePickerWindowProc(HWND window, UINT message, WPARAM wParam
 			return 0;
 		}
 		case IDC_SAMPLE_OK:
+		case IDOK:
 			CompleteSamplePickerSelection(context);
 			return 0;
 		case IDC_SAMPLE_CANCEL:
+		case IDCANCEL:
 			context->result = SampleDialogResult::Cancelled;
 			DestroyWindow(window);
 			return 0;
@@ -3009,8 +3020,14 @@ LRESULT CALLBACK LogSavePickerProc(HWND window, UINT message, WPARAM wParam, LPA
 			return 0;
 		}
 		case IDC_LOG_SAVE_REFRESH: NavigateLogSavePicker(context, context->currentDirectory); return 0;
-		case IDC_LOG_SAVE_OK: AcceptLogSavePicker(context); return 0;
-		case IDC_LOG_SAVE_CANCEL: DestroyWindow(window); return 0;
+		case IDC_LOG_SAVE_OK:
+		case IDOK:
+			AcceptLogSavePicker(context);
+			return 0;
+		case IDC_LOG_SAVE_CANCEL:
+		case IDCANCEL:
+			DestroyWindow(window);
+			return 0;
 		}
 		break;
 	case WM_NOTIFY:
@@ -3315,6 +3332,10 @@ LRESULT CALLBACK MediaPickerProc(HWND window, UINT message, WPARAM wParam, LPARA
 		EndPaint(window, &paint);
 		return 0;
 	}
+	case WM_KEYDOWN:
+		// 这个窗口没有原生控件，Esc 只能自己接。
+		if (wParam == VK_ESCAPE) { DestroyWindow(window); return 0; }
+		break;
 	case WM_MOUSEWHEEL: {
 		const int notches = GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA;
 		context->scrollOffset = (std::max)(0, context->scrollOffset - notches * 3);
@@ -3324,7 +3345,8 @@ LRESULT CALLBACK MediaPickerProc(HWND window, UINT message, WPARAM wParam, LPARA
 	case WM_LBUTTONDOWN:
 	case WM_LBUTTONDBLCLK: {
 		POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-		if (PtInRect(&context->upRect, point)) {
+		// 按钮只认「按下」：双击的第三次消息会再走一遍，双击「上一级」会一次退两级。
+		if (message == WM_LBUTTONDOWN && PtInRect(&context->upRect, point)) {
 			if (context->currentDirectory.empty()) MediaPickerNavigate(context, L"");
 			else if (context->currentDirectory.size() <= 3 && context->currentDirectory[1] == L':') MediaPickerNavigate(context, L"");
 			else {
@@ -3333,8 +3355,8 @@ LRESULT CALLBACK MediaPickerProc(HWND window, UINT message, WPARAM wParam, LPARA
 			}
 			return 0;
 		}
-		if (PtInRect(&context->useRect, point)) { MediaPickerAccept(context); return 0; }
-		if (PtInRect(&context->cancelRect, point)) { DestroyWindow(window); return 0; }
+		if (message == WM_LBUTTONDOWN && PtInRect(&context->useRect, point)) { MediaPickerAccept(context); return 0; }
+		if (message == WM_LBUTTONDOWN && PtInRect(&context->cancelRect, point)) { DestroyWindow(window); return 0; }
 		if (PtInRect(&context->listRect, point)) {
 			const int rowHeight = AuxPx(window, 32);
 			const int row = rowHeight > 0 ? (point.y - context->listRect.top) / rowHeight : -1;
@@ -3410,6 +3432,9 @@ bool ChooseMediaPath(HWND owner, bool image, std::wstring* path)
 	ShowWindow(window, SW_SHOW);
 	UpdateWindow(window);
 	SetForegroundWindow(window);
+	// 焦点要落在窗口上：滚轮和键盘都只投给焦点窗口，靠点一下才拿到焦点的话
+	// 打开后先用滚轮是没有反应的。
+	SetFocus(window);
 	MSG message{};
 	while (IsWindow(window) && GetMessageW(&message, nullptr, 0, 0) > 0) {
 		TranslateMessage(&message);
@@ -8721,8 +8746,10 @@ void MainWindow::CreateNetworkControls()
 		0, 0, 10, 10, _hWnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TEACHER_REFRESH)), JTAppGetInstanceDirect(), nullptr);
 	teacherViewButton = CreateWindowExW(0, L"BUTTON", L"\u5b9e\u65f6\u753b\u9762", WS_CHILD | WS_TABSTOP | BS_OWNERDRAW,
 		0, 0, 10, 10, _hWnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TEACHER_VIEW)), JTAppGetInstanceDirect(), nullptr);
+	// LBS_NOTIFY 不能省：没有它 LBN_SELCHANGE 根本不会发，点选学生后
+	// selected_ip 一直是旧值，「实时画面」要等下一次刷新列表才跟上。
 	teacherStudentList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
-		WS_CHILD | WS_TABSTOP | LBS_NOINTEGRALHEIGHT | WS_VSCROLL,
+		WS_CHILD | WS_TABSTOP | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL,
 		0, 0, 10, 10, _hWnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TEACHER_STUDENTS)), JTAppGetInstanceDirect(), nullptr);
 	teacherChatInput = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"\u8bf7\u8ba4\u771f\u542c\u8bfe", WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL,
 		0, 0, 10, 10, _hWnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TEACHER_CHAT_INPUT)), JTAppGetInstanceDirect(), nullptr);
@@ -9620,7 +9647,11 @@ void MainWindow::OnWmCommand(WPARAM wParam)
 		LaunchEmbeddedTeacherGui();
 		return;
 	}
-	if ((command >= IDC_TEACHER_REFRESH && command <= IDC_TEACHER_REBOOT) || command == IDC_TEACHER_VIEW || command == IDC_TEACHER_CHAT_SEND) {
+	// 区块里混着聊天输入框的 IDC_TEACHER_CHAT_INPUT：不过滤通知码的话，
+	// 每敲一个字都会当成一次按钮命令，服务没开时结果栏会被「请先启动教师服务」刷满。
+	if (HIWORD(wParam) == BN_CLICKED &&
+		((command >= IDC_TEACHER_REFRESH && command <= IDC_TEACHER_REBOOT) ||
+			command == IDC_TEACHER_VIEW || command == IDC_TEACHER_CHAT_SEND)) {
 		HandleTeacherCommand(command);
 		return;
 	}
