@@ -1482,7 +1482,7 @@ int TrainerWorkerInternal::GetEduHostCount()
 // 进程）不会把同一句话重复几遍。
 std::wstring TrainerWorkerInternal::GetEduHostSummary()
 {
-	struct Group { std::wstring name; int count = 0; };
+	struct Group { std::wstring name; int count = 0; std::list<std::wstring> processes; };
 	std::list<Group> groups;
 	for (const auto& item : _CustomInjected) {
 		if (item.product.empty()) continue;
@@ -1493,18 +1493,41 @@ std::wstring TrainerWorkerInternal::GetEduHostSummary()
 			Group group;
 			group.name = item.product;
 			group.count = 1;
+			group.processes.push_back(item.name);
 			groups.push_back(group);
 		}
 		else {
 			++it->count;
+			bool seen = false;
+			for (const auto& existing : it->processes)
+				if (_wcsicmp(existing.c_str(), item.name.c_str()) == 0) { seen = true; break; }
+			if (!seen) it->processes.push_back(item.name);
 		}
 	}
 	std::wstring text;
 	for (const auto& group : groups) {
 		if (!text.empty()) text += L"、";
+		// 一个进程时不带数字：「红蜘蛛 ×1」里的 1 没有任何信息量。
+		if (group.count <= 1) {
+			text += group.name;
+			continue;
+		}
 		WCHAR part[96] = {};
 		swprintf_s(part, L"%s ×%d", group.name.c_str(), group.count);
 		text += part;
+		// 同一款教室挂多个进程是常态（联想传奇是 PsGhost 守护 + Student 学生端），
+		// 只写 ×2 看不出挂的是哪两个，把进程名带上。
+		if (group.processes.size() > 1) {
+			std::wstring names;
+			for (const auto& process : group.processes) {
+				std::wstring plain = process;
+				if (plain.size() > 4 && _wcsicmp(plain.c_str() + plain.size() - 4, L".exe") == 0)
+					plain.resize(plain.size() - 4);
+				if (!names.empty()) names += L"、";
+				names += plain;
+			}
+			text += L"（" + names + L"）";
+		}
 	}
 	return text;
 }
