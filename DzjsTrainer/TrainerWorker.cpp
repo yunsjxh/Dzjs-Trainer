@@ -860,6 +860,13 @@ void TrainerWorkerInternal::UpdateState()
 	if (_Callback) 
 	{
 		TrainerWorkerCallback::TrainerStatus status;
+		// 其他电子教室（伽卡他卡 / 红蜘蛛 / 联想传奇）只在这张表里有记录。
+		// 标题原来一律写「极域电子教室 ……」：只装别家教室的机器会一直显示
+		// 「极域未运行」，而钩子其实早就装进宿主进程了。这里两边合起来报。
+		const int eduHosts = GetEduHostCount();
+		const std::wstring eduSummary = eduHosts > 0 ? GetEduHostSummary() : std::wstring();
+		_StatusTextMore.clear();
+
 		if (_StudentMainPid > 4) {
 			if (_StudentMainControlled) {
 				_StatusTextMain = L"已控制极域电子教室";
@@ -870,11 +877,14 @@ void TrainerWorkerInternal::UpdateState()
 				}
 				else if (_StudentMainRunningLock)
 				{
-					_StatusTextMore = L"已为您解锁极域电子教室<br/>您可以放心继续您的工作";
+					_StatusTextMore = L"已为您解锁极域电子教室";
+					if (eduHosts > 0) _StatusTextMore += L"，同时接管了 " + eduSummary;
+					_StatusTextMore += L"<br/>您可以放心继续您的工作";
 					status = TrainerWorkerCallback::TrainerStatus::TrainerStatusControlledAndUnLocked;
 				}
 				else {
-					_StatusTextMore = L"您可以放心继续您的工作";
+					if (eduHosts > 0) _StatusTextMore = L"同时接管了 " + eduSummary + L"。";
+					_StatusTextMore += L"您可以放心继续您的工作";
 					status = TrainerWorkerCallback::TrainerStatus::TrainerStatusControlled;
 				}
 			}
@@ -893,6 +903,24 @@ void TrainerWorkerInternal::UpdateState()
 					_StatusTextMore = L"向极域电子教室插入病毒失败<br / >错误详情请查看 <a id=\"link_log\">日志</a>";
 					status = TrainerWorkerCallback::TrainerStatus::TrainerStatusControllFailed;
 				}
+				// 极域没拿下、别家教室却接管成功是常见组合（极域有驱动自保），
+				// 这句话得说出来，否则用户只看到「无法控制」就以为工具废了。
+				if (eduHosts > 0)
+					_StatusTextMore = L"其他电子教室已接管 " + eduSummary + L"。<br/>" + _StatusTextMore;
+			}
+		}
+		else if (eduHosts > 0) {
+			// 极域没装也没跑，但其他教室的学生端已经在钩子里。这属于正常受控，
+			// 不该再报「极域电子教室未运行」——防护确实在工作，只是对象换了。
+			if (!_Running) {
+				_StatusTextMain = L"控制器未启动";
+				_StatusTextMore = L"已接管 " + eduSummary + L"<br / >您已手动停止控制器，当前不会对电子教室做任何操作";
+				status = TrainerWorkerCallback::TrainerStatus::TrainerStatusStopped;
+			}
+			else {
+				_StatusTextMain = L"已接管其他电子教室";
+				_StatusTextMore = eduSummary + L"。您可以放心继续您的工作";
+				status = TrainerWorkerCallback::TrainerStatus::TrainerStatusControlled;
 			}
 		}
 		else {
@@ -1484,6 +1512,8 @@ void TrainerWorkerInternal::NotifyEduHosts()
 	if (!_Callback) return;
 	const std::wstring summary = GetEduHostSummary();
 	_Callback->OnUpdateEduHosts(GetEduHostCount(), summary.c_str());
+	// 标题里要报产品名，注入成功当刻就刷新一次，别等下一轮 PID 重置。
+	UpdateState();
 }
 
 void TrainerWorkerInternal::SyncCustomHosts()

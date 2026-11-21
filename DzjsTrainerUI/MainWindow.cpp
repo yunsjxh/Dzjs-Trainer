@@ -4675,8 +4675,11 @@ void MainWindow::PaintOverview(Graphics& g, int width, int height, int offsetY)
 		Text(g, eduHostSummary.c_str(), contentX + cardW + gap + 18, metricsY + 70, cardW - 34, 16, 9,
 			FontStyleRegular, C(darkMode, 91, 97, 94, 169, 179, 174));
 	}
-	Text(g, L"\u68c0\u6d4b\u8def\u5f84", contentX + (cardW + gap) * 2 + 18, metricsY + 15, cardW - 32, 18, 11, FontStyleRegular, C(darkMode, 91, 97, 94, 169, 179, 174));
-	Text(g, studentPath.c_str(), contentX + (cardW + gap) * 2 + 18, metricsY + 40, cardW - 34, 38, 11, FontStyleBold, C(darkMode, 24, 30, 27, 226, 233, 229));
+	// 只装了别家教室的机器上极域路径是空的，这张卡原来就那么空着。
+	// 有宿主接管时改报产品名，三张卡才都说得上话。
+	const bool showProducts = studentPath.empty() && eduHostCount > 0;
+	Text(g, showProducts ? L"\u53d7\u63a7\u4ea7\u54c1" : L"\u68c0\u6d4b\u8def\u5f84", contentX + (cardW + gap) * 2 + 18, metricsY + 15, cardW - 32, 18, 11, FontStyleRegular, C(darkMode, 91, 97, 94, 169, 179, 174));
+	Text(g, showProducts ? eduHostSummary.c_str() : studentPath.c_str(), contentX + (cardW + gap) * 2 + 18, metricsY + 40, cardW - 34, 38, 11, FontStyleBold, C(darkMode, 24, 30, 27, 226, 233, 229));
 
 	const float actionsY = metricsY + 110;
 	const float actionGap = 12.0f;
@@ -4690,7 +4693,11 @@ void MainWindow::PaintOverview(Graphics& g, int width, int height, int offsetY)
 	StrokeRound(g, RectF(contentX, actionsY, contentW, actionsH), 12, C(darkMode, 236, 241, 238, 45, 53, 49));
 	Text(g, L"\u5feb\u6377\u64cd\u4f5c", contentX + 20, actionsY + 18, 180, 24, 14, FontStyleBold, C(darkMode, 24, 30, 27, 226, 233, 229));
 	Text(g, L"\u5e38\u7528\u7684\u8fd0\u884c\u63a7\u5236\u548c\u8bbe\u5907\u5de5\u5177", contentX + 20, actionsY + 44, 340, 18, 10, FontStyleRegular, C(darkMode, 91, 99, 95, 166, 177, 171));
-	const wchar_t* labels[] = { L"\u9632\u62a4\u72b6\u6001", setTopMost ? L"\u53d6\u6d88\u7f6e\u9876" : L"\u5f00\u542f\u7f6e\u9876", studentRunning ? L"\u7ed3\u675f\u6781\u57df" : L"\u91cd\u542f\u6781\u57df", L"\u63a7\u5236\u4e0e\u8bbe\u7f6e", L"\u7535\u6e90\u63a7\u5236" };
+	// 「重启极域」在只装了别家教室的机器上没有意义 —— 点下去会去拉 StudentMain，
+	// 而这台机器上根本没有。那种情况改成跳到注入页看当前接管了谁。
+	const wchar_t* hostAction = studentRunning ? L"\u7ed3\u675f\u6781\u57df"
+		: (eduHostCount > 0 ? L"\u67e5\u770b\u5bbf\u4e3b" : L"\u91cd\u542f\u6781\u57df");
+	const wchar_t* labels[] = { L"\u9632\u62a4\u72b6\u6001", setTopMost ? L"\u53d6\u6d88\u7f6e\u9876" : L"\u5f00\u542f\u7f6e\u9876", hostAction, L"\u63a7\u5236\u4e0e\u8bbe\u7f6e", L"\u7535\u6e90\u63a7\u5236" };
 	const float actionY = actionsY + 64.0f;
 	for (int i = 0; i < 5; ++i) {
 		const float x = contentX + 20 + i * (actionW + actionGap);
@@ -8016,7 +8023,11 @@ void MainWindow::HandleClick(POINT point)
 			switch (i) {
 			case 0: ShowFastTip(currentControlled ? L"\u5f53\u524d\u5df2\u542f\u7528\u5b8c\u6574\u9632\u62a4\u3002" : L"\u9632\u62a4\u670d\u52a1\u6b63\u5728\u76d1\u63a7\u3002"); break;
 			case 1: RequestSuperTopmost(); break;
-			case 2: if (currentWorker) { if (studentRunning) currentWorker->Kill(); else currentWorker->Rerun(); } break;
+			case 2:
+				if (studentRunning) { if (currentWorker) currentWorker->Kill(); }
+				else if (eduHostCount > 0) SelectPage(Page::Injection);
+				else if (currentWorker) currentWorker->Rerun();
+				break;
 			case 3: SelectPage(Page::Protection); break;
 			case 4: ShowPowerMenu(); break;
 			}
@@ -9389,7 +9400,7 @@ void MainWindow::ShowPowerMenu()
 void MainWindow::ShowHelp()
 {
 	MessageBoxW(_hWnd,
-		L"Dzjs Trainer \u4f1a\u81ea\u52a8\u68c0\u6d4b\u5e76\u63a7\u5236\u6781\u57df\u8fdb\u7a0b\u3002\n\n"
+		L"Dzjs Trainer \u4f1a\u81ea\u52a8\u68c0\u6d4b\u5e76\u63a7\u5236\u6781\u57df\u53ca\u5176\u4ed6\u7535\u5b50\u6559\u5ba4\u7684\u8fdb\u7a0b\u3002\n\n"
 		L"\u53ef\u5728\u201c\u9632\u62a4\u7b56\u7565\u201d\u4e2d\u8c03\u6574\u8fdc\u7a0b\u64cd\u4f5c\u6743\u9650\uff0c\u5728\u201c\u8fd0\u884c\u65e5\u5fd7\u201d\u4e2d\u67e5\u770b\u5b9e\u65f6\u72b6\u6001\u3002",
 		L"Dzjs Trainer \u5e2e\u52a9", MB_OK | MB_ICONINFORMATION);
 }
