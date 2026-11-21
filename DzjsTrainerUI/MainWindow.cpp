@@ -3496,10 +3496,21 @@ std::unique_ptr<Bitmap> TeacherBitmapFromFrame(const jiyu::RemoteFrame& frame)
 std::wstring StripMarkup(LPCWSTR input) {
 	std::wstring result;
 	bool inTag = false;
+	bool lineBreak = false;
 	for (const wchar_t* p = input ? input : L""; *p; ++p) {
-		if (*p == L'<') inTag = true;
-		else if (*p == L'>') inTag = false;
-		else if (!inTag) result.push_back(*p);
+		if (*p == L'<') { inTag = true; lineBreak = false; continue; }
+		if (*p == L'>') {
+			inTag = false;
+			// <br> 不能像 <b> 那样直接抹掉。原来「已在此计算机上找到极域电子教室」
+			// 和「你可以点击…」会粘成一句，读起来像漏了标点。
+			if (lineBreak) result.push_back(L'\n');
+			continue;
+		}
+		if (inTag) {
+			if ((*p == L'b' || *p == L'B') && (p[1] == L'r' || p[1] == L'R')) lineBreak = true;
+			continue;
+		}
+		result.push_back(*p);
 	}
 	return result;
 }
@@ -9472,16 +9483,20 @@ void MainWindow::ShowEduMenu()
 
 	POINT point{};
 	if (actionRects[2].right > actionRects[2].left) {
-		point.x = actionRects[2].left;
-		point.y = actionRects[2].bottom + 4;
+		// actionRects 存的是逻辑坐标（整帧绘制前 ScaleTransform 过），
+		// ClientToScreen 要的是物理坐标，125% / 150% 下不换算会弹到左上角去。
+		point.x = ToPhysical(actionRects[2].left);
+		point.y = ToPhysical(actionRects[2].bottom) + 4;
 		ClientToScreen(_hWnd, &point);
 	}
 	else {
 		GetCursorPos(&point);
 	}
 	SetForegroundWindow(_hWnd);
-	TrackPopupMenu(menu, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON,
-		point.x, point.y, 0, _hWnd, nullptr);
+	// 这一格贴着窗口下沿，菜单条目一多就会顶到任务栏。TPM_WORKAREA 让系统
+	// 把它挪回工作区，而不是让最后几项落在屏幕外面。
+	TrackPopupMenuEx(menu, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON | TPM_WORKAREA,
+		point.x, point.y, _hWnd, nullptr);
 	DestroyMenu(menu);
 }
 
@@ -9642,7 +9657,10 @@ void MainWindow::OnUpdateStudentMainInfo(bool running, LPCWSTR fullPath, DWORD p
 		std::lock_guard<std::mutex> guard(stateMutex);
 		studentRunning = running;
 		studentPid = running ? pid : 0;
-		studentPath = running && fullPath ? fullPath : L"未检测到";
+		// 路径是「定位结果」，不是「运行结果」。极域没跑但已经找到 exe 时，标题
+		// 会写「已在此计算机上找到极域电子教室」，这张卡却写「未检测到」——
+		// 同一屏两句话互相打脸。
+		studentPath = (fullPath && fullPath[0]) ? fullPath : L"未检测到";
 	}
 	PostMessageW(_hWnd, WM_NATIVE_REFRESH, 0, 0);
 }

@@ -933,7 +933,9 @@ void TrainerWorkerInternal::UpdateState()
 			}
 			else if (_StudentMainFileLocated) {
 				status = TrainerWorkerCallback::TrainerStatus::TrainerStatusNotRunning;
-				_StatusTextMore = L"已在此计算机上找到极域电子教室<br / >你可以点击 <b>下方按钮</b> 运行它";
+				// 「下方按钮」已经改名叫「电子教室操作」（那格现在既能结束也能
+				// 启动），文案得跟着走，否则用户会去找一个不存在的按钮。
+				_StatusTextMore = L"已在此计算机上找到极域电子教室<br/>点开下方的 <b>电子教室操作</b> 可以启动它";
 			}
 			else {
 				status = TrainerWorkerCallback::TrainerStatus::TrainerStatusNotFound;
