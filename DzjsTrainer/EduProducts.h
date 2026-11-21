@@ -30,7 +30,7 @@ struct EduProcessRule {
 	const wchar_t* exe;        // 学生端进程名
 	const wchar_t* pathHint;   // 完整路径里必须出现的一段，不区分大小写
 	// pathHint 为空时的第二判据：同目录（或上一级）里应该有的文件。
-	// 伽卡他卡这类国内软件装在中目录下，路径特征靠不住，但同目录的两个
+	// 伽卡他卡这类国内软件装在中文目录下，路径特征靠不住，但同目录的两个
 	// 进程是稳定的。两个都为空就只认进程名，留给名字足够独特的那些。
 	const wchar_t* companion;
 };
