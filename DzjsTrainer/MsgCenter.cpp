@@ -1,4 +1,4 @@
-#include "stdafx.h"
+﻿#include "stdafx.h"
 #include "MsgCenter.h"
 #include "EduProducts.h"
 #include <list>
