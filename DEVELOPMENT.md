@@ -1,6 +1,6 @@
 # 开发者说明
 
-README 写给使用者：怎么用、装不上怎么办。这份文档写给改代码的人：模块怎么分、哪些写法是踩过坑之后定下来的、构建和验证怎么跑。
+README 写给使用者：怎么跑起来、什么系统能跑、驱动为什么要签名。这份文档写给改代码的人：模块怎么分、哪些写法是踩过坑之后定下来的、构建和验证怎么跑。
 
 文档与 `main` 保持同步。代码和这里对不上时以代码为准，并且顺手把这里改掉。
 
@@ -41,15 +41,15 @@ README 写给使用者：怎么用、装不上怎么办。这份文档写给改�
 
 ### 环境
 
-换机器第一件事是把三样装齐：
+换台机器要装这些：
 
-- **Visual Studio**，本机是 18 Community（MSVC 14.51）。安装时勾「使用 C++ 的桌面开发」，组件里要带上 **v143 生成工具** —— 新版本默认给的是 v145，而工程文件全部固定 `v143`，缺了就报找不到工具集。
+- **Visual Studio**，本机是 18 Community（MSVC 14.51）。装的时候勾「使用 C++ 的桌面开发」，组件里要有 **v143 生成工具**——新版默认给的是 v145，而工程全部固定 `v143`，缺了就报找不到工具集。
 - **Windows SDK**，本机 10.0.28000。
-- **WDK**，勾「Windows 驱动程序工具包」。装完才有 `WindowsKernelModeDriver10.0` 这个平台工具集，驱动工程要靠它。
+- **WDK**，勾「Windows 驱动程序工具包」。装完才有 `WindowsKernelModeDriver10.0` 这个平台工具集，驱动工程靠它。
 
-**别用 Build Tools 顶替 Visual Studio。** 驱动工具集只在完整 VS 实例里注册，Build Tools 加 WDK 的裸组合编驱动会直接报工具集缺失，而且报错信息不会告诉你是这个原因。
+**别用 Build Tools 顶替 Visual Studio。** 驱动工具集只在完整 VS 实例里注册，Build Tools 加 WDK 的裸组合编驱动会直接报工具集缺失，而且报错不会告诉你是这个原因。
 
-SDK 版本对不上时分两种：用户态工程写的是 `10.0`，自动取本机最新，不用管；`DzjsTrainerDriver.vcxproj` 里固定写死 `10.0.28000.0`，装不到这个版本就改这一行，换成实际装上的版本号。
+SDK 版本对不上时：用户态工程写的是 `10.0`，自动取本机最新，不用管；`DzjsTrainerDriver.vcxproj` 里固定写死 `10.0.28000.0`，装不到这个版本就改这一行，换成实际装上的版本号。
 
 确认装在哪：
 
@@ -104,7 +104,7 @@ IOCTL 号是 `0x800`–`0x80D` 连续一段，全部 `METHOD_BUFFERED`，定义�
 
 卸载令牌是 144 字节，对前 80 字节做 SHA-256，签名格式是 IEEE P1363 的 `r||s`。
 
-**因为公钥编在 `.sys` 里，换密钥就必须重编并重签驱动。** 反过来，驱动重签了但令牌没重生成，主程序就会拒绝卸载——README 里那段「预期失败」说的就是这个。
+**因为公钥编在 `.sys` 里，换密钥就必须重编并重签驱动。** 反过来，驱动重签了但令牌没重生成，主程序就会拒绝卸载——「发布构建」开头那段日志说的就是这个。
 
 AES 那半边的拆分明文（partA / partB 异或还原）**硬编码在三处，改一处等于全坏**：`tools/Protect-DriverUnlockToken.ps1`、`tools/Test-DriverUnlockToken.ps1`、`DzjsTrainer/KernelUtils.cpp`。
 
@@ -167,14 +167,14 @@ AES 那半边的拆分明文（partA / partB 异或还原）**硬编码在三处
 
 ## 发布构建
 
-**先说一件事：照「构建」那节的命令编出来的 exe，卸载不了自己加载的驱动。** `.vcxproj` 把 `IDR_DRIVER_UNLOCK_TOKEN` 绑定到 `DzjsTrainerDriver.unlock.enc.sample`，占位令牌和本次产出的 `.sys` 不匹配，驱动会拒绝。日志长这样：
+**照「构建」那节的命令编出来的 exe，卸载不了自己加载的驱动。** `.vcxproj` 把 `IDR_DRIVER_UNLOCK_TOKEN` 绑定到 `DzjsTrainerDriver.unlock.enc.sample`，占位令牌和这次产出的 `.sys` 对不上，驱动会拒绝。日志长这样：
 
 ```
 [E] Embedded unload token is missing, invalid, or cannot be decrypted
 [E] Driver unload authorization failed; service stop was not attempted
 ```
 
-这是刻意的失败方向，不是 bug。要可卸载的构建就得走下面的签名流程重新生成令牌；调试阶段等不及，手工 `sc stop <驱动服务名>` 再重启也行。
+故意的，不是 bug。要能卸载就得走下面的签名流程重新生成令牌；调试阶段等不及，手工 `sc stop <驱动服务名>` 再重启也行。
 
 `tools/` 下的脚本负责这一段，`Complete-DriverSigning.ps1` 签名并回嵌，`Build-DzjsTrainerRelease.ps1` 校验产物。手工发版时有两个地方容易翻车：
 
@@ -189,7 +189,7 @@ AES 那半边的拆分明文（partA / partB 异或还原）**硬编码在三处
 
 `DzjsTrainerUpdater` 需要一把内嵌的 RSA 公钥来验证服务器返回的时效票据。仓库里不放真实公钥，只有 `UpdaterTicketKey.h.example`（对应私钥 `update-server/ticket-sign.pem.example`，是公开的示例）。
 
-`UpdaterTicket.h` 用 `__has_include` 回退到 `.example`，所以克隆下来直接就能编。编出来的程序连不上正式更新服务器，会明确提示「此版本内置的是开源示例公钥」——同样是刻意的失败方向。
+`UpdaterTicket.h` 用 `__has_include` 回退到 `.example`，所以克隆下来直接就能编。代价是编出来的程序连不上正式更新服务器，会提示「此版本内置的是开源示例公钥」。
 
 要构建能接收正式更新的发行版，先把自己的公钥生成进去：
 
@@ -199,7 +199,7 @@ python tools\make-ticket-key.py
 
 脚本读 `update-server/ticket-sign.pub.der`，生成被 Git 忽略的 `DzjsTrainerUpdater/UpdaterTicketKey.h`。加 `--check` 可以确认现有头文件有没有和 DER 脱节。
 
-这份 DER 也不进版本库 —— 否则任何人都能一键编出一个连得上正式服务器的客户端，占位符就白做了。它从私钥导出：
+这份 DER 也不进版本库，否则任何人都能一键编出一个连得上正式服务器的客户端，占位符就白做了。它从私钥导出：
 
 ```powershell
 openssl pkey -in update-server\ticket-sign.pem -pubout -outform DER -out update-server\ticket-sign.pub.der
@@ -212,8 +212,8 @@ openssl pkey -in update-server\ticket-sign.pem -pubout -outform DER -out update-
 - 别用 `Get-AuthenticodeSignature` 的「根不受信任」去推断「必须开测试模式」。它只看第一个嵌入签名，跟内核实际加载时走的检查不是一回事。
 - 别把 `/MT` 换成 `/MD`。发布包是静态 CRT，换掉就要求目标机装运行库——这是被人提过的「修复」，实际是回归。
 - 别在 UI 线程做更新探测。子进程 + 超时是刻意设计，探测期间的卡顿全部来自这里。
-- 别加「绕过 MSBuild 直接用 cl 编驱动」的兜底脚本。绕过去拿不到 Inf2Cat 生成的 `.cat`，驱动装不上；`.sys` 又是嵌进主程序资源的，绕出来的产物想进包还得回头重编一次 exe。只想验证驱动改动能编过，用 cl 单文件检查就够，犯不上凑齐一整条 link 命令。
-- 别加「便携包」打包脚本往 exe 旁边拷 VC++ 运行时。工程是静态 CRT，实测发布版 exe 的导入表里没有 `vcruntime140.dll`、`msvcp140.dll`、`ucrtbase.dll` 中的任何一个，单独一个文件就是完整的。
+- 别加「绕过 MSBuild 直接用 cl 编驱动」的兜底脚本。绕过去拿不到 Inf2Cat 生成的 `.cat`，驱动装不上；`.sys` 又是嵌进主程序资源的，绕出来的产物想进包还得回头重编一次 exe。想验证驱动改动能编过，cl 单文件检查就够了，犯不上凑一整条 link 命令。
+- 别加「便携包」脚本往 exe 旁边拷 VC++ 运行时。工程是静态 CRT，拿发布版 exe 查导入表，`vcruntime140.dll`、`msvcp140.dll`、`ucrtbase.dll` 一个都没有，独立一个文件就是完整的。
 - 别提交 `Release`、`obj`、`bin`、PDB、日志、证书、私钥、令牌。
 
 ## 提交约定
