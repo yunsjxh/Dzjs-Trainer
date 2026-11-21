@@ -96,6 +96,10 @@ public:
 	virtual int KillEduHosts(LPCWSTR product) { return 0; }
 	// 极域学生端的 exe 找不找得到。菜单据此决定要不要给「重启电子教室」这一条。
 	virtual bool IsStudentMainLocated() { return false; }
+	// 这款教室现在有没有进程在跑。和 GetEduHostCountOf 不是一回事：那个数的是
+	// 「已经注入的宿主」，刚被守护拉起来、还没轮到扫描的进程不算；菜单要的是
+	// 「能不能结束」，所以按进程本身判断。
+	virtual bool IsEduProductRunning(LPCWSTR product) { return false; }
 	// 某款教室现在能不能拉起来：记得它的学生端路径，或者它的服务/守护进程还在。
 	virtual bool CanStartEduHost(LPCWSTR product) { return false; }
 	// 「启动」某款教室（product 为空表示全部），返回是否真的发起了启动动作。
@@ -144,8 +148,12 @@ public:
 	int GetEduHostCount() override;
 	int GetEduHostCountOf(LPCWSTR product) override;
 	std::wstring GetEduHostSummary() override;
+	// 「在跑但还没接管」的产品名，用「、」连起来。标题用：进程明明在那儿，
+	// 界面不能一派「未运行」。
+	std::wstring GetEduPendingSummary();
 	int KillEduHosts(LPCWSTR product) override;
 	bool IsStudentMainLocated() override { return _StudentMainFileLocated; }
+	bool IsEduProductRunning(LPCWSTR product) override;
 	bool CanStartEduHost(LPCWSTR product) override;
 	bool StartEduHost(LPCWSTR product) override;
 	void SyncCustomHosts() override;
@@ -208,11 +216,20 @@ private:
 	// 产品名 → 学生端 exe 路径。进程被结束（记录随之删掉）之后还要靠它恢复，
 	// 所以单独存一份，生命周期跟着进程走。
 	std::map<std::wstring, std::wstring> _EduLaunchPaths;
+	// 被我们挂起过的守护进程。NtSuspendProcess 是计数式的：同一个进程挂两次，
+	// 之后一次 NtResumeProcess 救不回来。「结束」在一次操作里会走两遍守护
+	// （停服务、清扫上游），靠这张表保证一个 PID 只挂一次。
+	std::vector<DWORD> _EduSuspendedGuards;
 
 	// 电子教室自动适配（见 EduProducts.h）。扫描本身有 10 秒间隔，失败目标
 	// 再压 10 分钟，避免「2 秒一次的重扫」把注入失败刷满日志。
 	bool _EduCompatEnabled = true;
 	ULONGLONG _LastEduCompatScan = 0;
+	// 「启动」之后的一小段窗口：守护进程拉起学生端要十几秒，这期间把扫描从
+	// 10 秒收紧到 2 秒，进程一出现就接管，界面不用等下一轮才改口。
+	ULONGLONG _EduStartWatchUntil = 0;
+	// 上一轮「在跑但还没接管」的产品清单。变了才刷标题，不然每十秒重绘一次。
+	std::wstring _EduPendingSummary;
 	std::map<DWORD, ULONGLONG> _EduInjectBlocked;
 	// 用户在「进程注入」里手动卸载过的目标：同一个进程不再自动注入回去，
 	// 进程退出后自动解禁（PID 会被复用，不能用它做长期标记）。

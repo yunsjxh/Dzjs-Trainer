@@ -925,21 +925,37 @@ void TrainerWorkerInternal::UpdateState()
 			}
 		}
 		else {
-			_StatusTextMain = L"极域电子教室未运行";
-			if (!_Running) {
-				_StatusTextMain = L"极域电子教室未运行 并且控制器未启动";
-				_StatusTextMore = L"您已手动停止控制器<br / >当前不会检测极域的运行";
-				status = TrainerWorkerCallback::TrainerStatus::TrainerStatusStopped;
-			}
-			else if (_StudentMainFileLocated) {
+			// 极域不在，别家教室也还没接管。但「没接管」不等于「没在跑」：
+			// 学生端刚被守护拉起来、还没轮到扫描，或者自动接管被关掉，进程
+			// 就在那儿。标题一派「未运行」，用户会以为点了启动没反应。
+			const std::wstring pending = _Running ? GetEduPendingSummary() : std::wstring();
+			if (!pending.empty()) {
+				const bool single = pending.find(L'、') == std::wstring::npos;
+				_StatusTextMain = single ? (L"检测到" + pending + L"在运行")
+					: L"检测到多个电子教室在运行";
+				_StatusTextMore = _EduCompatEnabled
+					? (single ? L"正在接管它，稍等片刻"
+						: L"正在接管 " + pending + L"，稍等片刻")
+					: L"自动接管已关闭，点开 <b>电子教室操作</b> 可以结束它";
 				status = TrainerWorkerCallback::TrainerStatus::TrainerStatusNotRunning;
-				// 「下方按钮」已经改名叫「电子教室操作」（那格现在既能结束也能
-				// 启动），文案得跟着走，否则用户会去找一个不存在的按钮。
-				_StatusTextMore = L"已在此计算机上找到极域电子教室<br/>点开下方的 <b>电子教室操作</b> 可以启动它";
 			}
 			else {
-				status = TrainerWorkerCallback::TrainerStatus::TrainerStatusNotFound;
-				_StatusTextMore = L"未在此计算机上找到极域电子教室";
+				_StatusTextMain = L"极域电子教室未运行";
+				if (!_Running) {
+					_StatusTextMain = L"极域电子教室未运行 并且控制器未启动";
+					_StatusTextMore = L"您已手动停止控制器<br / >当前不会检测极域的运行";
+					status = TrainerWorkerCallback::TrainerStatus::TrainerStatusStopped;
+				}
+				else if (_StudentMainFileLocated) {
+					status = TrainerWorkerCallback::TrainerStatus::TrainerStatusNotRunning;
+					// 「下方按钮」已经改名叫「电子教室操作」（那格现在既能结束也能
+					// 启动），文案得跟着走，否则用户会去找一个不存在的按钮。
+					_StatusTextMore = L"已在此计算机上找到极域电子教室<br/>点开下方的 <b>电子教室操作</b> 可以启动它";
+				}
+				else {
+					status = TrainerWorkerCallback::TrainerStatus::TrainerStatusNotFound;
+					_StatusTextMore = L"未在此计算机上找到极域电子教室";
+				}
 			}
 		}
 
@@ -1323,7 +1339,8 @@ static bool QueryProcessImagePath(DWORD pid, std::wstring* outPath)
 void TrainerWorkerInternal::RunEduCompatInject()
 {
 	const ULONGLONG now = GetTickCount64();
-	if (now - _LastEduCompatScan < 10000) return;
+	const ULONGLONG interval = now < _EduStartWatchUntil ? 2000 : 10000;
+	if (now - _LastEduCompatScan < interval) return;
 	_LastEduCompatScan = now;
 
 	// 已注入记录里的死 PID 必须清掉：PID 会被复用，留着会让新起来的进程被
@@ -1339,6 +1356,14 @@ void TrainerWorkerInternal::RunEduCompatInject()
 		else ++it;
 	}
 	if (droppedHost) NotifyEduHosts();
+
+	// 「有教室在跑、但还没接管」也要让标题知道：自动接管关掉时不会走到下面
+	// 的注入流程，没有别的事件会来刷新状态，界面就一直是「未运行」。
+	const std::wstring pending = GetEduPendingSummary();
+	if (pending != _EduPendingSummary) {
+		_EduPendingSummary = pending;
+		NotifyEduHosts();
+	}
 
 	if (!_EduCompatEnabled) return;
 
@@ -1858,11 +1883,56 @@ static bool IsProductHostExe(const EduProduct& product, const wchar_t* exeName)
 	return false;
 }
 
+// 按产品表找当前在跑的学生端进程。
+//
+// 必须过一遍路径特征：REDAgent.exe / Student.exe 这类名字不算独特，只按名字
+// 收集会把不相干的程序算成「电子教室在跑」，菜单里就多出一条结束项。
+static void CollectProductHostPids(const EduProduct& product, std::vector<DWORD>* out)
+{
+	if (out == nullptr) return;
+	for (int r = 0; r < product.ruleCount; ++r) {
+		std::vector<DWORD> pids;
+		CollectProcessIdsByName(product.rules[r].exe, &pids);
+		for (DWORD pid : pids) {
+			std::wstring path;
+			if (!QueryProcessImagePath(pid, &path)) continue;
+			if (!EduPathContainsNoCase(path.c_str(), product.rules[r].pathHint)) continue;
+			bool seen = false;
+			for (DWORD existing : *out) if (existing == pid) { seen = true; break; }
+			if (!seen) out->push_back(pid);
+		}
+	}
+}
+
+static const EduProduct* FindEduProduct(LPCWSTR name)
+{
+	if (name == nullptr || name[0] == L'\0') return nullptr;
+	for (int i = 0; i < kEduProductCount; ++i)
+		if (_wcsicmp(kEduProducts[i].name, name) == 0) return &kEduProducts[i];
+	return nullptr;
+}
+
+// 这款教室的学生端现在有没有进程在跑（按产品表查，不看注入记录：
+// 刚起来的进程要等下一轮扫描才会被接管）。
+static bool AnyProductHostRunning(const EduProduct& product)
+{
+	std::vector<DWORD> pids;
+	CollectProductHostPids(product, &pids);
+	return !pids.empty();
+}
+
 int TrainerWorkerInternal::StopEduGuards(const EduProduct& product)
 {
 	int stopped = 0;
 	std::map<DWORD, std::wstring> serviceByPid;
 	bool serviceMapReady = false;
+
+	// 先把已经不存在的守护 PID 从挂起表里剔掉：PID 会被复用，留着会让新进程
+	// 被当成「已经挂起过」而跳过。
+	for (auto it = _EduSuspendedGuards.begin(); it != _EduSuspendedGuards.end(); ) {
+		if (IsProcessGone(*it)) it = _EduSuspendedGuards.erase(it);
+		else ++it;
+	}
 
 	for (int i = 0; i < product.guardCount; ++i) {
 		const EduGuardRule& guard = product.guards[i];
@@ -1885,7 +1955,15 @@ int TrainerWorkerInternal::StopEduGuards(const EduProduct& product)
 
 		for (DWORD pid : pids) {
 			if (!alsoHost) {
+				// 挂起是计数式的：同一个进程挂第二次，之后一次 NtResumeProcess
+				// 救不回来。「结束」一次会走到这里两趟（停服务 + 清扫上游），
+				// 所以记一份挂起过的 PID，一个进程只挂一次。
+				bool alreadySuspended = false;
+				for (DWORD existing : _EduSuspendedGuards)
+					if (existing == pid) { alreadySuspended = true; break; }
+				if (alreadySuspended) continue;
 				if (MSuspendProcessNt(pid, nullptr) == STATUS_SUCCESS) {
+					_EduSuspendedGuards.push_back(pid);
 					currentLogger->LogInfo(L"已挂起守护进程 %s [PID %lu]", guard.exe, pid);
 					++stopped;
 					continue;
@@ -2114,11 +2192,10 @@ void TrainerWorkerInternal::EduKillWatchExtend()
 
 
 // 「结束电子教室」里收拾其他教室的那一半。极域走的是 Kill()，这里是通用
-// 宿主：注入记录里的每个产品进程都要收拾，连它的同目录进程和上游一起。
+// 宿主：产品表里认得的学生端都要收拾，连它的同目录进程和上游一起。
 // product 给具体产品名时只动那一款，界面的选择框按名字逐个调。
 int TrainerWorkerInternal::KillEduHosts(LPCWSTR product)
 {
-	if (_CustomInjected.empty()) return 0;
 	const bool all = (product == nullptr || product[0] == L'\0');
 
 	// 盯梢名单先立起来：这一下没收拾干净的话，StepEduKillWatch() 接着收。
@@ -2144,23 +2221,43 @@ int TrainerWorkerInternal::KillEduHosts(LPCWSTR product)
 
 	// 先把上游停掉。红蜘蛛的学生端是 checkrs.exe（服务）拉起来的，直接杀
 	// REDAgent 的话，服务几秒后就把学生端重新启起来，用户看到的是「点了没用」。
+	// 这里不看注入记录：学生端刚被守护拉起来、还没轮到扫描时也该能结束。
+	// 但只对真的在跑的那几款动手 —— 结束极域时不该顺带把别家的守护挂起。
 	for (int i = 0; i < kEduProductCount; ++i) {
 		if (!all && _wcsicmp(kEduProducts[i].name, product) != 0) continue;
-		if (GetEduHostCountOf(kEduProducts[i].name) <= 0) continue;
+		if (!AnyProductHostRunning(kEduProducts[i]) && GetEduHostCountOf(kEduProducts[i].name) <= 0)
+			continue;
 		StopEduGuards(kEduProducts[i]);
 	}
 
 	// 先把目标快照下来：清扫过程中会顺手结束别的进程，边遍历边改列表容易漏。
+	//
+	// 目标有两个来源。产品表扫出来的是「正在跑但可能还没被注入」的（守护拉起
+	// 学生端到下一轮扫描之间有十秒空档，菜单上的结束项就是冲着它去的）；注入
+	// 记录补上产品表认不出的情况，比如用户装了别的版本、目录特征对不上。
 	struct Target { DWORD pid; std::wstring name; std::wstring path; };
 	std::vector<Target> targets;
+	auto addTarget = [&targets](DWORD pid) {
+		if (pid <= 4) return;
+		for (const auto& existing : targets) if (existing.pid == pid) return;
+		Target target;
+		target.pid = pid;
+		if (!QueryProcessImagePath(pid, &target.path)) return;
+		const size_t slash = target.path.find_last_of(L"\\/");
+		target.name = slash == std::wstring::npos ? target.path : target.path.substr(slash + 1);
+		targets.push_back(target);
+	};
+
+	for (int i = 0; i < kEduProductCount; ++i) {
+		if (!all && _wcsicmp(kEduProducts[i].name, product) != 0) continue;
+		std::vector<DWORD> pids;
+		CollectProductHostPids(kEduProducts[i], &pids);
+		for (DWORD pid : pids) addTarget(pid);
+	}
 	for (const auto& item : _CustomInjected) {
 		if (item.product.empty()) continue;
 		if (!all && _wcsicmp(item.product.c_str(), product) != 0) continue;
-		Target target;
-		target.pid = item.pid;
-		target.name = item.name;
-		QueryProcessImagePath(item.pid, &target.path);
-		targets.push_back(target);
+		addTarget(item.pid);
 	}
 	if (targets.empty()) return 0;
 
@@ -2216,16 +2313,29 @@ int TrainerWorkerInternal::GetEduHostCountOf(LPCWSTR product)
 	return count;
 }
 
-// 这款教室的学生端现在有没有进程在跑（按产品表里的 exe 名查，不看注入记录：
-// 刚起来的进程要等下一轮扫描才会被接管）。
-static bool AnyProductHostRunning(const EduProduct& product)
+// 菜单据此决定「结束」这一条要不要出现。注入记录为空不代表没在跑：学生端
+// 刚被守护进程拉起来的那十来秒里就是这种状态，用户看得见它在跑，菜单里却
+// 只有「启动」，点哪都不对。
+bool TrainerWorkerInternal::IsEduProductRunning(LPCWSTR product)
 {
-	for (int r = 0; r < product.ruleCount; ++r) {
-		std::vector<DWORD> pids;
-		CollectProcessIdsByName(product.rules[r].exe, &pids);
-		if (!pids.empty()) return true;
+	const EduProduct* item = FindEduProduct(product);
+	if (item == nullptr) return false;
+	if (GetEduHostCountOf(product) > 0) return true;
+	return AnyProductHostRunning(*item);
+}
+
+std::wstring TrainerWorkerInternal::GetEduPendingSummary()
+{
+	std::wstring text;
+	int products = 0;
+	for (int i = 0; i < kEduProductCount; ++i) {
+		if (GetEduHostCountOf(kEduProducts[i].name) > 0) continue;  // 已接管的走另一档
+		if (!AnyProductHostRunning(kEduProducts[i])) continue;
+		if (products > 0) text += L"、";
+		text += kEduProducts[i].name;
+		++products;
 	}
-	return false;
+	return text;
 }
 
 // 菜单里要不要给「启动」这一条，看这里。判据要便宜：菜单是一次点击里现拼的。
@@ -2271,58 +2381,72 @@ bool TrainerWorkerInternal::StartEduHost(LPCWSTR product)
 	for (int i = 0; i < kEduProductCount; ++i) {
 		const EduProduct& item = kEduProducts[i];
 		if (!all && _wcsicmp(item.name, product) != 0) continue;
-		if (GetEduHostCountOf(item.name) > 0) {
+		if (IsEduProductRunning(item.name)) {
 			currentLogger->LogInfo(L"[%s] 已经在运行，不需要启动", item.name);
 			continue;
 		}
 
-		bool started = false;
+		// 起服务
+		bool serviceStarted = false;
 		for (int g = 0; g < item.guardCount; ++g)
-			if (StartServicesByImage(item.guards[g].exe, item.guards[g].service) > 0) started = true;
+			if (StartServicesByImage(item.guards[g].exe, item.guards[g].service) > 0) serviceStarted = true;
 
 		// 服务起不来（被禁用、被安全软件拦住、或者压根没有服务）就恢复被挂起的
 		// 守护进程。恢复不触发 SCM 的恢复计数，比重新起一个干净。
+		bool guardResumed = false;
 		for (int g = 0; g < item.guardCount; ++g) {
 			std::vector<DWORD> pids;
 			CollectProcessIdsByName(item.guards[g].exe, &pids);
 			for (DWORD pid : pids) {
 				if (MResumeProcessNt(pid, nullptr) == STATUS_SUCCESS) {
 					currentLogger->LogInfo(L"已恢复守护进程 %s [PID %lu]", item.guards[g].exe, pid);
-					started = true;
+					guardResumed = true;
+					// 已经醒了，别让它留在挂起表里，否则下一次结束会以为它还在睡。
+					for (auto it = _EduSuspendedGuards.begin(); it != _EduSuspendedGuards.end(); ) {
+						if (*it == pid) it = _EduSuspendedGuards.erase(it);
+						else ++it;
+					}
 				}
 			}
 		}
 
-		// 恢复一个「本来就没挂起」的守护进程也会返回成功，光看返回值会误判成
-		// 已经起来了。真正的判据是学生端有没有进程，等它一下再决定要不要自己拉。
-		if (started) {
-			for (int wait = 0; wait < 8 && !AnyProductHostRunning(item); ++wait) Sleep(100);
+		// 学生端已经在了，这就够了。
+		if (AnyProductHostRunning(item)) {
+			acted = true;
+			continue;
 		}
 
-		// 服务没起、守护进程也没把学生端带出来，才按记下的路径自己拉一个：
+		// 服务和守护都动过，剩下的交给它们。红蜘蛛从恢复 checkrs 到拉起 REDAgent
+		// 要十秒上下，原来在这里等 800 毫秒就判「没起来」，菜单弹「无法启动」，
+		// 而它其实几秒后自己就出来了 —— 用户看到的就是「说没启动，其实启动了」。
+		if (serviceStarted || guardResumed) {
+			currentLogger->LogInfo(L"[%s] 已让守护进程去拉学生端，稍等它自己起来", item.name);
+			acted = true;
+			continue;
+		}
+
+		// 服务没起、守护进程也没有，才按记下的路径自己拉一个：
 		// 联想传奇这种没有服务、守护进程又被结束掉的，只剩这一条路。
-		if (!AnyProductHostRunning(item)) {
-			auto saved = _EduLaunchPaths.find(item.name);
-			if (saved == _EduLaunchPaths.end() || saved->second.empty()) {
-				currentLogger->LogWarn(L"[%s] 学生端没有起来，也不知道它在哪", item.name);
-				continue;
-			}
-			if (SysHlp::RunApplication(saved->second.c_str(), NULL)) {
-				currentLogger->LogInfo(L"已启动电子教室 %s（%s）", item.name, saved->second.c_str());
-				started = true;
-			}
-			else {
-				currentLogger->LogWarn(L"启动电子教室 %s 失败：%s", item.name, saved->second.c_str());
-			}
+		auto saved = _EduLaunchPaths.find(item.name);
+		if (saved == _EduLaunchPaths.end() || saved->second.empty()) {
+			currentLogger->LogWarn(L"[%s] 没有在运行，也没记下它装在哪，无法启动", item.name);
+			continue;
+		}
+		if (SysHlp::RunApplication(saved->second.c_str(), NULL)) {
+			currentLogger->LogInfo(L"已启动电子教室 %s（%s）", item.name, saved->second.c_str());
+			acted = true;
 		}
 		else {
-			started = true;
+			currentLogger->LogWarn(L"启动电子教室 %s 失败：%s", item.name, saved->second.c_str());
 		}
-		if (started) acted = true;
 	}
 
-	// 刚起来的进程让下一轮扫描立刻接手，不用等满 10 秒。
-	if (acted && _EduCompatEnabled) _LastEduCompatScan = 0;
+	// 守护进程拉起学生端要几秒到十几秒。这段时间把扫描间隔收紧到 2 秒，起来
+	// 就立刻接管，界面标题不用等到下一个十秒窗口才改口。
+	if (acted) {
+		_EduStartWatchUntil = GetTickCount64() + 30000;
+		if (_EduCompatEnabled) _LastEduCompatScan = 0;
+	}
 	return acted;
 }
 
@@ -2340,7 +2464,10 @@ void TrainerWorkerInternal::SetEduCompatAutoInject(bool enabled)
 void TrainerWorkerInternal::NotifyEduHosts()
 {
 	if (!_Callback) return;
-	const std::wstring summary = GetEduHostSummary();
+	std::wstring summary = GetEduHostSummary();
+	// 还没接管、但进程已经在跑的产品也报给界面：那个数（count）仍是 0，
+	// 界面靠 summary 非空认出「待接管」，不然卡片会写「未运行」。
+	if (summary.empty()) summary = GetEduPendingSummary();
 	_Callback->OnUpdateEduHosts(GetEduHostCount(), summary.c_str());
 	// 标题里要报产品名，注入成功当刻就刷新一次，别等下一轮 PID 重置。
 	UpdateState();

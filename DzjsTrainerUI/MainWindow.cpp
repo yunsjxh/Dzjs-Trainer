@@ -4676,11 +4676,14 @@ void MainWindow::PaintOverview(Graphics& g, int width, int height, int offsetY)
 	// 极域没起来、但其他教室的学生端已经接管时，这里再写「待检测 / 进程未运行」
 	// 就是在骗人：防护其实在工作，只是对象换了一个。
 	const bool eduOnly = !studentRunning && eduHostCount > 0;
+	// 进程在跑、还没轮到接管（守护进程刚把它拉起来，或者自动接管被关掉）。
+	// 工作线程在这时候把产品名放进 summary，count 仍是 0。
+	const bool eduPending = !studentRunning && eduHostCount == 0 && !eduHostSummary.empty();
 	WCHAR eduBadge[32] = {};
 	if (eduOnly) swprintf_s(eduBadge, L"\u5176\u4ed6\u6559\u5ba4 %d \u4e2a", eduHostCount);
-	Text(g, studentRunning ? L"\u5df2\u8fde\u63a5" : (eduOnly ? L"\u5df2\u63a5\u7ba1" : L"\u5f85\u68c0\u6d4b"),
+	Text(g, studentRunning ? L"\u5df2\u8fde\u63a5" : (eduOnly ? L"\u5df2\u63a5\u7ba1" : (eduPending ? L"\u5f85\u63a5\u7ba1" : L"\u5f85\u68c0\u6d4b")),
 		badgeX + 8, badgeY + 56, 104, 26, 15, FontStyleBold, onPrimary, StringAlignmentCenter);
-	Text(g, studentRunning ? L"StudentMain" : (eduOnly ? eduBadge : L"\u8fdb\u7a0b\u672a\u8fd0\u884c"),
+	Text(g, studentRunning ? L"StudentMain" : (eduOnly ? eduBadge : (eduPending ? L"\u8fdb\u7a0b\u5728\u8fd0\u884c" : L"\u8fdb\u7a0b\u672a\u8fd0\u884c")),
 		badgeX + 8, badgeY + 84, 104, 18, 10, FontStyleRegular, onPrimary, StringAlignmentCenter);
 
 	const float gap = 12.0f;
@@ -4700,15 +4703,17 @@ void MainWindow::PaintOverview(Graphics& g, int width, int height, int offsetY)
 	swprintf_s(pidText, L"PID  %lu", static_cast<unsigned long>(studentPid));
 	Text(g, L"\u53d7\u63a7\u5bbf\u4e3b", contentX + cardW + gap + 18, metricsY + 15, cardW - 32, 18, 11, FontStyleRegular, C(darkMode, 91, 97, 94, 169, 179, 174));
 	const wchar_t* hostValue = studentRunning ? pidText
-		: (eduHostCount > 0 ? L"\u5176\u4ed6\u6559\u5ba4" : L"\u672a\u8fd0\u884c");
+		: (eduHostCount > 0 ? L"\u5176\u4ed6\u6559\u5ba4"
+			: (eduPending ? L"\u5f85\u63a5\u7ba1" : L"\u672a\u8fd0\u884c"));
 	Text(g, hostValue, contentX + cardW + gap + 18, metricsY + 42, cardW - 32, 26, 16, FontStyleBold, C(darkMode, 24, 30, 27, 226, 233, 229));
-	if (eduHostCount > 0) {
+	if (eduHostCount > 0 || eduPending) {
 		Text(g, eduHostSummary.c_str(), contentX + cardW + gap + 18, metricsY + 70, cardW - 34, 16, 9,
 			FontStyleRegular, C(darkMode, 91, 97, 94, 169, 179, 174));
 	}
 	// 只装了别家教室的机器上极域路径是空的，这张卡原来就那么空着。
 	// 有宿主接管时改报产品名，三张卡才都说得上话。
-	const bool showProducts = studentPath.empty() && eduHostCount > 0;
+	const bool hasJiYuPath = !studentPath.empty() && studentPath != L"\u672a\u68c0\u6d4b\u5230";
+	const bool showProducts = !hasJiYuPath && (eduHostCount > 0 || eduPending);
 	Text(g, showProducts ? L"\u53d7\u63a7\u4ea7\u54c1" : L"\u68c0\u6d4b\u8def\u5f84", contentX + (cardW + gap) * 2 + 18, metricsY + 15, cardW - 32, 18, 11, FontStyleRegular, C(darkMode, 91, 97, 94, 169, 179, 174));
 	Text(g, showProducts ? eduHostSummary.c_str() : studentPath.c_str(), contentX + (cardW + gap) * 2 + 18, metricsY + 40, cardW - 34, 38, 11, FontStyleBold, C(darkMode, 24, 30, 27, 226, 233, 229));
 
@@ -5397,10 +5402,12 @@ void MainWindow::PaintInjection(Gdiplus::Graphics& g, int width, int height, int
 	const Color hairline = C(darkMode, 226, 234, 229, 44, 52, 48);
 	// 宿主数量由工作线程回调写入，绘制前拷一份，免得 wstring 读到一半被改。
 	bool eduOn = true;
+	int eduCount = 0;
 	std::wstring eduSummary;
 	{
 		std::lock_guard<std::mutex> guard(stateMutex);
 		eduOn = eduCompatAutoInject;
+		eduCount = eduHostCount;
 		eduSummary = eduHostSummary;
 	}
 	SoftShadow(g, RectF(x, y, w, h), 12, darkMode);
@@ -5426,7 +5433,8 @@ void MainWindow::PaintInjection(Gdiplus::Graphics& g, int width, int height, int
 		if (!eduOn)
 			detail = L"\u5df2\u5173\u95ed\uff1a\u4e0d\u4f1a\u81ea\u52a8\u6ce8\u5165\u65b0\u8fdb\u7a0b\uff0c\u4e0b\u9762\u7684\u624b\u52a8\u6ce8\u5165\u4e0d\u53d7\u5f71\u54cd";
 		else if (!eduSummary.empty())
-			detail = L"\u5f53\u524d\u5df2\u63a5\u7ba1 " + eduSummary;
+			detail = eduCount > 0 ? (L"\u5f53\u524d\u5df2\u63a5\u7ba1 " + eduSummary)
+				: (L"\u68c0\u6d4b\u5230 " + eduSummary + L" \u5728\u8fd0\u884c\uff0c\u7b49\u5f85\u63a5\u7ba1");
 		else
 			detail = L"\u8bc6\u522b\u5230 \u4f3d\u5361\u4ed6\u5361 / \u7ea2\u8718\u86db / \u8054\u60f3\u4f20\u5947 \u5b66\u751f\u7aef\u65f6\u81ea\u52a8\u6ce8\u5165\uff0c\u4e0d\u7528\u624b\u52a8\u9009";
 		Text(g, detail.c_str(), cardX + 16, cardY + 36, cardW - 100, 17, 10, FontStyleRegular, secondary);
@@ -9441,7 +9449,12 @@ void MainWindow::ShowEduMenu()
 	}
 	for (int i = 0; i < kEduProductCount; ++i) {
 		const int count = currentWorker ? currentWorker->GetEduHostCountOf(kEduProducts[i].name) : 0;
-		if (count <= 0) continue;
+		// 注入记录只说明「已经接管了几个」，不说明「跑没跑」。红蜘蛛的学生端
+		// 被守护进程拉起来之后，要等下一轮扫描才进记录，这十几秒里用户看得见
+		// 它在跑，菜单却只给「启动」——所以按进程本身再判一次。
+		const bool productRunning = count > 0 ||
+			(currentWorker && currentWorker->IsEduProductRunning(kEduProducts[i].name));
+		if (!productRunning) continue;
 		std::wstring label = kEduProducts[i].name;
 		if (count > 1) label += L" \u00d7" + std::to_wstring(count);
 		AppendMenuW(menu, MF_STRING, CMD_END_EDU_BASE + i, label.c_str());
