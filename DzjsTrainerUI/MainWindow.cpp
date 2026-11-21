@@ -4642,8 +4642,15 @@ void MainWindow::PaintOverview(Graphics& g, int width, int height, int offsetY)
 	const float badgeY = top + 29;
 	FillRound(g, RectF(badgeX, badgeY, 120, 112), 20, primary);
 	DrawIcon(g, 1, badgeX + 46, badgeY + 18, onPrimary, 28);
-	Text(g, studentRunning ? L"\u5df2\u8fde\u63a5" : L"\u5f85\u68c0\u6d4b", badgeX + 8, badgeY + 56, 104, 26, 15, FontStyleBold, onPrimary, StringAlignmentCenter);
-	Text(g, studentRunning ? L"StudentMain" : L"\u8fdb\u7a0b\u672a\u8fd0\u884c", badgeX + 8, badgeY + 84, 104, 18, 10, FontStyleRegular, onPrimary, StringAlignmentCenter);
+	// 极域没起来、但其他教室的学生端已经接管时，这里再写「待检测 / 进程未运行」
+	// 就是在骗人：防护其实在工作，只是对象换了一个。
+	const bool eduOnly = !studentRunning && eduHostCount > 0;
+	WCHAR eduBadge[32] = {};
+	if (eduOnly) swprintf_s(eduBadge, L"\u5176\u4ed6\u6559\u5ba4 %d \u4e2a", eduHostCount);
+	Text(g, studentRunning ? L"\u5df2\u8fde\u63a5" : (eduOnly ? L"\u5df2\u63a5\u7ba1" : L"\u5f85\u68c0\u6d4b"),
+		badgeX + 8, badgeY + 56, 104, 26, 15, FontStyleBold, onPrimary, StringAlignmentCenter);
+	Text(g, studentRunning ? L"StudentMain" : (eduOnly ? eduBadge : L"\u8fdb\u7a0b\u672a\u8fd0\u884c"),
+		badgeX + 8, badgeY + 84, 104, 18, 10, FontStyleRegular, onPrimary, StringAlignmentCenter);
 
 	const float gap = 12.0f;
 	const float cardW = (contentW - gap * 2) / 3.0f;
@@ -4656,10 +4663,18 @@ void MainWindow::PaintOverview(Graphics& g, int width, int height, int offsetY)
 	}
 	Text(g, L"\u9632\u62a4\u72b6\u6001", contentX + 18, metricsY + 15, cardW - 32, 18, 11, FontStyleRegular, C(darkMode, 91, 97, 94, 169, 179, 174));
 	Text(g, currentControlled ? L"\u5b8c\u6574\u9632\u62a4" : L"\u6b63\u5728\u76d1\u63a7", contentX + 18, metricsY + 42, cardW - 32, 28, 16, FontStyleBold, C(darkMode, 24, 30, 27, 226, 233, 229));
+	// 这张卡原来只写极域，装了其他教室的机器会一直显示「未运行」，看着像没生效。
+	// 现在把两边合在一起：有极域就给 PID，没有就报其他教室的数量，下面一行补产品名。
 	wchar_t pidText[64];
 	swprintf_s(pidText, L"PID  %lu", static_cast<unsigned long>(studentPid));
-	Text(g, L"\u5b66\u751f\u7aef\u8fdb\u7a0b", contentX + cardW + gap + 18, metricsY + 15, cardW - 32, 18, 11, FontStyleRegular, C(darkMode, 91, 97, 94, 169, 179, 174));
-	Text(g, studentRunning ? pidText : L"\u672a\u8fd0\u884c", contentX + cardW + gap + 18, metricsY + 42, cardW - 32, 28, 16, FontStyleBold, C(darkMode, 24, 30, 27, 226, 233, 229));
+	Text(g, L"\u53d7\u63a7\u5bbf\u4e3b", contentX + cardW + gap + 18, metricsY + 15, cardW - 32, 18, 11, FontStyleRegular, C(darkMode, 91, 97, 94, 169, 179, 174));
+	const wchar_t* hostValue = studentRunning ? pidText
+		: (eduHostCount > 0 ? L"\u5176\u4ed6\u6559\u5ba4" : L"\u672a\u8fd0\u884c");
+	Text(g, hostValue, contentX + cardW + gap + 18, metricsY + 42, cardW - 32, 26, 16, FontStyleBold, C(darkMode, 24, 30, 27, 226, 233, 229));
+	if (eduHostCount > 0) {
+		Text(g, eduHostSummary.c_str(), contentX + cardW + gap + 18, metricsY + 70, cardW - 34, 16, 9,
+			FontStyleRegular, C(darkMode, 91, 97, 94, 169, 179, 174));
+	}
 	Text(g, L"\u68c0\u6d4b\u8def\u5f84", contentX + (cardW + gap) * 2 + 18, metricsY + 15, cardW - 32, 18, 11, FontStyleRegular, C(darkMode, 91, 97, 94, 169, 179, 174));
 	Text(g, studentPath.c_str(), contentX + (cardW + gap) * 2 + 18, metricsY + 40, cardW - 34, 38, 11, FontStyleBold, C(darkMode, 24, 30, 27, 226, 233, 229));
 
@@ -5344,12 +5359,51 @@ void MainWindow::PaintInjection(Gdiplus::Graphics& g, int width, int height, int
 	const Color titleColor = C(darkMode, 42, 49, 46, 220, 229, 225);
 	const Color secondary = C(darkMode, 98, 106, 102, 159, 171, 165);
 	const Color hairline = C(darkMode, 226, 234, 229, 44, 52, 48);
+	// 宿主数量由工作线程回调写入，绘制前拷一份，免得 wstring 读到一半被改。
+	bool eduOn = true;
+	std::wstring eduSummary;
+	{
+		std::lock_guard<std::mutex> guard(stateMutex);
+		eduOn = eduCompatAutoInject;
+		eduSummary = eduHostSummary;
+	}
 	SoftShadow(g, RectF(x, y, w, h), 12, darkMode);
 	FillRound(g, RectF(x, y, w, h), 12, C(darkMode, 255, 255, 255, 33, 40, 37));
-	Text(g, L"\u81ea\u5b9a\u4e49\u8fdb\u7a0b\u6ce8\u5165", x + 24, y + 22, w - 48, 26, 15, FontStyleBold, titleColor);
+	Text(g, L"\u8fdb\u7a0b\u6ce8\u5165\u4e0e\u7535\u5b50\u6559\u5ba4", x + 24, y + 22, w - 48, 26, 15, FontStyleBold, titleColor);
 	Text(g, L"\u628a hooks DLL \u6ce8\u5165\u5230\u4f60\u9009\u4e2d\u7684\u8fdb\u7a0b\uff1a\u70b9\u4e0b\u65b9\u6309\u94ae\u4f1a\u6253\u5f00\u8fdb\u7a0b\u5217\u8868\uff0c\u6309\u540d\u79f0\u6216 PID \u8fc7\u6ee4\u540e\u9009\u4e2d\u5373\u53ef\uff0c32 / 64 \u4f4d\u81ea\u52a8\u8bc6\u522b\u3002", x + 24, y + 54, w - 48, 22, 11, FontStyleRegular, secondary);
 	Text(g, L"\u9ed8\u8ba4\u88c5 34 \u9879\u6709\u5e8f\u8868\uff1bini [CustomInject] Mode=minimal \u53ef\u8df3\u8fc7\u6781\u57df\u4e13\u5c5e\u94a9\u5b50\u3002\u7cfb\u7edf\u5173\u952e\u8fdb\u7a0b\u4e5f\u53ef\u9009\uff0c\u6807\u300c\u7cfb\u7edf\u300d\u4ec5\u4f5c\u63d0\u793a\u3002", x + 24, y + 78, w - 48, 22, 11, FontStyleRegular, secondary);
-	const float by = y + 116;
+
+	// 自动接管开关。以前只能改 ini 的 EduCompatAutoInject，界面上没有入口，
+	// 用户既不知道程序会自己往别的教室进程里注东西，也没法关掉。
+	{
+		const float cardX = x + 24;
+		const float cardY = y + 108;
+		const float cardW = w - 48;
+		eduCompatToggleRect = { static_cast<LONG>(cardX), static_cast<LONG>(cardY),
+			static_cast<LONG>(cardX + cardW), static_cast<LONG>(cardY + 64) };
+		FillRound(g, RectF(cardX, cardY, cardW, 64), 12,
+			Blend(C(darkMode, 248, 251, 249, 31, 37, 35),
+				C(darkMode, 220, 237, 231, 49, 63, 58), hoverProgress[113]));
+		Text(g, L"\u81ea\u52a8\u63a5\u7ba1\u5176\u4ed6\u7535\u5b50\u6559\u5ba4", cardX + 16, cardY + 10, cardW - 100, 20, 11,
+			FontStyleBold, titleColor);
+		std::wstring detail;
+		if (!eduOn)
+			detail = L"\u5df2\u5173\u95ed\uff1a\u4e0d\u4f1a\u81ea\u52a8\u6ce8\u5165\u65b0\u8fdb\u7a0b\uff0c\u4e0b\u9762\u7684\u624b\u52a8\u6ce8\u5165\u4e0d\u53d7\u5f71\u54cd";
+		else if (!eduSummary.empty())
+			detail = L"\u5f53\u524d\u5df2\u63a5\u7ba1 " + eduSummary;
+		else
+			detail = L"\u8bc6\u522b\u5230 \u4f3d\u5361\u4ed6\u5361 / \u7ea2\u8718\u86db / \u8054\u60f3\u4f20\u5947 \u5b66\u751f\u7aef\u65f6\u81ea\u52a8\u6ce8\u5165\uff0c\u4e0d\u7528\u624b\u52a8\u9009";
+		Text(g, detail.c_str(), cardX + 16, cardY + 36, cardW - 100, 17, 10, FontStyleRegular, secondary);
+		const float knobMotion = AnimateToggle(20, eduOn);
+		FillRound(g, RectF(cardX + cardW - 60, cardY + 19, 44, 26), 13,
+			Blend(C(darkMode, 116, 124, 120, 97, 108, 103),
+				C(darkMode, 0, 107, 95, 130, 213, 199), knobMotion));
+		SolidBrush knob(Blend(C(darkMode, 245, 247, 245, 219, 225, 222),
+			C(darkMode, 255, 255, 255, 0, 55, 49), knobMotion));
+		g.FillEllipse(&knob, RectF(cardX + cardW - (56.0f - knobMotion * 18.0f), cardY + 23, 18, 18));
+	}
+
+	const float by = y + 188;
 	const float bw = 150.0f;
 	const wchar_t* labels[] = { L"\u6ce8\u5165\u5230\u6307\u5b9a\u8fdb\u7a0b", L"\u5378\u8f7d", L"\u5237\u65b0\u5217\u8868" };
 	for (int i = 0; i < 3; ++i) {
@@ -5359,9 +5413,9 @@ void MainWindow::PaintInjection(Gdiplus::Graphics& g, int width, int height, int
 		PaintButton(g, RectF(bx, by, bw, 40), labels[i], 110 + i,
 			i == 1 ? ButtonStyle::Danger : (i == 0 ? ButtonStyle::Primary : ButtonStyle::Tonal), 10.0f);
 	}
-	Text(g, customInjectStatus.c_str(), x + 24, y + 172, w - 48, 24, 11, FontStyleBold, titleColor);
-	const float listY = y + 206;
-	const float listH = (std::max)(120.0f, h - 240.0f);
+	Text(g, customInjectStatus.c_str(), x + 24, y + 244, w - 48, 24, 11, FontStyleBold, titleColor);
+	const float listY = y + 278;
+	const float listH = (std::max)(110.0f, h - 312.0f);
 	FillRound(g, RectF(x + 24, listY, w - 48, listH), 12, surface);
 	StrokeRound(g, RectF(x + 24, listY, w - 48, listH), 12, hairline);
 	const std::wstring list = customInjectList.empty()
@@ -7643,6 +7697,7 @@ int MainWindow::HitTargetAt(POINT point)
 	if (page == Page::Logs && Hit(exportLogRect, point)) target = 40;
 	if (page == Page::Injection) {
 		for (int i = 0; i < 3; ++i) if (Hit(customInjectRects[i], point)) target = 110 + i;
+		if (Hit(eduCompatToggleRect, point)) target = 113;
 	}
 	if (Hit(themeRect, point)) target = 41;
 	if ((page == Page::Protection || page == Page::Replacement) && Hit(advancedSettingsRect, point)) target = 42;
@@ -7723,6 +7778,7 @@ bool MainWindow::TargetRect(int target, RECT* rect) const
 	case 64: case 65: case 66: found = advancedKillRects[target - 64]; break;
 	case 67: case 68: found = advancedInjectRects[target - 67]; break;
 	case 110: case 111: case 112: found = customInjectRects[target - 110]; break;
+	case 113: found = eduCompatToggleRect; break;
 	case 69: found = advancedSaveRect; break;
 	case 70: case 71: found = advancedTabRects[target - 70]; break;
 	case 72: found = networkProjectRect; break;
@@ -7927,6 +7983,17 @@ void MainWindow::HandleClick(POINT point)
 	}
 	for (int i = 0; i < kNavCount; ++i) if (Hit(navRects[i], point)) { SelectPage(static_cast<Page>(i)); return; }
 	if (page == Page::Injection) {
+		if (Hit(eduCompatToggleRect, point)) {
+			eduCompatAutoInject = !eduCompatAutoInject;
+			// 落盘给注入端读，再直接改工作线程的开关，不用等下一次重读 ini。
+			JTAppGetSettingsDirect()->SetSettingBool(L"EduCompatAutoInject", eduCompatAutoInject);
+			if (currentWorker) currentWorker->SetEduCompatAutoInject(eduCompatAutoInject);
+			ShowFastTip(eduCompatAutoInject
+				? L"已开启：识别到其他电子教室学生端会自动注入"
+				: L"已关闭：不再自动注入新进程，已注入的继续生效");
+			InvalidateRect(_hWnd, nullptr, FALSE);
+			return;
+		}
 		for (int i = 0; i < 3; ++i) if (Hit(customInjectRects[i], point)) {
 			if (i == 2) {
 				if (currentWorker) customInjectList = currentWorker->GetCustomInjectedList();
@@ -9431,6 +9498,9 @@ void MainWindow::ApplyTemporaryVideoProtection()
 	const std::wstring mode = L"hk:setvideomode:" + temporaryVideoMode;
 	currentWorker->SendMessageToVirus(mode.c_str());
 	currentWorker->SendMessageToVirus(temporaryVideoProtection ? L"hk:setvideo:1" : L"hk:setvideo:0");
+	// 上面几条只发给极域。其他教室的宿主不认这套命令，让它们重读一次 ini，
+	// 否则界面切了「信息流保护」，教师端那边看到的还是旧画面。
+	currentWorker->SyncCustomHosts();
 }
 
 bool MainWindow::ChooseTemporaryVideoMedia(bool image)
@@ -9478,6 +9548,16 @@ void MainWindow::OnUpdateStudentMainInfo(bool running, LPCWSTR fullPath, DWORD p
 	PostMessageW(_hWnd, WM_NATIVE_REFRESH, 0, 0);
 }
 
+void MainWindow::OnUpdateEduHosts(int count, LPCWSTR summary)
+{
+	{
+		std::lock_guard<std::mutex> guard(stateMutex);
+		eduHostCount = count;
+		eduHostSummary = summary ? summary : L"";
+	}
+	PostMessageW(_hWnd, WM_NATIVE_REFRESH, 0, 0);
+}
+
 void MainWindow::OnUpdateState(TrainerStatus status, LPCWSTR textMain, LPCWSTR textMore)
 {
 	{
@@ -9505,6 +9585,8 @@ void MainWindow::LoadSettings()
 	setTopMost = settings->GetSettingBool(L"TopMost", true);
 	setAllowAllRunOp = settings->GetSettingBool(L"AllowAllRunOp", true);
 	setAllowMonitor = settings->GetSettingBool(L"AllowMonitor", true);
+	// 自动接管其他电子教室。默认开，和工作线程里的默认值保持一致。
+	eduCompatAutoInject = settings->GetSettingBool(L"EduCompatAutoInject", true);
 	// 默认值必须和注入端 VInitSettings 的默认值一致，否则界面显示"已拦截"、
 	// 钩子那边其实是放行，两边对不上。2026-11-14 起全部默认只记录。
 	setAllowControl = settings->GetSettingBool(L"AllowControl", true);

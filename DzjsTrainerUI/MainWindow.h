@@ -48,6 +48,7 @@ public:
 
 	void OnUpdateStudentMainInfo(bool running, LPCWSTR fullPath, DWORD pid, bool byuser) override;
 	void OnUpdateState(TrainerStatus status, LPCWSTR textMain, LPCWSTR textMore) override;
+	void OnUpdateEduHosts(int count, LPCWSTR summary) override;
 	void OnResolveBlackScreenWindow() override;
 	void OnBeforeSendStartConf() override;
 	HWND GetMainHWND() override { return _hWnd; }
@@ -188,6 +189,12 @@ private:
 	std::array<RECT, 3> customInjectRects{};
 	std::wstring customInjectStatus = L"\u5c31\u7eea";
 	std::wstring customInjectList;
+	// 「自动接管其他电子教室」开关：以前只能改 ini，界面上要能看到、能关掉。
+	RECT eduCompatToggleRect{};
+	bool eduCompatAutoInject = true;
+	// 其他电子教室宿主的现状，由 OnUpdateEduHosts 推过来，概览页和注入页共用。
+	int eduHostCount = 0;
+	std::wstring eduHostSummary;
 
 	// 进程选择弹窗：和更新弹窗共用一套窗口内自绘模态卡片，不再弹原生对话框。
 	// 原生 STATIC/EDIT/BUTTON 是直角灰底 + 系统标题栏，和这套圆角玻璃界面两套皮。

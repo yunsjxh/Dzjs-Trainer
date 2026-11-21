@@ -33,6 +33,9 @@ public:
 
 	virtual void OnUpdateStudentMainInfo(bool running, LPCWSTR fullPath, DWORD pid, bool byuser) {}
 	virtual void OnUpdateState(TrainerStatus status, LPCWSTR textMain, LPCWSTR textMore) {}
+	// 其他电子教室宿主（自动适配注入的那些进程）有增减时回调。
+	// count 是当前受控的宿主进程数，summary 形如「红蜘蛛 ×1、联想传奇 ×2」。
+	virtual void OnUpdateEduHosts(int count, LPCWSTR summary) {}
 	virtual void OnResolveBlackScreenWindow() {}
 	virtual void OnSimpleMessageCallback(LPCWSTR text) {}
 	virtual void OnBeforeSendStartConf() {}
@@ -75,6 +78,16 @@ public:
 	virtual std::wstring GetCustomInjectedList() { return L""; }
 	// 进程选择器用 PID 查「已注入」标记。返回 bool 而不是容器，避免跨 DLL 传 STL。
 	virtual bool IsCustomInjected(DWORD pid) { return false; }
+
+	// 「自动接管其他电子教室」（EduProducts.h 里登记的产品）。关掉只是不再
+	// 自动注入新进程，已经注进去的宿主保持不动，等它们退出或被手动卸载。
+	virtual void SetEduCompatAutoInject(bool enabled) {}
+	virtual bool GetEduCompatAutoInject() { return true; }
+	virtual int GetEduHostCount() { return 0; }
+	virtual std::wstring GetEduHostSummary() { return L""; }
+	// 让已注入的电子教室宿主重读 ini。界面上改了显示相关开关（信息流保护、
+	// 允许监看）之后调用，否则要等宿主重启或者下一次保存设置才生效。
+	virtual void SyncCustomHosts() {}
 };
 
 #ifdef JTEXPORT
@@ -111,11 +124,18 @@ public:
 	bool UninjectCustomProcess(LPCWSTR target, std::wstring* status) override;
 	std::wstring GetCustomInjectedList() override;
 	bool IsCustomInjected(DWORD pid) override;
+	void SetEduCompatAutoInject(bool enabled) override;
+	bool GetEduCompatAutoInject() override { return _EduCompatEnabled; }
+	int GetEduHostCount() override;
+	std::wstring GetEduHostSummary() override;
+	void SyncCustomHosts() override;
 
 	// 扫描 EduProducts.h 里登记的学生端进程，命中就按通用宿主注入。
 	// 一台机器可以同时装几套电子教室，一轮扫描会把命中的目标全部注进去。
 	// 只在 _EduCompatEnabled 打开时做事，失败的目标会被压住一段时间不重试。
 	void RunEduCompatInject();
+	// 受控宿主有增减时通知界面。调用点只有注入成功、卸载、清理死进程三处。
+	void NotifyEduHosts();
 
 	bool Kill(bool autoWork = false);
 	bool KillStAuto();
@@ -145,6 +165,9 @@ private:
 		DWORD pid = 0;
 		std::wstring name;
 		bool is64 = false;
+		// 命中 EduProducts.h 的产品名（如「红蜘蛛」）。手动注入的普通进程为空，
+		// 界面据此把自动接管的目标和用户自己选的分开显示。
+		std::wstring product;
 	};
 	std::list<CustomInjectedProcess> _CustomInjected;
 

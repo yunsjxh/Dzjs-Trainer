@@ -154,7 +154,17 @@ AES 那半边的拆分明文（partA / partB 异或还原）**硬编码在三处
 
 **注入的实例用独立窗口标题**（`EDZU_CUSTOM_HOST_WINDOW_TITLE`）。主程序靠 `FindWindow("JiYu Trainer Virus Window")` 找极域消息中心，注入进程要是同名，`hk:` 命令会投给错误的进程。标题分开之后，要给它们同步设置得走 `MsgCenterSendToCustomHosts()` —— `InitSettings()` 每次保存设置都会发一条 `hk:reset`，对端重读 ini 并按新开关补装钩子。
 
-自动注入在 `TrainerWorker::RunEduCompatInject()`，扫描 10 秒一次（`RunResetPid` 是 2 秒一次的定时器，直接挂上去太密），失败的目标压 10 分钟再试。关掉自动注入：ini 里 `[JTSettings] EduCompatAutoInject=0`。
+自动注入在 `TrainerWorker::RunEduCompatInject()`，扫描 10 秒一次（`RunResetPid` 是 2 秒一次的定时器，直接挂上去太密），失败的目标压 10 分钟再试。
+
+**开关在「进程注入」页顶部**（「自动接管其他电子教室」）。点一下会写 ini 的 `[JTSettings] EduCompatAutoInject`，同时调用 `SetEduCompatAutoInject` 让工作线程立刻改状态、把下一次扫描提前到本轮；只改 ini 的话要重启程序才生效。关掉只停止注入新进程，已经注进去的宿主保持原样。
+
+界面上有三处跟着这个状态走，改后端时别漏：
+
+- 宿主数量由 `NotifyEduHosts()` 推给界面（`TrainerWorkerCallback::OnUpdateEduHosts`），只在注入成功、卸载成功、清理死进程三处触发。界面不轮询 `_CustomInjected` —— 那是工作线程的数据。
+- 概览页的徽标和「受控宿主」卡片。极域没跑但其他教室已经接管时显示「已接管 / 其他教室 N 个」，卡片下面一行列产品名；原来固定写「待检测 / 进程未运行」，装了别的教室也像没生效。
+- 注入列表里，命中产品表的目标带 `· 红蜘蛛` 这样的后缀，手动注入的普通进程不带。
+
+`SyncCustomHosts()` 是给「界面改了显示开关」用的。`ApplyTemporaryVideoProtection()` 改完媒体和 `EnableVideoModify` 之后要广播一次 `hk:reset`，否则宿主还按旧的 ini 值拦或放 —— 极域那几条 `hk:` 命令它们不认。
 
 **几套产品同时装、同时跑是常态，所以一轮把所有命中的目标都注进去**，不是每轮注一个。每轮注一个的话，第二套要等 10 秒才受控，这中间它对教师端完全透明。单轮上限 6 个：64 位目标要起注入助手并等它返回，一轮全注会占住界面线程。
 

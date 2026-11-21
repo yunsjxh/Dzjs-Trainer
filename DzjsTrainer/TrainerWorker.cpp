@@ -92,9 +92,7 @@ void TrainerWorkerInternal::InitSettings()
 	// 第三方电子教室宿主没有极域的握手机制，上面那几条 hk: 命令到不了它们，
 	// 它们在注入时只读过一次 ini。补一条 reset：对端会重读 ini、按新的
 	// AllowMonitor / EnableVideoModify 补装钩子，界面上刚改的开关才真的生效。
-	const int customHosts = MsgCenterSendToCustomHosts(L"hk:reset", hWndMain);
-	if (customHosts > 0)
-		currentLogger->LogInfo(L"已向 %d 个电子教室宿主同步显示设置", customHosts);
+	SyncCustomHosts();
 }
 void TrainerWorkerInternal::UpdateScreenSize()
 {
@@ -1166,6 +1164,9 @@ bool TrainerWorkerInternal::RunInjector64(DWORD pid, LPCWSTR dllPath, bool unloa
 	return true;
 }
 
+// 定义在文件后半段（卸载之后），注入时要先用它查路径判断产品归属。
+static bool QueryProcessImagePath(DWORD pid, std::wstring* outPath);
+
 bool TrainerWorkerInternal::InjectCustomProcess(LPCWSTR target, std::wstring* status)
 {
 	DWORD pid = 0;
@@ -1197,7 +1198,15 @@ bool TrainerWorkerInternal::InjectCustomProcess(LPCWSTR target, std::wstring* st
 	record.pid = pid;
 	record.name = name;
 	record.is64 = is64;
+	// 手动注入的目标也过一遍产品表：用户自己点了「红蜘蛛」，界面上照样要能看出
+	// 它属于哪套电子教室。路径查不到就当普通进程处理，不影响注入结果。
+	std::wstring imagePath;
+	if (QueryProcessImagePath(pid, &imagePath)) {
+		const wchar_t* product = EduCompatMatch(name.c_str(), imagePath.c_str());
+		if (product) record.product = product;
+	}
 	_CustomInjected.push_back(record);
+	if (!record.product.empty()) NotifyEduHosts();
 	WCHAR message[192] = {};
 	swprintf_s(message, L"已注入 %s [PID %lu，%s]", name.c_str(), pid, is64 ? L"64 位" : L"32 位");
 	SetCustomInjectStatus(status, message);
@@ -1214,9 +1223,11 @@ bool TrainerWorkerInternal::UninjectCustomProcess(LPCWSTR target, std::wstring* 
 	for (; it != _CustomInjected.end(); ++it) if (it->pid == pid) break;
 	bool is64 = false;
 	std::wstring recordName = name;
+	std::wstring recordProduct;
 	if (it != _CustomInjected.end()) {
 		is64 = it->is64;
 		recordName = it->name;
+		recordProduct = it->product;
 	}
 	else {
 		// 命令行 -uninject 由另一个进程发起，本进程的已注入列表是空的；
@@ -1237,6 +1248,7 @@ bool TrainerWorkerInternal::UninjectCustomProcess(LPCWSTR target, std::wstring* 
 	}
 	if (!ok) return false;
 	if (it != _CustomInjected.end()) _CustomInjected.erase(it);
+	if (!recordProduct.empty()) NotifyEduHosts();
 	// 手动卸载是有意为之：记一笔，自动适配别在 10 秒后又把它注回去。
 	// 进程退出后这条记录会被清掉，下次启动照常接管。
 	_EduManualSkip.insert(pid);
@@ -1274,11 +1286,25 @@ static bool QueryProcessImagePath(DWORD pid, std::wstring* outPath)
 // 6 个是「够用且基本感觉不到卡顿」的折中。
 void TrainerWorkerInternal::RunEduCompatInject()
 {
-	if (!_EduCompatEnabled) return;
-
 	const ULONGLONG now = GetTickCount64();
 	if (now - _LastEduCompatScan < 10000) return;
 	_LastEduCompatScan = now;
+
+	// 已注入记录里的死 PID 必须清掉：PID 会被复用，留着会让新起来的进程被
+	// 当成「已注入」而永远拿不到钩子。关掉自动注入时也要清 —— 界面上的列表
+	// 和进程选择器的「已注入」标记都读这份记录。
+	bool droppedHost = false;
+	for (auto it = _CustomInjected.begin(); it != _CustomInjected.end(); )
+	{
+		if (IsProcessGone(it->pid)) {
+			if (!it->product.empty()) droppedHost = true;
+			it = _CustomInjected.erase(it);
+		}
+		else ++it;
+	}
+	if (droppedHost) NotifyEduHosts();
+
+	if (!_EduCompatEnabled) return;
 
 	// 这一轮跑在界面线程上：注入助手等不到就得放弃，下一轮再来。40 秒那个上限
 	// 是给手动注入用的（用户知道自己在等），放在这里会把窗口钉住几十秒。
@@ -1295,13 +1321,6 @@ void TrainerWorkerInternal::RunEduCompatInject()
 	for (auto it = _EduManualSkip.begin(); it != _EduManualSkip.end(); )
 	{
 		if (IsProcessGone(*it)) it = _EduManualSkip.erase(it);
-		else ++it;
-	}
-	// 已注入记录里的死 PID 必须清掉：PID 会被复用，留着会让新起来的进程被
-	// 当成「已注入」而永远拿不到钩子。
-	for (auto it = _CustomInjected.begin(); it != _CustomInjected.end(); )
-	{
-		if (IsProcessGone(it->pid)) it = _CustomInjected.erase(it);
 		else ++it;
 	}
 
@@ -1393,13 +1412,87 @@ std::wstring TrainerWorkerInternal::GetCustomInjectedList()
 	if (_CustomInjected.empty()) return L"（暂无自定义注入进程）";
 	std::wstring text;
 	for (const auto& item : _CustomInjected) {
-		WCHAR line[192] = {};
-		swprintf_s(line, L"PID %-8lu  %-32s  %s", item.pid, item.name.c_str(),
-			item.is64 ? L"64 位" : L"32 位");
+		WCHAR line[224] = {};
+		// 自动接管的宿主带上产品名，用户才知道这行不是自己点的；
+		// 手动注入的目标保持原样，免得「· 手动」这种标签刷满一列。
+		if (item.product.empty()) {
+			swprintf_s(line, L"PID %-8lu  %-32s  %s", item.pid, item.name.c_str(),
+				item.is64 ? L"64 位" : L"32 位");
+		}
+		else {
+			swprintf_s(line, L"PID %-8lu  %-32s  %s  · %s", item.pid, item.name.c_str(),
+				item.is64 ? L"64 位" : L"32 位", item.product.c_str());
+		}
 		text += line;
 		text += L"\n";
 	}
 	return text;
+}
+
+int TrainerWorkerInternal::GetEduHostCount()
+{
+	int count = 0;
+	for (const auto& item : _CustomInjected)
+		if (!item.product.empty()) ++count;
+	return count;
+}
+
+// 「红蜘蛛 ×2、联想传奇 ×1」。按产品聚合，同类多开（学生端有时会起来两个
+// 进程）不会把同一句话重复几遍。
+std::wstring TrainerWorkerInternal::GetEduHostSummary()
+{
+	struct Group { std::wstring name; int count = 0; };
+	std::list<Group> groups;
+	for (const auto& item : _CustomInjected) {
+		if (item.product.empty()) continue;
+		auto it = groups.begin();
+		for (; it != groups.end(); ++it)
+			if (it->name == item.product) break;
+		if (it == groups.end()) {
+			Group group;
+			group.name = item.product;
+			group.count = 1;
+			groups.push_back(group);
+		}
+		else {
+			++it->count;
+		}
+	}
+	std::wstring text;
+	for (const auto& group : groups) {
+		if (!text.empty()) text += L"、";
+		WCHAR part[96] = {};
+		swprintf_s(part, L"%s ×%d", group.name.c_str(), group.count);
+		text += part;
+	}
+	return text;
+}
+
+void TrainerWorkerInternal::SetEduCompatAutoInject(bool enabled)
+{
+	if (_EduCompatEnabled == enabled) return;
+	_EduCompatEnabled = enabled;
+	// 下次定时器一响就生效，不用等满 10 秒的扫描间隔。
+	_LastEduCompatScan = 0;
+	// 关掉时把失败记录清空：重新打开后应该立刻重试，而不是接着压 10 分钟。
+	if (enabled) _EduInjectBlocked.clear();
+	currentLogger->LogInfo(L"EduCompat autoInject=%d（界面切换）", _EduCompatEnabled ? 1 : 0);
+}
+
+void TrainerWorkerInternal::NotifyEduHosts()
+{
+	if (!_Callback) return;
+	const std::wstring summary = GetEduHostSummary();
+	_Callback->OnUpdateEduHosts(GetEduHostCount(), summary.c_str());
+}
+
+void TrainerWorkerInternal::SyncCustomHosts()
+{
+	// 注入实例的窗口标题和极域不同，FindWindow 那套命令到不了它们，
+	// 只能靠这条广播。对端收到 reset 会重读 ini 并补装/拆掉钩子。
+	const int hosts = MsgCenterSendToCustomHosts(L"hk:reset", hWndMain);
+	if (hosts > 0)
+		currentLogger->LogInfo(L"已向 %d 个电子教室宿主同步显示设置", hosts);
 }
 
 bool TrainerWorkerInternal::IsCustomInjected(DWORD pid)
