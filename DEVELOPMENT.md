@@ -154,7 +154,17 @@ AES 那半边的拆分明文（partA / partB 异或还原）**硬编码在三处
 
 **注入的实例用独立窗口标题**（`EDZU_CUSTOM_HOST_WINDOW_TITLE`）。主程序靠 `FindWindow("JiYu Trainer Virus Window")` 找极域消息中心，注入进程要是同名，`hk:` 命令会投给错误的进程。标题分开之后，要给它们同步设置得走 `MsgCenterSendToCustomHosts()` —— `InitSettings()` 每次保存设置都会发一条 `hk:reset`，对端重读 ini 并按新开关补装钩子。
 
-自动注入在 `TrainerWorker::RunEduCompatInject()`。扫描 10 秒一次（`RunResetPid` 是 2 秒一次的定时器，直接挂上去太密），每轮最多注入一个新目标，64 位目标要起注入助手并等它返回。失败的目标压 10 分钟再试。关掉自动注入：ini 里 `[JTSettings] EduCompatAutoInject=0`。
+自动注入在 `TrainerWorker::RunEduCompatInject()`，扫描 10 秒一次（`RunResetPid` 是 2 秒一次的定时器，直接挂上去太密），失败的目标压 10 分钟再试。关掉自动注入：ini 里 `[JTSettings] EduCompatAutoInject=0`。
+
+**几套产品同时装、同时跑是常态，所以一轮把所有命中的目标都注进去**，不是每轮注一个。每轮注一个的话，第二套要等 10 秒才受控，这中间它对教师端完全透明。单轮上限 6 个：64 位目标要起注入助手并等它返回，一轮全注会占住界面线程。
+
+每个宿主进程里是**各自一份** hooks 实例，互不干扰；设置靠 `MsgCenterSendToCustomHosts()` 广播到所有带 `EDZU_CUSTOM_HOST_WINDOW_TITLE` 的窗口，改一次全都跟着变。所以「同时控制」不需要额外的调度，需要的是别把宿主当成只有一个：扫描、注入记录、卸载循环都得按集合写。
+
+三个容易写错的点：
+
+- **死 PID 必须每轮清掉。** PID 会被复用，`_CustomInjected` 里留着的死记录会让新进程被当成「已注入」，永远拿不到钩子。清的时候顺带比进程名，名字对不上说明 PID 已经被别的进程占了。
+- **手动卸载要能压住自动注入。** 用户在「进程注入」里卸掉某个宿主后，`_EduManualSkip` 记一笔，同一个进程不再注回去；进程退出后自动解禁，下次启动照常接管。
+- **先比名字再查路径。** 全量扫描要过一百多个进程，逐个 `OpenProcess` 查路径比 `EduCompatNameCandidate()` 贵得多，非候选在名字这一步就筛掉。
 
 **验证状态**：匹配逻辑有离线和多组用例（真实路径、大小写、同名反例、极域 `StudentMain.exe` 不该被认领），`cl` 编过。**注入之后的实际拦截没有实机验证过** —— 三款软件各自走哪些抓屏路径、锁屏用什么手段，都还不知道。真机跑起来先看日志里的 `product=` 和「已自动注入」，再看教师端画面。
 

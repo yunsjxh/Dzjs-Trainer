@@ -75,6 +75,20 @@ inline bool EduPathContainsNoCase(const wchar_t* haystack, const wchar_t* needle
 	return false;
 }
 
+// 只比进程名：扫描时先用它过一遍，非候选就不必去查进程路径。
+// 一次全量扫描要过一百多个进程，逐个 OpenProcess 查路径比这里贵得多。
+inline bool EduCompatNameCandidate(const wchar_t* exeName)
+{
+	if (!exeName) return false;
+	for (int i = 0; i < kEduProductCount; ++i)
+	{
+		const EduProduct& product = kEduProducts[i];
+		for (int r = 0; r < product.ruleCount; ++r)
+			if (_wcsicmp(exeName, product.rules[r].exe) == 0) return true;
+	}
+	return false;
+}
+
 // 命中返回产品名，否则 nullptr。
 inline const wchar_t* EduCompatMatch(const wchar_t* exeName, const wchar_t* fullPath)
 {

@@ -3,6 +3,7 @@
 #include <string>
 #include <list>
 #include <map>
+#include <set>
 #include "SysHlp.h"
 
 enum TrainerWorkerOp {
@@ -112,6 +113,7 @@ public:
 	bool IsCustomInjected(DWORD pid) override;
 
 	// 扫描 EduProducts.h 里登记的学生端进程，命中就按通用宿主注入。
+	// 一台机器可以同时装几套电子教室，一轮扫描会把命中的目标全部注进去。
 	// 只在 _EduCompatEnabled 打开时做事，失败的目标会被压住一段时间不重试。
 	void RunEduCompatInject();
 
@@ -151,6 +153,12 @@ private:
 	bool _EduCompatEnabled = true;
 	ULONGLONG _LastEduCompatScan = 0;
 	std::map<DWORD, ULONGLONG> _EduInjectBlocked;
+	// 用户在「进程注入」里手动卸载过的目标：同一个进程不再自动注入回去，
+	// 进程退出后自动解禁（PID 会被复用，不能用它做长期标记）。
+	std::set<DWORD> _EduManualSkip;
+	// 64 位注入助手的等待上限。手动注入时用户知道自己在等，给足 40 秒；
+	// 自动扫描是后台行为，卡住的是界面线程，所以压到几秒就放弃、下一轮再试。
+	DWORD _Injector64TimeoutMs = 40000;
 	bool ResolveCustomTarget(LPCWSTR target, DWORD* outPid, std::wstring* outName, std::wstring* status);
 	bool IsSelfCustomTarget(DWORD pid, LPCWSTR name, std::wstring* status);
 	bool DetectTargetBitness(DWORD pid, bool* outIs64, std::wstring* status);

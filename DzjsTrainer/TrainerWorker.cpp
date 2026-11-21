@@ -1152,7 +1152,7 @@ bool TrainerWorkerInternal::RunInjector64(DWORD pid, LPCWSTR dllPath, bool unloa
 		return false;
 	}
 	CloseHandle(processInfo.hThread);
-	WaitForSingleObject(processInfo.hProcess, 40000);
+	WaitForSingleObject(processInfo.hProcess, _Injector64TimeoutMs);
 	DWORD exitCode = STILL_ACTIVE;
 	GetExitCodeProcess(processInfo.hProcess, &exitCode);
 	CloseHandle(processInfo.hProcess);
@@ -1237,6 +1237,9 @@ bool TrainerWorkerInternal::UninjectCustomProcess(LPCWSTR target, std::wstring* 
 	}
 	if (!ok) return false;
 	if (it != _CustomInjected.end()) _CustomInjected.erase(it);
+	// 手动卸载是有意为之：记一笔，自动适配别在 10 秒后又把它注回去。
+	// 进程退出后这条记录会被清掉，下次启动照常接管。
+	_EduManualSkip.insert(pid);
 	WCHAR message[192] = {};
 	swprintf_s(message, L"已卸载 %s [PID %lu]", recordName.c_str(), pid);
 	SetCustomInjectStatus(status, message);
@@ -1264,8 +1267,11 @@ static bool QueryProcessImagePath(DWORD pid, std::wstring* outPath)
 
 // 扫描其他电子教室的学生端进程，命中产品表就按通用宿主注入。
 //
-// 两个限流：扫描本身 10 秒一次（RunResetPid 是 2 秒一次的定时器），每轮最多
-// 注入一个新目标（64 位目标要起注入助手并等待，一次进来三个会把界面卡住）。
+// 节奏：扫描本身 10 秒一次（RunResetPid 是 2 秒一次的定时器，直接跟着它跑太密）。
+// 一轮里把命中的目标全部注进去 —— 一台机器同时装两套电子教室是常态，每轮只注
+// 一个会让第二套晚 10 秒才受控，这中间它对教师端是完全透明的。
+// 单轮上限 6 个：64 位目标要起注入助手并等它返回，一轮全注会占住界面线程，
+// 6 个是「够用且基本感觉不到卡顿」的折中。
 void TrainerWorkerInternal::RunEduCompatInject()
 {
 	if (!_EduCompatEnabled) return;
@@ -1274,45 +1280,97 @@ void TrainerWorkerInternal::RunEduCompatInject()
 	if (now - _LastEduCompatScan < 10000) return;
 	_LastEduCompatScan = now;
 
-	// 失败记录压 10 分钟。PID 会被系统复用，过期就清掉重新试。
+	// 这一轮跑在界面线程上：注入助手等不到就得放弃，下一轮再来。40 秒那个上限
+	// 是给手动注入用的（用户知道自己在等），放在这里会把窗口钉住几十秒。
+	const DWORD savedInjectorTimeout = _Injector64TimeoutMs;
+	_Injector64TimeoutMs = 8000;
+
+	// 失败记录压 10 分钟。PID 会被系统复用，进程没了就立刻放开。
 	for (auto it = _EduInjectBlocked.begin(); it != _EduInjectBlocked.end(); )
 	{
-		if (now - it->second > 10 * 60 * 1000) it = _EduInjectBlocked.erase(it);
+		if (now - it->second > 10 * 60 * 1000 || IsProcessGone(it->first)) it = _EduInjectBlocked.erase(it);
+		else ++it;
+	}
+	// 手动卸载过的目标：同一个进程不再自动注入回去，进程退出后自动解禁。
+	for (auto it = _EduManualSkip.begin(); it != _EduManualSkip.end(); )
+	{
+		if (IsProcessGone(*it)) it = _EduManualSkip.erase(it);
+		else ++it;
+	}
+	// 已注入记录里的死 PID 必须清掉：PID 会被复用，留着会让新起来的进程被
+	// 当成「已注入」而永远拿不到钩子。
+	for (auto it = _CustomInjected.begin(); it != _CustomInjected.end(); )
+	{
+		if (IsProcessGone(it->pid)) it = _CustomInjected.erase(it);
 		else ++it;
 	}
 
 	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-	if (snapshot == INVALID_HANDLE_VALUE) return;
+	if (snapshot == INVALID_HANDLE_VALUE) {
+		_Injector64TimeoutMs = savedInjectorTimeout;
+		return;
+	}
 
-	bool injectedOne = false;
+	const int kMaxPerRound = 6;
+	int injected = 0;
+	int failed = 0;
+	int slowUsed = 0;
 	PROCESSENTRY32W entry = {};
 	entry.dwSize = sizeof(entry);
 	if (Process32FirstW(snapshot, &entry)) {
 		do {
-			if (injectedOne) break;
+			if (injected + failed >= kMaxPerRound) break;
 
 			const DWORD pid = entry.th32ProcessID;
 			if (pid <= 4) continue;
+			// 名字先过一遍：不是候选就不查路径，一百多个进程绝大部分在这里筛掉。
+			if (!EduCompatNameCandidate(entry.szExeFile)) continue;
 			if (_EduInjectBlocked.find(pid) != _EduInjectBlocked.end()) continue;
+			if (_EduManualSkip.find(pid) != _EduManualSkip.end()) continue;
 
-			// 先取路径再匹配：产品表要求路径特征，只看进程名会误伤同名程序。
+			// 产品表要求路径特征，只看进程名会误伤同名程序。
 			std::wstring path;
 			if (!QueryProcessImagePath(pid, &path)) continue;
 			const wchar_t* product = EduCompatMatch(entry.szExeFile, path.c_str());
 			if (!product) continue;
 
+			// 64 位目标要走注入助手，一轮只放一个：这是整个扫描里唯一可能等上
+			// 几秒的步骤，几个叠在一起就会明显卡界面。32 位注入是几十毫秒的事，
+			// 同一轮注几个都无所谓。
+			bool is64 = false;
+			std::wstring bitness;
+			if (!DetectTargetBitness(pid, &is64, &bitness)) {
+				// 连进程都打不开，注入必然也失败：记一次、压 10 分钟，
+				// 免得一个被保护的目标把日志刷满。
+				++failed;
+				_EduInjectBlocked[pid] = now;
+				currentLogger->LogError(L"[%s] 无法判断 %s [PID %lu] 的位数：%s",
+					product, entry.szExeFile, pid, bitness.c_str());
+				continue;
+			}
+			if (is64 && slowUsed >= 1) continue;
+
 			bool alreadyInjected = false;
-			for (const auto& record : _CustomInjected)
-				if (record.pid == pid) { alreadyInjected = true; break; }
+			for (auto it = _CustomInjected.begin(); it != _CustomInjected.end(); ) {
+				// 名字对不上说明这个 PID 已经被别的进程复用了，旧记录作废。
+				if (it->pid == pid && _wcsicmp(it->name.c_str(), entry.szExeFile) != 0)
+					it = _CustomInjected.erase(it);
+				else {
+					if (it->pid == pid) alreadyInjected = true;
+					++it;
+				}
+			}
 			if (alreadyInjected) continue;
 
 			std::wstring status;
 			const std::wstring target = std::to_wstring(pid);
 			if (InjectCustomProcess(target.c_str(), &status)) {
-				injectedOne = true;
+				++injected;
+				if (is64) ++slowUsed;
 				currentLogger->Log(L"[%s] 已自动注入 %s [PID %lu]", product, entry.szExeFile, pid);
 			}
 			else {
+				++failed;
 				_EduInjectBlocked[pid] = now;
 				currentLogger->LogError(L"[%s] 自动注入 %s [PID %lu] 失败：%s",
 					product, entry.szExeFile, pid, status.c_str());
@@ -1320,6 +1378,14 @@ void TrainerWorkerInternal::RunEduCompatInject()
 		} while (Process32NextW(snapshot, &entry));
 	}
 	CloseHandle(snapshot);
+	_Injector64TimeoutMs = savedInjectorTimeout;
+
+	// 只在这一轮真的动过手时才补汇总：两套以上产品同时受控时，光看单条
+	// 「已自动注入」拼不出全局状态；没事发生的轮次保持安静，别刷日志。
+	const int handled = injected + failed;
+	if (handled > 0 && (handled > 1 || _CustomInjected.size() > 1))
+		currentLogger->Log(L"[电子教室] 本轮注入 %d 个（失败 %d 个），当前共管控 %d 个宿主",
+			injected, failed, (int)_CustomInjected.size());
 }
 
 std::wstring TrainerWorkerInternal::GetCustomInjectedList()
