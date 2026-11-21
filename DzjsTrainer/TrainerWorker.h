@@ -6,6 +6,9 @@
 #include <set>
 #include "SysHlp.h"
 
+// EduProducts.h 那张产品表里的元素类型，只有 .cpp 需要完整定义。
+struct EduProduct;
+
 enum TrainerWorkerOp {
 	TrainerWorkerOpVirusBoom,
 	TrainerWorkerOpVirusQuit,
@@ -141,6 +144,11 @@ public:
 	// 一台机器可以同时装几套电子教室，一轮扫描会把命中的目标全部注进去。
 	// 只在 _EduCompatEnabled 打开时做事，失败的目标会被压住一段时间不重试。
 	void RunEduCompatInject();
+	// 结束某一款教室之前先停掉拉起它的服务（红蜘蛛的 checkrs.exe 这类），
+	// 否则学生端刚被杀就被重新拉起来。返回停掉的服务/进程个数。
+	int StopEduGuards(const EduProduct& product);
+	int StopServicesByImage(const wchar_t* exeName, const wchar_t* serviceName);
+	int KillProcessesByName(const wchar_t* exeName);
 	// 受控宿主有增减时通知界面。调用点只有注入成功、卸载、清理死进程三处。
 	void NotifyEduHosts();
 

@@ -170,6 +170,8 @@ AES 那半边的拆分明文（partA / partB 异或还原）**硬编码在三处
 
 每个宿主进程里是**各自一份** hooks 实例，互不干扰；设置靠 `MsgCenterSendToCustomHosts()` 广播到所有带 `EDZU_CUSTOM_HOST_WINDOW_TITLE` 的窗口，改一次全都跟着变。所以「同时控制」不需要额外的调度，需要的是别把宿主当成只有一个：扫描、注入记录、卸载循环都得按集合写。
 
+**「结束」要连上游一起停。** 红蜘蛛的学生端不是自己起来的，父链是 `REDAgent.exe ← checkrs.exe ← services.exe`：`checkrs` 是服务，学生端被杀掉之后它会把学生端再拉起来，用户看到的就是「点了没反应」。所以 `KillEduHosts()` 先调 `StopEduGuards()`，把 `EduProducts.h` 里 `guards` 声明的服务 `ControlService(STOP)` 并等到 `SERVICE_STOPPED`，再杀进程。服务名在不同版本里不统一，写成 `nullptr` 就按「服务二进制路径里含这个 exe 名」反查；`KillProcessesByName()` 兜底绿色安装（服务被删、进程还在跑的情况）。
+
 三个容易写错的点：
 
 - **死 PID 必须每轮清掉。** PID 会被复用，`_CustomInjected` 里留着的死记录会让新进程被当成「已注入」，永远拿不到钩子。清的时候顺带比进程名，名字对不上说明 PID 已经被别的进程占了。

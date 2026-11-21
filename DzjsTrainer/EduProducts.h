@@ -30,21 +30,41 @@ struct EduProcessRule {
 	const wchar_t* pathHint;  // 完整路径里必须出现的一段，不区分大小写
 };
 
+// 结束一款教室之前要先停掉的上游。
+//
+// 红蜘蛛的父链是 REDAgent.exe ← checkrs.exe ← services.exe：checkrs 是个服务，
+// 学生端挂了它会把学生端重新拉起来。只结束 REDAgent，看起来就像「点了没反应」。
+// service 写 nullptr 表示服务名不确定，按「服务的二进制路径里含这个 exe 名」反查：
+// 服务名随版本和语言变，进程名反而稳定。
+struct EduGuardRule {
+	const wchar_t* exe;
+	const wchar_t* service;
+};
+
 struct EduProduct {
 	const wchar_t* name;
 	const EduProcessRule* rules;
 	int ruleCount;
+	const EduGuardRule* guards;
+	int guardCount;
 };
 
 // 伽卡他卡：学生端 Smonitor.exe（服务 Smsvc），装在 ...\gakataka\Student\ 下。
 static const EduProcessRule kGakatakaRules[] = {
 	{ L"Smonitor.exe", L"gakataka" },
 };
+static const EduGuardRule kGakatakaGuards[] = {
+	{ L"Smonitor.exe", L"Smsvc" },
+};
 
 // 红蜘蛛：学生端 REDAgent.exe，安装目录 ...\3000soft\Red Spider\。
 static const EduProcessRule kRedSpiderRules[] = {
 	{ L"REDAgent.exe", L"3000soft" },
 	{ L"REDAgent.exe", L"red spider" },
+};
+// checkrs.exe 负责拉起学生端，服务名未知，按 exe 反查。
+static const EduGuardRule kRedSpiderGuards[] = {
+	{ L"checkrs.exe", nullptr },
 };
 
 // 联想传奇：PsGhost 是守护进程，Student 才是学生端，两个都得进。
@@ -55,11 +75,14 @@ static const EduProcessRule kParasagaRules[] = {
 	{ L"PsGhost.exe", L"parasaga" },
 	{ L"Student.exe", L"parasaga" },
 };
+static const EduGuardRule kParasagaGuards[] = {
+	{ L"PsGhost.exe", nullptr },
+};
 
 static const EduProduct kEduProducts[] = {
-	{ L"伽卡他卡", kGakatakaRules,  _countof(kGakatakaRules) },
-	{ L"红蜘蛛",   kRedSpiderRules, _countof(kRedSpiderRules) },
-	{ L"联想传奇", kParasagaRules,  _countof(kParasagaRules) },
+	{ L"伽卡他卡", kGakatakaRules,  _countof(kGakatakaRules),  kGakatakaGuards,  _countof(kGakatakaGuards) },
+	{ L"红蜘蛛",   kRedSpiderRules, _countof(kRedSpiderRules), kRedSpiderGuards, _countof(kRedSpiderGuards) },
+	{ L"联想传奇", kParasagaRules,  _countof(kParasagaRules),  kParasagaGuards,  _countof(kParasagaGuards) },
 };
 
 static const int kEduProductCount = _countof(kEduProducts);

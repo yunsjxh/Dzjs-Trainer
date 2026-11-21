@@ -1543,13 +1543,22 @@ int TrainerWorkerInternal::KillEduHosts(LPCWSTR product)
 	if (_CustomInjected.empty()) return 0;
 	const bool all = (product == nullptr || product[0] == L'\0');
 
+	// 先把上游停掉。红蜘蛛的学生端是 checkrs.exe（服务）拉起来的，直接杀
+	// REDAgent 的话，服务一两分钟内就把它重新启动，用户看到的是「点了没用」。
+	for (int i = 0; i < kEduProductCount; ++i) {
+		if (!all && _wcsicmp(kEduProducts[i].name, product) != 0) continue;
+		if (GetEduHostCountOf(kEduProducts[i].name) <= 0) continue;
+		StopEduGuards(kEduProducts[i]);
+	}
+
 	int killed = 0;
 	for (auto it = _CustomInjected.begin(); it != _CustomInjected.end(); ) {
 		if (it->product.empty()) { ++it; continue; }
 		if (!all && _wcsicmp(it->product.c_str(), product) != 0) { ++it; continue; }
 		const DWORD pid = it->pid;
 		const std::wstring name = it->name;
-		if (KillProcess(pid, true)) {
+		// 停服务的时候学生端可能已经跟着退出了，这算成功，不该留在列表里。
+		if (IsProcessGone(pid) || KillProcess(pid, true)) {
 			currentLogger->LogInfo(L"已结束电子教室 %s [PID %lu]", name.c_str(), pid);
 			it = _CustomInjected.erase(it);
 			++killed;
@@ -1565,6 +1574,153 @@ int TrainerWorkerInternal::KillEduHosts(LPCWSTR product)
 		UpdateState();
 	}
 	return killed;
+}
+
+// ControlService 只是把 STOP 请求投出去，紧接着去杀进程会和服务的恢复动作抢先
+// 一步，看起来就是「杀掉了又回来了」。等到 STOPPED 再往下走。
+static bool WaitServiceStopped(SC_HANDLE service, DWORD timeoutMs)
+{
+	const ULONGLONG deadline = GetTickCount64() + timeoutMs;
+	for (;;) {
+		SERVICE_STATUS status{};
+		if (!QueryServiceStatus(service, &status)) return false;
+		if (status.dwCurrentState == SERVICE_STOPPED) return true;
+		if (GetTickCount64() >= deadline) return false;
+		Sleep(100);
+	}
+}
+
+// 按「服务名」或「服务二进制路径里有这个 exe 名」找服务并停掉。
+// 服务名给 nullptr 时走路径匹配：红蜘蛛的 checkrs 在各版本里服务名不统一，
+// 但可执行文件名一直是 checkrs.exe。
+int TrainerWorkerInternal::StopServicesByImage(const wchar_t* exeName, const wchar_t* serviceName)
+{
+	const bool byName = (serviceName != nullptr && serviceName[0] != L'\0');
+	const bool byPath = (exeName != nullptr && exeName[0] != L'\0');
+	if (!byName && !byPath) return 0;
+
+	SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr,
+		SC_MANAGER_CONNECT | SC_MANAGER_ENUMERATE_SERVICE);
+	if (manager == nullptr) {
+		currentLogger->LogWarn(L"停止守护服务：打开服务管理器失败 error=%lu", GetLastError());
+		return 0;
+	}
+
+	int stopped = 0;
+	std::vector<BYTE> buffer(16 * 1024);
+	DWORD needed = 0, count = 0, resume = 0;
+	for (;;) {
+		const BOOL enumerated = EnumServicesStatusW(manager, SERVICE_WIN32, SERVICE_STATE_ALL,
+			reinterpret_cast<LPENUM_SERVICE_STATUSW>(buffer.data()),
+			static_cast<DWORD>(buffer.size()), &needed, &count, &resume);
+		if (!enumerated) {
+			const DWORD error = GetLastError();
+			if (error == ERROR_MORE_DATA) {
+				buffer.resize(needed > buffer.size() ? needed : buffer.size() * 2);
+				resume = 0;  // 从头再枚举一遍，免得跳过已经返回过的条目
+				continue;
+			}
+			currentLogger->LogWarn(L"停止守护服务：枚举服务失败 error=%lu", error);
+			break;
+		}
+
+		auto* entries = reinterpret_cast<LPENUM_SERVICE_STATUSW>(buffer.data());
+		for (DWORD i = 0; i < count; ++i) {
+			const wchar_t* name = entries[i].lpServiceName;
+			if (name == nullptr) continue;
+
+			bool match = byName && _wcsicmp(name, serviceName) == 0;
+			if (!match && byPath) {
+				SC_HANDLE query = OpenServiceW(manager, name, SERVICE_QUERY_CONFIG);
+				if (query != nullptr) {
+					DWORD configSize = 0;
+					QueryServiceConfigW(query, nullptr, 0, &configSize);
+					if (configSize > 0) {
+						std::vector<BYTE> config(configSize);
+						if (QueryServiceConfigW(query,
+							reinterpret_cast<LPQUERY_SERVICE_CONFIGW>(config.data()), configSize, &configSize)) {
+							const auto* serviceConfig =
+								reinterpret_cast<const QUERY_SERVICE_CONFIGW*>(config.data());
+							match = serviceConfig->lpBinaryPathName != nullptr &&
+								EduPathContainsNoCase(serviceConfig->lpBinaryPathName, exeName);
+						}
+					}
+					CloseServiceHandle(query);
+				}
+			}
+			if (!match) continue;
+
+			SC_HANDLE service = OpenServiceW(manager, name, SERVICE_STOP | SERVICE_QUERY_STATUS);
+			if (service == nullptr) {
+				currentLogger->LogWarn(L"停止守护服务 %s：打开失败 error=%lu", name, GetLastError());
+				continue;
+			}
+			SERVICE_STATUS status{};
+			if (ControlService(service, SERVICE_CONTROL_STOP, &status)) {
+				if (WaitServiceStopped(service, 5000)) {
+					currentLogger->LogInfo(L"已停止守护服务 %s", name);
+					++stopped;
+				}
+				else {
+					currentLogger->LogWarn(L"守护服务 %s 5 秒内没有停下来", name);
+				}
+			}
+			else {
+				const DWORD error = GetLastError();
+				if (error == ERROR_SERVICE_NOT_ACTIVE) {
+					// 本来就没在跑，不是失败。
+				}
+				else if (error == ERROR_SERVICE_CANNOT_ACCEPT_CTRL &&
+					status.dwCurrentState == SERVICE_STOP_PENDING) {
+					if (WaitServiceStopped(service, 5000)) ++stopped;
+				}
+				else {
+					currentLogger->LogWarn(L"停止守护服务 %s 失败 error=%lu", name, error);
+				}
+			}
+			CloseServiceHandle(service);
+		}
+		if (resume == 0) break;
+	}
+	CloseServiceHandle(manager);
+	return stopped;
+}
+
+// 按 exe 名把进程收干净。停服务失败、或者对方是绿色版没有服务时靠这一步。
+int TrainerWorkerInternal::KillProcessesByName(const wchar_t* exeName)
+{
+	if (exeName == nullptr || exeName[0] == L'\0') return 0;
+
+	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snapshot == INVALID_HANDLE_VALUE) return 0;
+
+	int killed = 0;
+	const DWORD self = GetCurrentProcessId();
+	PROCESSENTRY32W entry{};
+	entry.dwSize = sizeof(entry);
+	for (BOOL ok = Process32FirstW(snapshot, &entry); ok; ok = Process32NextW(snapshot, &entry)) {
+		if (entry.th32ProcessID == self) continue;
+		if (_wcsicmp(entry.szExeFile, exeName) != 0) continue;
+		if (KillProcess(entry.th32ProcessID, true)) {
+			currentLogger->LogInfo(L"已结束守护进程 %s [PID %lu]", entry.szExeFile, entry.th32ProcessID);
+			++killed;
+		}
+	}
+	CloseHandle(snapshot);
+	return killed;
+}
+
+int TrainerWorkerInternal::StopEduGuards(const EduProduct& product)
+{
+	int stopped = 0;
+	for (int i = 0; i < product.guardCount; ++i) {
+		const EduGuardRule& guard = product.guards[i];
+		stopped += StopServicesByImage(guard.exe, guard.service);
+		// 服务停下来了它的进程也就跟着没了；还留着的（绿色安装、服务被删掉）
+		// 按 exe 名收尾，不然后面杀学生端还是会被它拉起来。
+		stopped += KillProcessesByName(guard.exe);
+	}
+	return stopped;
 }
 
 int TrainerWorkerInternal::GetEduHostCountOf(LPCWSTR product)
