@@ -241,27 +241,11 @@ bool TrainerWorkerInternal::Kill(bool autoWork)
 		currentLogger->LogError(L"未找到极域主进程");
 		return false;
 	}
-	if (_StudentMainControlled){
-		bool vkill = autoWork;
-		if(!vkill){
-			MSGBOXPARAMSW mbp = { 0 };
-			mbp.hwndOwner = hWndMain;
-			mbp.lpszCaption = L"DzjsTrainer - 提示";
-			mbp.lpszText = L"您是否希望使用病毒进行爆破？";
-			mbp.cbSize = sizeof(MSGBOXPARAMSW);
-			mbp.dwStyle = MB_ICONEXCLAMATION | MB_TOPMOST | MB_YESNOCANCEL;
-			int drs = MessageBoxIndirect(&mbp);
-			if (drs == IDCANCEL) return false;
-			else if (drs == IDYES) vkill = true;
-		}
-		if (vkill) {
-			//Stop sginal
-			SendMessageToVirus(L"ss2:0");
-			return true;
-		}
-	}
+	// 这里原来会弹一个「您是否希望使用病毒进行爆破？」的确认框，回答「是」只是
+	// 往注入的 DLL 发一条 ss2:0 让它别再拦广播，进程还在。卡片上写的是「结束」，
+	// 那就该真的结束，不再多问一句。
 
-	// The advanced selector applies to the non-virus termination path.
+	// The advanced selector applies to the termination path.
 	std::wstring killMode = currentApp->GetSettings()->GetSettingStr(L"KillProcess", L"NtTerminateProcess");
 	if (killMode != L"NtTerminateProcess") {
 		const bool killed = KillProcess(_StudentMainPid, autoWork);
@@ -480,6 +464,8 @@ void TrainerWorkerInternal::RunResetPid()
 		_MasterHelperPid = 0;
 	}
 
+	// 结束之后先看住，再谈自动注入：被拉起来的目标不能一边杀一边又注回去。
+	StepEduKillWatch();
 	RunEduCompatInject();
 }
 
@@ -1396,6 +1382,12 @@ void TrainerWorkerInternal::RunEduCompatInject()
 			const wchar_t* product = EduCompatMatch(entry.szExeFile, path.c_str());
 			if (!product) continue;
 
+			// 这款刚被「结束」过，正在盯梢：又冒出来的进程是要收掉的，不是要
+			// 接管的。注进去等于自己跟自己的清理动作对着干。
+			if (_EduKillWatchActive &&
+				(_EduKillWatchProduct.empty() || _wcsicmp(_EduKillWatchProduct.c_str(), product) == 0))
+				continue;
+
 			// 64 位目标要走注入助手，一轮只放一个：这是整个扫描里唯一可能等上
 			// 几秒的步骤，几个叠在一起就会明显卡界面。32 位注入是几十毫秒的事，
 			// 同一轮注几个都无所谓。
@@ -1576,6 +1568,14 @@ static bool IsUnderDirectory(const std::wstring& path, const std::wstring& direc
 	return next == L'\\' || next == L'/';
 }
 
+static void AppendUniqueName(std::vector<std::wstring>* list, const wchar_t* name)
+{
+	if (list == nullptr || name == nullptr || name[0] == L'\0') return;
+	for (const auto& item : *list)
+		if (_wcsicmp(item.c_str(), name) == 0) return;
+	list->push_back(name);
+}
+
 // 整目录清理只在这种目录上做：不能是盘根，也不能是 Program Files / Windows
 // 这类公共目录本身 —— 学生端真装在 Program Files 根上的话，一清就是半个系统。
 static bool IsSafeSweepDirectory(const std::wstring& raw)
@@ -1749,39 +1749,104 @@ int TrainerWorkerInternal::StopServicesByImage(const wchar_t* exeName, const wch
 	return stopped;
 }
 
-// 按 exe 名把进程收干净。停服务失败、或者对方是绿色版没有服务时靠这一步。
-int TrainerWorkerInternal::KillProcessesByName(const wchar_t* exeName)
+// 按进程名收集 PID。只比名字，调用方自己决定路径要不要对。
+static void CollectProcessIdsByName(const wchar_t* exeName, std::vector<DWORD>* out)
 {
-	if (exeName == nullptr || exeName[0] == L'\0') return 0;
+	if (out == nullptr || exeName == nullptr || exeName[0] == L'\0') return;
 
 	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-	if (snapshot == INVALID_HANDLE_VALUE) return 0;
+	if (snapshot == INVALID_HANDLE_VALUE) return;
 
-	int killed = 0;
 	const DWORD self = GetCurrentProcessId();
 	PROCESSENTRY32W entry{};
 	entry.dwSize = sizeof(entry);
 	for (BOOL ok = Process32FirstW(snapshot, &entry); ok; ok = Process32NextW(snapshot, &entry)) {
-		if (entry.th32ProcessID == self) continue;
+		if (entry.th32ProcessID <= 4 || entry.th32ProcessID == self) continue;
 		if (_wcsicmp(entry.szExeFile, exeName) != 0) continue;
-		if (KillProcess(entry.th32ProcessID, true)) {
-			currentLogger->LogInfo(L"已结束守护进程 %s [PID %lu]", entry.szExeFile, entry.th32ProcessID);
-			++killed;
-		}
+		out->push_back(entry.th32ProcessID);
 	}
 	CloseHandle(snapshot);
-	return killed;
+}
+
+// TerminateProcess 返回成功到进程真的消失之间有一小段空档（对象还没完全回收），
+// 紧接着查 IsProcessGone 会得到「还活着」，日志就会把成功写成失败。
+static bool WaitProcessGone(DWORD pid, DWORD timeoutMs)
+{
+	const ULONGLONG deadline = GetTickCount64() + timeoutMs;
+	for (;;) {
+		if (IsProcessGone(pid)) return true;
+		if (GetTickCount64() >= deadline) return false;
+		Sleep(50);
+	}
+}
+
+// 停不掉的服务宿主改成挂起。
+//
+// 服务进程被 TerminateProcess 掉，SCM 会当成一次异常退出，按服务的恢复策略把它
+// 重新启动 —— 红蜘蛛就是这样：checkapp2 这个服务停在「标记删除」状态，
+// ControlService 返回 1052，我们退回去杀 checkrs.exe，几秒后 SCM 又把它拉起来，
+// 它再把 REDAgent 拉起来，用户看到的就是「杀了还会重启」。挂起不触发恢复动作。
+// 某个 exe 是不是这款教室的学生端本身（联想传奇的 PsGhost 既是守护也是学生端）。
+static bool IsProductHostExe(const EduProduct& product, const wchar_t* exeName)
+{
+	if (exeName == nullptr) return false;
+	for (int r = 0; r < product.ruleCount; ++r)
+		if (_wcsicmp(product.rules[r].exe, exeName) == 0) return true;
+	return false;
 }
 
 int TrainerWorkerInternal::StopEduGuards(const EduProduct& product)
 {
 	int stopped = 0;
+	std::map<DWORD, std::wstring> serviceByPid;
+	bool serviceMapReady = false;
+
 	for (int i = 0; i < product.guardCount; ++i) {
 		const EduGuardRule& guard = product.guards[i];
 		stopped += StopServicesByImage(guard.exe, guard.service);
-		// 服务停下来了它的进程也就跟着没了；还留着的（绿色安装、服务被删掉）
-		// 按 exe 名收尾，不然后面杀学生端还是会被它拉起来。
-		stopped += KillProcessesByName(guard.exe);
+
+		// 服务停下来了它的进程也就跟着没了；还留着的（绿色安装、服务被删掉，或者
+		// 服务本身停在「标记删除」状态压根停不掉）还得处理。
+		//
+		// 处理方式看它是不是学生端本身：PsGhost 这种既是守护又是学生端的，要的是
+		// 「结束」，杀掉；checkrs 这种纯守护，挂起比杀更有效 —— 服务进程被杀的
+		// 后果是 SCM 按恢复策略把它重新启动，等于白杀一次。
+		const bool alsoHost = IsProductHostExe(product, guard.exe);
+		std::vector<DWORD> pids;
+		CollectProcessIdsByName(guard.exe, &pids);
+		if (pids.empty()) continue;
+		if (!serviceMapReady) {
+			BuildServicePidMap(&serviceByPid);
+			serviceMapReady = true;
+		}
+
+		for (DWORD pid : pids) {
+			if (!alsoHost) {
+				if (MSuspendProcessNt(pid, nullptr) == STATUS_SUCCESS) {
+					currentLogger->LogInfo(L"已挂起守护进程 %s [PID %lu]", guard.exe, pid);
+					++stopped;
+					continue;
+				}
+			}
+			else {
+				auto service = serviceByPid.find(pid);
+				if (service != serviceByPid.end()) {
+					SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+					if (manager != nullptr) {
+						StopServiceEntry(manager, service->second.c_str());
+						CloseServiceHandle(manager);
+					}
+					if (IsProcessGone(pid)) {
+						++stopped;
+						continue;
+					}
+				}
+			}
+			if (KillProcess(pid, true)) {
+				currentLogger->LogInfo(L"已结束守护进程 %s [PID %lu]", guard.exe, pid);
+				++stopped;
+			}
+		}
 	}
 	return stopped;
 }
@@ -1870,6 +1935,121 @@ int TrainerWorkerInternal::SweepEduCompanions(DWORD rootPid, const std::wstring&
 	return killed;
 }
 
+// 「结束」之后的盯梢。
+//
+// 红蜘蛛这类产品有服务或守护进程盯着：学生端被杀，几秒后又被拉起来，界面上看
+// 就是「点了没反应」。结束那一下能杀的都杀了，之后每 2 秒再看一眼，重新出现的
+// 再收一次，并把父进程写进日志 —— 万一是内核里的东西在拉，这条日志就是线索。
+void TrainerWorkerInternal::StepEduKillWatch()
+{
+	if (!_EduKillWatchActive) return;
+	const ULONGLONG now = GetTickCount64();
+	if (now >= _EduKillWatchDeadline || now >= _EduKillWatchHardDeadline) {
+		_EduKillWatchActive = false;
+		currentLogger->LogInfo(L"电子教室盯梢结束，共收了 %d 轮", _EduKillWatchRounds);
+		return;
+	}
+
+	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snapshot == INVALID_HANDLE_VALUE) return;
+
+	struct Hit { DWORD pid; DWORD parent; std::wstring name; bool guardOnly; };
+	std::vector<Hit> hits;
+	PROCESSENTRY32W entry{};
+	entry.dwSize = sizeof(entry);
+	for (BOOL ok = Process32FirstW(snapshot, &entry); ok; ok = Process32NextW(snapshot, &entry)) {
+		const DWORD pid = entry.th32ProcessID;
+		if (pid <= 4 || pid == GetCurrentProcessId()) continue;
+
+		bool isHost = false;
+		for (const auto& name : _EduKillWatchHosts)
+			if (_wcsicmp(entry.szExeFile, name.c_str()) == 0) { isHost = true; break; }
+		bool isGuard = false;
+		if (!isHost) {
+			for (const auto& name : _EduKillWatchGuards)
+				if (_wcsicmp(entry.szExeFile, name.c_str()) == 0) { isGuard = true; break; }
+		}
+		if (!isHost && !isGuard) continue;
+
+		// 学生端同名的程序不少（Student.exe 满地都是），只认落在安装目录里的。
+		// 上游进程名足够特别，只看名字。
+		if (!_EduKillWatchDirectories.empty()) {
+			std::wstring path;
+			if (!QueryProcessImagePath(pid, &path)) continue;
+			bool inDirectory = false;
+			for (const auto& directory : _EduKillWatchDirectories)
+				if (IsUnderDirectory(path, directory)) { inDirectory = true; break; }
+			if (!inDirectory) continue;
+		}
+
+		Hit hit;
+		hit.pid = pid;
+		hit.parent = entry.th32ParentProcessID;
+		hit.name = entry.szExeFile;
+		hit.guardOnly = isGuard;
+		hits.push_back(hit);
+	}
+	CloseHandle(snapshot);
+	if (hits.empty()) return;
+
+	++_EduKillWatchRounds;
+	std::map<DWORD, std::wstring> serviceByPid;
+	BuildServicePidMap(&serviceByPid);
+	SC_HANDLE scm = serviceByPid.empty() ? nullptr : OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+
+	// 纯守护一律挂起：杀掉会被 SCM 按恢复策略拉回来，等于陪着它转圈。
+	// 学生端本身还是要结束，它才是用户看到的那层。
+	auto stopOne = [&](DWORD pid, const std::wstring& name, bool suspendOnly) {
+		if (suspendOnly && MSuspendProcessNt(pid, nullptr) == STATUS_SUCCESS) {
+			currentLogger->LogInfo(L"已挂起守护进程 %s [PID %lu]", name.c_str(), pid);
+			return;
+		}
+		auto service = serviceByPid.find(pid);
+		if (service != serviceByPid.end()) {
+			if (scm != nullptr) StopServiceEntry(scm, service->second.c_str());
+			if (IsProcessGone(pid)) return;
+			if (MSuspendProcessNt(pid, nullptr) == STATUS_SUCCESS) return;
+		}
+		KillProcess(pid, true);
+		currentLogger->LogInfo(L"已再次结束电子教室 %s [PID %lu]", name.c_str(), pid);
+	};
+
+	for (const auto& hit : hits) {
+		std::wstring parentPath;
+		if (hit.parent > 4) QueryProcessImagePath(hit.parent, &parentPath);
+		currentLogger->LogWarn(L"电子教室 %s [PID %lu] 又被拉起，父进程 [PID %lu] %s",
+			hit.name.c_str(), hit.pid, hit.parent,
+			parentPath.empty() ? L"（取不到路径）" : parentPath.c_str());
+
+		// 先把上游摁住，再收它拉起来的那个。系统目录下的父进程不动（explorer、
+		// services 这些），否则会顺手带走别的东西。
+		if (hit.parent > 4 && hit.parent != GetCurrentProcessId() && !parentPath.empty() &&
+			!IsSystemProcessImage(parentPath) && !IsProcessGone(hit.parent)) {
+			const std::wstring parentName = parentPath.substr(parentPath.find_last_of(L"\\/") + 1);
+			bool parentGuardOnly = false;
+			for (const auto& name : _EduKillWatchGuards)
+				if (_wcsicmp(parentName.c_str(), name.c_str()) == 0) { parentGuardOnly = true; break; }
+			for (const auto& name : _EduKillWatchHosts)
+				if (_wcsicmp(parentName.c_str(), name.c_str()) == 0) { parentGuardOnly = false; break; }
+			currentLogger->LogWarn(L"结束它的上游 %s [PID %lu]", parentName.c_str(), hit.parent);
+			stopOne(hit.parent, parentName, parentGuardOnly);
+		}
+		stopOne(hit.pid, hit.name, hit.guardOnly);
+	}
+
+	if (scm != nullptr) CloseServiceHandle(scm);
+	EduKillWatchExtend();
+}
+
+// 还在往外冒就多看一会儿，但总量封顶，别让界面线程一直陪着。
+void TrainerWorkerInternal::EduKillWatchExtend()
+{
+	const ULONGLONG now = GetTickCount64();
+	const ULONGLONG extended = now + 30000;
+	_EduKillWatchDeadline = extended > _EduKillWatchHardDeadline ? _EduKillWatchHardDeadline : extended;
+}
+
+
 // 「结束电子教室」里收拾其他教室的那一半。极域走的是 Kill()，这里是通用
 // 宿主：注入记录里的每个产品进程都要收拾，连它的同目录进程和上游一起。
 // product 给具体产品名时只动那一款，界面的选择框按名字逐个调。
@@ -1878,8 +2058,29 @@ int TrainerWorkerInternal::KillEduHosts(LPCWSTR product)
 	if (_CustomInjected.empty()) return 0;
 	const bool all = (product == nullptr || product[0] == L'\0');
 
+	// 盯梢名单先立起来：这一下没收拾干净的话，StepEduKillWatch() 接着收。
+	// 连着结束两款时不再区分产品，按「全部」记。
+	const bool firstCall = !_EduKillWatchActive;
+	if (firstCall) {
+		_EduKillWatchProduct = all ? L"" : product;
+		_EduKillWatchHosts.clear();
+		_EduKillWatchGuards.clear();
+		_EduKillWatchDirectories.clear();
+		_EduKillWatchRounds = 0;
+	}
+	else if (all) _EduKillWatchProduct.clear();
+	else if (!_EduKillWatchProduct.empty() && _wcsicmp(_EduKillWatchProduct.c_str(), product) != 0)
+		_EduKillWatchProduct.clear();
+
+	for (int i = 0; i < kEduProductCount; ++i) {
+		if (!all && _wcsicmp(kEduProducts[i].name, product) != 0) continue;
+		const EduProduct& item = kEduProducts[i];
+		for (int r = 0; r < item.ruleCount; ++r) AppendUniqueName(&_EduKillWatchHosts, item.rules[r].exe);
+		for (int g = 0; g < item.guardCount; ++g) AppendUniqueName(&_EduKillWatchGuards, item.guards[g].exe);
+	}
+
 	// 先把上游停掉。红蜘蛛的学生端是 checkrs.exe（服务）拉起来的，直接杀
-	// REDAgent 的话，服务一两分钟内就把它重新启动，用户看到的是「点了没用」。
+	// REDAgent 的话，服务几秒后就把学生端重新启起来，用户看到的是「点了没用」。
 	for (int i = 0; i < kEduProductCount; ++i) {
 		if (!all && _wcsicmp(kEduProducts[i].name, product) != 0) continue;
 		if (GetEduHostCountOf(kEduProducts[i].name) <= 0) continue;
@@ -1900,22 +2101,35 @@ int TrainerWorkerInternal::KillEduHosts(LPCWSTR product)
 	}
 	if (targets.empty()) return 0;
 
+	for (const auto& target : targets) {
+		const size_t slash = target.path.find_last_of(L"\\/");
+		if (slash != std::wstring::npos && slash > 2)
+			AppendUniqueName(&_EduKillWatchDirectories, target.path.substr(0, slash).c_str());
+	}
+
+	const ULONGLONG now = GetTickCount64();
+	_EduKillWatchDeadline = now + 90000;
+	_EduKillWatchHardDeadline = now + 8 * 60 * 1000;
+	_EduKillWatchActive = true;
+
 	int killed = 0;
 	for (const auto& target : targets)
 		killed += SweepEduCompanions(target.pid, target.path);
 
 	// 注入记录按「进程还在不在」收尾：连带的进程被清掉之后，宿主多半也没了。
+	// TerminateProcess 成功到进程真的消失之间有空档，等一下再判，否则成功的会被
+	// 记成失败。
 	int removed = 0;
 	for (auto it = _CustomInjected.begin(); it != _CustomInjected.end(); ) {
 		if (it->product.empty()) { ++it; continue; }
 		if (!all && _wcsicmp(it->product.c_str(), product) != 0) { ++it; continue; }
-		if (IsProcessGone(it->pid)) {
+		if (IsProcessGone(it->pid) || WaitProcessGone(it->pid, 1500)) {
 			currentLogger->LogInfo(L"已结束电子教室 %s [PID %lu]", it->name.c_str(), it->pid);
 			it = _CustomInjected.erase(it);
 			++removed;
 		}
 		else {
-			currentLogger->LogWarn(L"结束电子教室 %s [PID %lu] 失败", it->name.c_str(), it->pid);
+			currentLogger->LogWarn(L"结束电子教室 %s [PID %lu] 失败，转入盯梢", it->name.c_str(), it->pid);
 			++it;
 		}
 	}

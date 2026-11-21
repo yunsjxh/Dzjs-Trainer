@@ -4,6 +4,7 @@
 #include <list>
 #include <map>
 #include <set>
+#include <vector>
 #include "SysHlp.h"
 
 // EduProducts.h 那张产品表里的元素类型，只有 .cpp 需要完整定义。
@@ -148,9 +149,12 @@ public:
 	// 否则学生端刚被杀就被重新拉起来。返回停掉的服务/进程个数。
 	int StopEduGuards(const EduProduct& product);
 	int StopServicesByImage(const wchar_t* exeName, const wchar_t* serviceName);
-	int KillProcessesByName(const wchar_t* exeName);
 	// 顺着宿主往上清：同目录（含子目录）的进程 + 非系统父进程。
 	int SweepEduCompanions(DWORD rootPid, const std::wstring& imagePath);
+	// 结束之后盯梢：产品会在几秒内把学生端重新拉起来（服务恢复、守护进程），
+	// 杀完就走等于没杀。每 2 秒看一眼，重新出现就再收一次并记下父进程。
+	void StepEduKillWatch();
+	void EduKillWatchExtend();
 	// 受控宿主有增减时通知界面。调用点只有注入成功、卸载、清理死进程三处。
 	void NotifyEduHosts();
 
@@ -196,6 +200,15 @@ private:
 	// 用户在「进程注入」里手动卸载过的目标：同一个进程不再自动注入回去，
 	// 进程退出后自动解禁（PID 会被复用，不能用它做长期标记）。
 	std::set<DWORD> _EduManualSkip;
+	// 「结束电子教室」之后的盯梢状态。product 为空表示全线结束。
+	bool _EduKillWatchActive = false;
+	std::wstring _EduKillWatchProduct;
+	std::vector<std::wstring> _EduKillWatchHosts;    // 学生端进程名（小写）
+	std::vector<std::wstring> _EduKillWatchGuards;   // 上游进程名（小写）
+	std::vector<std::wstring> _EduKillWatchDirectories; // 安装目录，目录内新增的一并清
+	ULONGLONG _EduKillWatchDeadline = 0;             // 安静这么久就收工
+	ULONGLONG _EduKillWatchHardDeadline = 0;         // 再能拉也不超过这个点
+	int _EduKillWatchRounds = 0;
 	// 64 位注入助手的等待上限。手动注入时用户知道自己在等，给足 40 秒；
 	// 自动扫描是后台行为，卡住的是界面线程，所以压到几秒就放弃、下一轮再试。
 	DWORD _Injector64TimeoutMs = 40000;
