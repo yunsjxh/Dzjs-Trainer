@@ -138,6 +138,9 @@ enum : int {
 	VOP_SRC_SETWINDOWLONG = 2,
 	// ShowWindow(SW_MAXIMIZE)：没有尺寸参数，cx 字段借来存 nCmdShow。
 	VOP_SRC_SHOWWINDOW    = 3,
+	// 后台巡查发现的「已经在整屏、但一次窗口 API 都没走过」的窗口。
+	// 没有调用可重放（窗口本来就摆在那儿），答「是」什么也不用做。
+	VOP_SRC_SWEEP         = 4,
 };
 
 struct WindowOpRequest {

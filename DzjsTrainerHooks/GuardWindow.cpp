@@ -326,22 +326,54 @@ LONG WINAPI hkSetWindowLongW(HWND hWnd, int nIndex, LONG dwNewLong)
 	return faSetWindowLongW(hWnd, nIndex, dwNewLong);
 }
 
+// 窗口现在铺满所在显示器多少。ShowWindow 带不来目标尺寸，只能看现状。
+static bool VEduWindowCoversMonitorNow(HWND hWnd, int percent)
+{
+	RECT rc;
+	if (!GetWindowRect(hWnd, &rc)) return false;
+	HMONITOR mon = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST);
+	MONITORINFO mi = { sizeof(mi) };
+	if (!GetMonitorInfoW(mon, &mi)) return false;
+	const long long monW = (long long)mi.rcMonitor.right - mi.rcMonitor.left;
+	const long long monH = (long long)mi.rcMonitor.bottom - mi.rcMonitor.top;
+	const long long w = (long long)rc.right - rc.left;
+	const long long h = (long long)rc.bottom - rc.top;
+	if (monW <= 0 || monH <= 0 || w <= 0 || h <= 0) return false;
+	return w * h * 100 >= monW * monH * percent;
+}
+
 BOOL WINAPI hkShowWindow(HWND hWnd, int nCmdShow)
 {
 	VTraceHook(L"hkShowWindow");
-	// 第三方宿主的「全屏」经常是 ShowWindow(SW_MAXIMIZE)，没有尺寸参数可看。
+	// 第三方宿主的「全屏」有两条常见写法，都没有尺寸参数可看：
+	//   1. ShowWindow(SW_MAXIMIZE) —— Delphi 的 WindowState := wsMaximized、
+	//      MFC 的 ShowWindow(SW_SHOWMAXIMIZED)，伽卡他卡走的就是这条；
+	//   2. CreateWindowEx 直接按整屏建好，再 ShowWindow(SW_SHOW)：窗口从出生
+	//      就是全屏尺寸，中间一次 SetWindowPos 都没有。
 	// 已经最大化的重复调用不问 —— 那只是恢复显示，不是一次新的全屏请求。
 	if (g_customHost && loaded && askWindowOps &&
-		(nCmdShow == SW_MAXIMIZE || nCmdShow == SW_SHOWMAXIMIZED) &&
-		(GetWindowLongW(hWnd, GWL_STYLE) & WS_MAXIMIZE) == 0)
+		(GetWindowLongW(hWnd, GWL_STYLE) & WS_CHILD) == 0)
 	{
-		WindowOpRequest req = {};
-		req.source = VOP_SRC_SHOWWINDOW;
-		req.hwnd = hWnd;
-		req.x = nCmdShow;
-		req.wide = true;
-		if (!VAllowWindowOp(req, true, false))
-			return TRUE;
+		const bool maximize = nCmdShow == SW_MAXIMIZE || nCmdShow == SW_SHOWMAXIMIZED;
+		const bool plainShow = nCmdShow == SW_SHOW || nCmdShow == SW_SHOWNORMAL ||
+			nCmdShow == SW_SHOWDEFAULT || nCmdShow == SW_SHOWNA || nCmdShow == SW_SHOWNOACTIVATE;
+
+		bool full = false;
+		if (maximize)
+			full = (GetWindowLongW(hWnd, GWL_STYLE) & WS_MAXIMIZE) == 0;
+		else if (plainShow)
+			full = VEduWindowCoversMonitorNow(hWnd, 90);
+
+		if (full)
+		{
+			WindowOpRequest req = {};
+			req.source = VOP_SRC_SHOWWINDOW;
+			req.hwnd = hWnd;
+			req.x = nCmdShow;
+			req.wide = true;
+			if (!VAllowWindowOp(req, true, false))
+				return TRUE;
+		}
 	}
 	if (VIsWindowGbOrHp(hWnd)) 
 	{

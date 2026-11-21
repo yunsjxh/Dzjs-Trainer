@@ -48,6 +48,9 @@
 #define TIMER_LIGNT_DELAY1 10014
 #define TIMER_LIGNT_DELAY2 10015
 #define TIMER_UI_HEARTBEAT 10016
+// 第三方宿主的全屏/置顶巡查。300ms 是「够快」和「别空转」之间取的：
+// 宿主把窗口撑满到我们缩回去，用户最多看到一瞬。
+#define TIMER_EDU_SWEEP 10017
 
 #define DirectorySeparatorChar L'\\'
 #define AltDirectorySeparatorChar  L'/'
@@ -685,7 +688,7 @@ void VRunMain() {
 		mainIniPath, allowMonitor, whitePreviewOnly, allowAllRunOp, g_VideoProps.m_EnableModifyVideoStream);
 	// 构建标记：日志里有这一行才说明跑的是本次构建的 DLL。
 	// 排查"改了没生效"时先看它，省得在部署问题上兜圈子。
-	VDebugLog(L"hooks build=20261121-edu-compat");
+	VDebugLog(L"hooks build=20261121-2030-edu-opask2");
 	// 走 minimal 还是全量集，由上面两个标志决定；全量集会接管极域的窗口/进程/网络接口，
 	// 把它记下来，出问题时一眼能看出走的是哪条分支。
 	VDebugLog(L"hooks mode=%s", (whitePreviewOnly || g_VideoProps.m_EnableModifyVideoStream) ? L"minimal" : L"full");
@@ -1473,6 +1476,9 @@ struct WindowOpState {
 	// 极域有主程序按 3/4 屏幕摆回去，第三方宿主没人管，只能自己记。
 	RECT            restore;
 	bool            hasRestore;
+	// 后台巡查专用：用户对「这个已经在全屏的窗口」选了「只拒绝这一次」。
+	// 窗口退出全屏后清掉，下次再铺满会重新问 —— 与钩子那条路径的语义一致。
+	bool            sweepSkip;
 };
 
 const int kOpStateCount = 12;
@@ -1746,8 +1752,23 @@ BOOL CALLBACK VEduEnumWindowsProc(HWND hWnd, LPARAM)
 {
 	DWORD pid = 0;
 	GetWindowThreadProcessId(hWnd, &pid);
-	if (pid == GetCurrentProcessId() && VEduWindowCoversMonitor(hWnd, 60))
-		VAttachEduWindow(hWnd);
+	if (pid != GetCurrentProcessId()) return TRUE;
+	if (!VEduWindowCoversMonitor(hWnd, 60)) return TRUE;
+	VAttachEduWindow(hWnd);
+	// 注入时就已经全屏的窗口：当作用户已知的状态记成「允许」。不这么做的话，
+	// 300ms 后的第一趟巡查就会拿它开刀 —— 人家本来就在上课，我们上去弹个框，
+	// 答「否」还要把画面缩小。
+	if (!VEduWindowCoversMonitor(hWnd, 90)) return TRUE;
+	VEnsureOpCs();
+	EnterCriticalSection(&g_opCs);
+	WindowOpState* state = VFindOpStateLocked(hWnd, true);
+	if (state) {
+		if (state->full == VOP_UNDECIDED) state->full = VOP_ALLOW;
+		// 置顶只跟着现状记：本来就没置顶的窗口，以后再置顶还得问。
+		if ((GetWindowLongW(hWnd, GWL_EXSTYLE) & WS_EX_TOPMOST) && state->top == VOP_UNDECIDED)
+			state->top = VOP_ALLOW;
+	}
+	LeaveCriticalSection(&g_opCs);
 	return TRUE;
 }
 
@@ -1755,6 +1776,30 @@ void VAttachEduWindows()
 {
 	if (!g_customHost) return;
 	EnumWindows(VEduEnumWindowsProc, 0);
+}
+
+// 给主程序回一行「刚才那个询问的结果」。走的是关机通知那条路：
+// VSendMessageBack 在通用宿主里整体关闭（怕误触发主程序的失联判定），
+// 但这几行诊断没有副作用，需要单独放行 —— 注入进程自己的日志在人家安装
+// 目录里，用户平时看不到，出了问题只能靠主日志对上时间。
+void VEduOpNotice(const wchar_t* result, HWND hwnd)
+{
+	if (!result) return;
+	HWND receiver = FindControlWindow();
+	if (!receiver) {
+		VDebugLog(L"edu op notice dropped result=%s reason=receiver-not-found", result);
+		return;
+	}
+	WCHAR message[128];
+	swprintf_s(message, L"hkb:eduop:%s:%lld", result, (long long)(INT_PTR)hwnd);
+	COPYDATASTRUCT copyData = { 0 };
+	copyData.lpData = message;
+	copyData.cbData = static_cast<DWORD>(sizeof(WCHAR) * (wcslen(message) + 1));
+	DWORD_PTR response = 0;
+	SendMessageTimeoutW(receiver, WM_COPYDATA, 0, reinterpret_cast<LPARAM>(&copyData),
+		SMTO_ABORTIFHUNG | SMTO_BLOCK, 500, &response);
+	VDebugLog(L"edu op notice result=%s hwnd=%p response=%llu", result, hwnd,
+		static_cast<unsigned long long>(response));
 }
 
 // 由消息中心线程调用（WM_DZJS_ASK_WINDOWOP）。这里可以安全地弹模态框：
@@ -1772,10 +1817,17 @@ void VAskWindowOp()
 	g_pendingHwnd = NULL;
 	g_pendingWant = 0;
 	ZeroMemory(&g_pendingReq, sizeof(g_pendingReq));
-	g_opAsking = false;
+	// g_opAsking 在这里**不能**清：框还开着的时候又来一个请求，得先挡下记成
+	// lastBlocked。清了就会出现第二个模态框叠在第一个上面（后台巡查每 300ms
+	// 一趟，窗口还在全屏、决定还没落库，正好会一直问）。
 	LeaveCriticalSection(&g_opCs);
 
-	if (!hwnd || !IsWindow(hwnd) || !want) return;
+	if (!hwnd || !IsWindow(hwnd) || !want) {
+		EnterCriticalSection(&g_opCs);
+		g_opAsking = false;
+		LeaveCriticalSection(&g_opCs);
+		return;
+	}
 
 	WCHAR title[96] = L"";
 	GetWindowTextW(hwnd, title, _countof(title));
@@ -1812,12 +1864,19 @@ void VAskWindowOp()
 				state->top = VOP_ALLOW;
 			}
 			state->hasLastBlocked = false;
+			state->sweepSkip = false;
 		}
 		else if (answer == IDNO) {
 			if (want & VOP_FULL) state->full = VOP_DENY;
 			if (want & VOP_TOP)  state->top = VOP_DENY;
 		}
+		else if (req.source == VOP_SRC_SWEEP) {
+			// 「取消」= 只拒绝这一次。巡查没有「下一次调用」可以拦，窗口就摆在那儿，
+			// 所以记成「先别再问」，等它退出全屏再重新开张。
+			state->sweepSkip = true;
+		}
 	}
+	g_opAsking = false;
 	LeaveCriticalSection(&g_opCs);
 
 	// 主程序每两秒扫一次广播窗口：gbFullManual 为假就把窗口加回边框、按 3/4
@@ -1835,6 +1894,9 @@ void VAskWindowOp()
 	}
 
 	VOutPutStatus(L"[W] 窗口操作 %s hwnd=%p 答复=%d", action, hwnd, answer);
+	// 第三方宿主的日志在人家自己的安装目录里，用户平时看不到。把结论送一份
+	// 给主程序记账：出现「明明弹了框却说没弹」时，主日志里能对上是哪一步。
+	VEduOpNotice(answer == IDYES ? L"allow" : answer == IDNO ? L"deny" : L"once", hwnd);
 	if (answer == IDYES) VReplayWindowOp(req);
 }
 
@@ -1898,9 +1960,10 @@ bool VWindowOpAskable(HWND hWnd, const WindowOpRequest* req, bool full, bool top
 	// 全屏请求本身就是铺满，直接问。置顶请求要看面积：宿主的工具条常年置顶，
 	// 每条都弹框会把用户烦死，也分不清哪个才是上课画面。
 	if (full) {
-		// ShowWindow 没有目标尺寸，按窗口现状兜底：小工具窗最大化不该来问。
-		if (req && req->source == VOP_SRC_SHOWWINDOW)
-			return VEduWindowCoversMonitor(hWnd, 25);
+		// 不再按当前尺寸设门槛。Delphi 那套（伽卡他卡就是）是先把
+		// WindowState 设成 wsMaximized、窗口尺寸随后才撑开，问的时候它还是
+		// 原来的小尺寸；按面积判会全部漏掉。要不要问由调用方决定 ——
+		// ShowWindow 只在最大化/已经铺满时才走到这里，后台巡查只在 >=90% 时。
 		return true;
 	}
 	if (!top) return false;
@@ -1986,6 +2049,87 @@ bool VAllowWindowOp(const WindowOpRequest& req, bool full, bool top)
 		LeaveCriticalSection(&g_opCs);
 	}
 	return false;
+}
+
+// ===== 第三方宿主：全屏 / 置顶的后台巡查 ====================================
+//
+// 钩子只看得见走了导出 API 的那些路径。红蜘蛛、伽卡他卡这类宿主经常是
+// CreateWindowEx 直接按整屏建窗口、再 ShowWindow(SW_SHOW)，或者走
+// SetWindowPlacement 恢复最大化 —— 一次 SetWindowPos 都不经过，钩子全程沉默。
+// 这里每 300ms 巡一遍本进程的顶层窗口兜底：发现「已经铺满、还没问过」的
+// 窗口补问一次，答「否」就把它缩回 3/4 屏幕。
+//
+// 只在消息中心线程上跑：EnumWindows 和弹框都在那儿，宿主自己的 UI 线程
+// 一根手指头都不碰。
+struct EduSweepState {
+	int  full;
+	bool skip;
+};
+
+EduSweepState VEduSweepStateOf(HWND hWnd, bool isFull)
+{
+	EduSweepState out = { VOP_UNDECIDED, false };
+	VEnsureOpCs();
+	EnterCriticalSection(&g_opCs);
+	WindowOpState* state = VFindOpStateLocked(hWnd, false);
+	if (state) {
+		// 退出全屏就把「只拒绝这一次」清掉：下次再铺满重新问。
+		if (!isFull) state->sweepSkip = false;
+		out.full = state->full;
+		out.skip = state->sweepSkip;
+	}
+	LeaveCriticalSection(&g_opCs);
+	return out;
+}
+
+BOOL CALLBACK VEduSweepProc(HWND hWnd, LPARAM)
+{
+	DWORD pid = 0;
+	GetWindowThreadProcessId(hWnd, &pid);
+	if (pid != GetCurrentProcessId()) return TRUE;
+	if (hWnd == hWndMsgCenter || hWnd == fakeDesktopWindow) return TRUE;
+	if (GetAncestor(hWnd, GA_ROOT) != hWnd) return TRUE;
+	if (GetWindowLongW(hWnd, GWL_STYLE) & WS_CHILD) return TRUE;
+	if (GetWindowLongW(hWnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) return TRUE;
+
+	const bool full = VEduWindowCoversMonitor(hWnd, 90);
+	const EduSweepState state = VEduSweepStateOf(hWnd, full);
+	if (!full) return TRUE;
+	if (!IsWindowVisible(hWnd) || IsIconic(hWnd)) return TRUE;
+	if (state.full == VOP_ALLOW) return TRUE;
+	if (state.full == VOP_DENY) {
+		// 用户说过不许全屏。窗口还铺着，只能说明宿主自己又撑回来了，缩回去。
+		// 最大化过的窗口先还原：带 WS_MAXIMIZE 的时候 SetWindowPos 的尺寸不生效。
+		if ((GetWindowLongW(hWnd, GWL_STYLE) & WS_MAXIMIZE) && faShowWindow)
+			faShowWindow(hWnd, SW_RESTORE);
+		VEduSetFull(hWnd, false);
+		return TRUE;
+	}
+	if (state.skip || g_opAsking) return TRUE;
+
+	const bool topmost = (GetWindowLongW(hWnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+	RECT rc = {};
+	GetWindowRect(hWnd, &rc);
+	WindowOpRequest req = {};
+	req.source = VOP_SRC_SWEEP;
+	req.hwnd = hWnd;
+	req.x = rc.left;
+	req.y = rc.top;
+	req.cx = rc.right - rc.left;
+	req.cy = rc.bottom - rc.top;
+	req.wide = true;
+	WCHAR title[64] = L"";
+	GetWindowTextW(hWnd, title, _countof(title));
+	VDebugLog(L"edu sweep found full screen hwnd=%p %dx%d topmost=%d title=%s",
+		hWnd, req.cx, req.cy, topmost, title);
+	VAllowWindowOp(req, true, topmost);
+	return TRUE;
+}
+
+void VEduSweepWindowOps()
+{
+	if (!g_customHost || !loaded || !askWindowOps || !hWndMsgCenter) return;
+	EnumWindows(VEduSweepProc, 0);
 }
 
 void VForgetWindowOp(HWND hWnd)
@@ -3809,6 +3953,13 @@ INT_PTR CALLBACK MainWndProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 		// 注入常常发生在宿主已经全屏之后，此时一次窗口钩子都没走过，
 		// 右键菜单只能靠这次补挂。
 		if (g_customHost) VAttachEduWindows();
+		// 菜单挂完再开巡查：补挂那一步会把「本来就全屏」的窗口记成允许，
+		// 否则头一趟巡查就会拿它开刀。
+		if (g_customHost && askWindowOps) {
+			SetTimer(hDlg, TIMER_EDU_SWEEP, 300, NULL);
+			// 主日志里留一行，确认跑的是带询问的这版 DLL。
+			VEduOpNotice(L"active", NULL);
+		}
 		VDebugLog(L"MainWndProc initialization completed customHost=%d eduHost=%d whitePreviewOnly=%d",
 			g_customHost, g_eduHost, whitePreviewOnly);
 		return TRUE;
@@ -4037,6 +4188,8 @@ INT_PTR CALLBACK MainWndProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 		}
 		if (wParam == TIMER_UI_HEARTBEAT)
 			VDebugLog(L"UI heartbeat hwnd=%p visible=%d watchdogRunning=%ld", hDlg, IsWindowVisible(hDlg), watchdogRunning);
+		if (wParam == TIMER_EDU_SWEEP)
+			VEduSweepWindowOps();
 		if (wParam == TIMER_LIGNT_DELAY1) {
 			KillTimer(hDlg, TIMER_LIGNT_DELAY1);
 			SendMessage(hDlg, WM_COMMAND, IDC_SW_STATUS_MAIN, NULL);

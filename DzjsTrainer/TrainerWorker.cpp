@@ -202,6 +202,16 @@ void TrainerWorkerInternal::HandleMessageFromVirus(LPCWSTR buf)
 				currentLogger->LogWarn(L"Blocked a shutdown request in the host process api=%s", api);
 				if (_Callback) _Callback->OnShutdownBlocked(api);
 			}
+			// 注入宿主里的一次全屏/置顶询问：active = 询问已就绪，其余是答复。
+			// 宿主进程自己的钩子日志落在它的安装目录里，用户看不到，所以把结论
+			// 记进主日志 —— 排查「明明该弹框却没弹」时全靠这一行。
+			else if (arr[1] == L"eduop" && arr.size() >= 3) {
+				if (arr[2] == L"active")
+					currentLogger->LogInfo(L"Window op prompt ready in edu host");
+				else
+					currentLogger->LogInfo(L"Window op prompt result=%s hwnd=%s",
+						arr[2].c_str(), arr.size() >= 4 ? arr[3].c_str() : L"?");
+			}
 			else if (arr[1] == L"wtf") {
 				//插入了错误的目标，现在重置状态
 				DWORD pid = _wtol(arr[2].c_str());

@@ -134,8 +134,10 @@ AES 那半边的拆分明文（partA / partB 异或还原）**硬编码在三处
 
 判据分两条：
 
-- 全屏：`SetWindowPos` / `MoveWindow` / `DeferWindowPos` 的目标矩形铺满所在显示器；第三方宿主放宽成「贴住屏幕左上角 + 覆盖 90%」，它们的尺寸未必等于主屏（工作区、副屏、DPI 取整都见过）。`ShowWindow(SW_MAXIMIZE)` 也算一次全屏请求，重放时存的是 `nCmdShow`。
+- 全屏：`SetWindowPos` / `MoveWindow` / `DeferWindowPos` 的目标矩形铺满所在显示器；第三方宿主放宽成「贴住屏幕左上角 + 覆盖 90%」，它们的尺寸未必等于主屏（工作区、副屏、DPI 取整都见过）。`ShowWindow` 有两条路都算：`SW_MAXIMIZE`（Delphi 的 `WindowState := wsMaximized` 走这条，判据不看当前尺寸 —— 它先把状态设成最大化、尺寸随后才撑开），以及窗口本来就铺满 >= 90% 时的 `SW_SHOW` / `SW_SHOWNORMAL`（先按整屏建成、再 ShowWindow 的写法）。
 - 置顶：插到 `HWND_TOPMOST`，或 `GWL_EXSTYLE` 新增 `WS_EX_TOPMOST`。第三方宿主只在窗口覆盖屏幕 50% 以上才问 —— 宿主的置顶工具条常年在那儿，每条都弹框会把用户烦死。
+- **后台巡查兜底。** 钩子只看得见走了导出 API 的路径。`CreateWindowEx` 直接按整屏建窗口、`SetWindowPlacement` 恢复最大化、`SW_VISIBLE` 一次成型，这三种一次窗口钩子都不过，钩子全程沉默 —— 2026-11-21 首次上线就是这样，五个宿主全注进去了，一个框都没弹。现在消息中心线程每 300ms 巡一遍本进程的顶层窗口，见到「已经铺满 >= 90% 且没问过」的补问一次，答「否」就缩回 3/4 屏幕（`VEduSetFull(hWnd, false)`，最大化过的先 `SW_RESTORE` 否则尺寸不生效）。代价是被拦下的窗口会先闪一下全屏，所以钩子那条路仍然是主力，巡查只兜底。
+- 注入完成时就已经全屏的窗口**记成允许**（`VEduEnumWindowsProc` 里做），那是「本来就在上课」，不该弹框，更不该把画面缩小。副作用是：广播窗口若在注入后 100ms 内就建好，也会被这条规则顺走 —— 可接受。
 
 - **不能在钩子里同步弹框。** 这些调用发生在宿主自己的 UI 线程上，模态框会把「全屏」卡到用户回答为止，中间的绘制和计时器全停。所以第一次只拦不问，`PostMessage` 到消息中心线程，答「是」以后再用原参数重放。重放走 `ra*` / `fa*`，不经过 detour，不会二次询问。
 - 决定按窗口记（未定 / 拒绝 / 允许），窗口销毁时清。表满 12 条淘汰最早的一条。「取消」只拒绝这一次，下次还问。
@@ -143,6 +145,9 @@ AES 那半边的拆分明文（partA / partB 异或还原）**硬编码在三处
 - **放行之后必须同步 `gbFullManual` 和 `allowGbTop`。** 主程序每两秒扫一次广播窗口：`gbFullManual` 为假就给窗口加回边框、按 3/4 屏幕摆好，`allowGbTop` 为假就摘掉置顶——学生刚允许的全屏会被它自己拆掉。第三方宿主没有这个扫描，同步过去也无害（`VSendMessageBack` 在 `g_customHost` 下丢弃）。
 - 询问不受 `BlockWindowOps` 约束（那个开关管的是静默拦下窗口操作），单独用 `AskWindowOps` 控制，缺键按开处理。
 - 右键菜单两套。极域的 `JiYuWndProc` 那套菜单项把意图发回主程序；第三方宿主由 `VEduSubclassProc` 挂一个独立菜单（全屏/退出、置顶/取消、允许、关闭），**改动一律走 `ra*` / `fa*`**，否则点「全屏」会自己弹出一个「是否允许全屏」。全屏前的矩形存在 `WindowOpState.restore` 里，退出时还原；没记录过就按 3/4 屏幕摆回去。
+- **`g_opAsking` 在框弹出期间必须保持为真。** 它原来在 `VAskWindowOp` 开头就清了，巡查每 300ms 一趟、窗口还在全屏、决定又没落库，正好会一路叠出第二个、第三个模态框。清在记录答复的同一段临界区里，并顺手把 `sweepSkip` 处理掉（「取消」= 只拒绝这一次，巡查没有「下一次」可拦，只能记「等它退出全屏再问」）。
+- **诊断走 `hkb:eduop`，不走 `VSendMessageBack`。** 后者在 `g_customHost` 下整体丢弃（怕误触发主程序的失联判定）。注入进程自己的 `DzjsTrainerHooks-debug.log` 落在宿主的安装目录里，用户平时看不到，所以「询问已就绪（active）/ 答复（allow|deny|once）」由 `VEduOpNotice` 单独发一份给主程序，进主日志。排查「该弹框却没弹」时先看主日志有没有 `Window op prompt ready in edu host` —— 没有就说明跑的不是带询问的那版 DLL。
+
 - 注入常常晚于宿主全屏：`WM_HOOK_INITIALIZED` 里 `EnumWindows` 把已经铺满的窗口补挂一遍，否则第一次右键什么都没有。
 
 ### 替换画面
