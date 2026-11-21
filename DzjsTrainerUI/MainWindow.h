@@ -517,6 +517,8 @@ private:
 	void UnloadSelectedDiagnosticDriver();
 	void AppendNetworkResult(LPCWSTR text);
 	void ShowPowerMenu();
+	// 概览页「结束电子教室」：弹出当前在跑的教室列表，按选中的那条结束。
+	void ShowEndClassroomMenu();
 	void ShowHelp();
 	void ExportLogs();
 	void ApplyTemporaryVideoProtection();

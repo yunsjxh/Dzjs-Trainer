@@ -1537,13 +1537,16 @@ std::wstring TrainerWorkerInternal::GetEduHostSummary()
 // 「结束电子教室」里收拾其他教室的那一半。极域走的是 Kill()，这里是通用
 // 宿主：注入记录里的每个产品进程都给一条，能结束的从列表里划掉，结束不掉
 // 的留着（下一轮扫描会因为进程还在而重新注入）。
-int TrainerWorkerInternal::KillEduHosts()
+// product 给具体产品名时只动那一款，界面的选择框按名字逐个调。
+int TrainerWorkerInternal::KillEduHosts(LPCWSTR product)
 {
 	if (_CustomInjected.empty()) return 0;
+	const bool all = (product == nullptr || product[0] == L'\0');
 
 	int killed = 0;
 	for (auto it = _CustomInjected.begin(); it != _CustomInjected.end(); ) {
 		if (it->product.empty()) { ++it; continue; }
+		if (!all && _wcsicmp(it->product.c_str(), product) != 0) { ++it; continue; }
 		const DWORD pid = it->pid;
 		const std::wstring name = it->name;
 		if (KillProcess(pid, true)) {
@@ -1562,6 +1565,18 @@ int TrainerWorkerInternal::KillEduHosts()
 		UpdateState();
 	}
 	return killed;
+}
+
+int TrainerWorkerInternal::GetEduHostCountOf(LPCWSTR product)
+{
+	const bool all = (product == nullptr || product[0] == L'\0');
+	int count = 0;
+	for (const auto& item : _CustomInjected) {
+		if (item.product.empty()) continue;
+		if (!all && _wcsicmp(item.product.c_str(), product) != 0) continue;
+		++count;
+	}
+	return count;
 }
 
 void TrainerWorkerInternal::SetEduCompatAutoInject(bool enabled)

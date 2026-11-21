@@ -12,6 +12,7 @@
 #include "../DzjsTrainerUpdater/DzjsTrainerUpdater.h"
 #include "../DzjsTrainerUpdater/UpdaterIpc.h"
 #include "../DzjsTrainer/AppPublic.h"
+#include "../DzjsTrainer/EduProducts.h"
 
 // 窗口默认从抓屏里排除（防极域/录屏）。排查 UI 视觉效果期间临时关掉，
 // 这样截图工具能拍到真实界面；视觉调整完成后改回 1 即可恢复。
@@ -718,6 +719,10 @@ constexpr UINT TIMER_UPDATE_RESTART = 24;
 constexpr int CMD_POWER_SHUTDOWN = 41001;
 constexpr int CMD_POWER_RESTART = 41002;
 constexpr int CMD_POWER_EXIT = 41003;
+// 「结束电子教室」的弹菜单：极域一条、每个产品一条（+100 偏移），最后是全部。
+constexpr int CMD_END_JIYU = 41010;
+constexpr int CMD_END_EDU_BASE = 41100;
+constexpr int CMD_END_ALL = 41011;
 constexpr int IDC_NET_IP = 42001;
 constexpr int IDC_NET_PORT = 42002;
 constexpr int IDC_NET_MESSAGE = 42003;
@@ -4707,8 +4712,10 @@ void MainWindow::PaintOverview(Graphics& g, int width, int height, int offsetY)
 	Text(g, L"\u5e38\u7528\u7684\u8fd0\u884c\u63a7\u5236\u548c\u8bbe\u5907\u5de5\u5177", contentX + 20, actionsY + 44, 340, 18, 10, FontStyleRegular, C(darkMode, 91, 99, 95, 166, 177, 171));
 	// 「重启极域」在只装了别家教室的机器上没有意义 —— 点下去会去拉 StudentMain，
 	// 而这台机器上根本没有。那种情况改成跳到注入页看当前接管了谁。
-	const wchar_t* hostAction = studentRunning ? L"\u7ed3\u675f\u7535\u5b50\u6559\u5ba4"
-		: (eduHostCount > 0 ? L"\u67e5\u770b\u5bbf\u4e3b" : L"\u91cd\u542f\u6781\u57df");
+	// 极域在跑、或者其他教室已经接管，都算「有东西可以结束」。点下去先弹菜单，
+	// 让人挑到底结束哪一款，而不是不声不响全停掉。
+	const wchar_t* hostAction = (studentRunning || eduHostCount > 0) ? L"\u7ed3\u675f\u7535\u5b50\u6559\u5ba4"
+		: L"\u91cd\u542f\u6781\u57df";
 	const wchar_t* labels[] = { L"\u9632\u62a4\u72b6\u6001", setTopMost ? L"\u53d6\u6d88\u7f6e\u9876" : L"\u5f00\u542f\u7f6e\u9876", hostAction, L"\u63a7\u5236\u4e0e\u8bbe\u7f6e", L"\u7535\u6e90\u63a7\u5236" };
 	const float actionY = actionsY + 64.0f;
 	for (int i = 0; i < 5; ++i) {
@@ -8035,16 +8042,10 @@ void MainWindow::HandleClick(POINT point)
 			switch (i) {
 			case 0: ShowFastTip(currentControlled ? L"\u5f53\u524d\u5df2\u542f\u7528\u5b8c\u6574\u9632\u62a4\u3002" : L"\u9632\u62a4\u670d\u52a1\u6b63\u5728\u76d1\u63a7\u3002"); break;
 			case 1: RequestSuperTopmost(); break;
-			// 「结束电子教室」不能只结束极域：机器上还接着红蜘蛛、伽卡他卡的时候，
-			// 按下去就该都停掉，否则按钮名和实际效果对不上。
+			// 「结束电子教室」弹选择框：机器上可能同时接着极域、红蜘蛛、伽卡他卡，
+			// 直接全停容易误伤，交给用户挑。
 			case 2:
-				if (studentRunning) {
-					if (currentWorker) {
-						currentWorker->Kill();
-						currentWorker->KillEduHosts();
-					}
-				}
-				else if (eduHostCount > 0) SelectPage(Page::Injection);
+				if (studentRunning || eduHostCount > 0) ShowEndClassroomMenu();
 				else if (currentWorker) currentWorker->Rerun();
 				break;
 			case 3: SelectPage(Page::Protection); break;
@@ -9416,6 +9417,45 @@ void MainWindow::ShowPowerMenu()
 	DestroyMenu(menu);
 }
 
+void MainWindow::ShowEndClassroomMenu()
+{
+	const int eduTotal = currentWorker ? currentWorker->GetEduHostCount() : 0;
+	const bool hasJiYu = studentRunning;
+	if (!hasJiYu && eduTotal <= 0) return;
+
+	int kinds = hasJiYu ? 1 : 0;
+	HMENU menu = CreatePopupMenu();
+	if (hasJiYu)
+		AppendMenuW(menu, MF_STRING, CMD_END_JIYU, L"\u6781\u57df\u7535\u5b50\u6559\u5ba4");
+	for (int i = 0; i < kEduProductCount; ++i) {
+		const int count = currentWorker ? currentWorker->GetEduHostCountOf(kEduProducts[i].name) : 0;
+		if (count <= 0) continue;
+		std::wstring label = kEduProducts[i].name;
+		if (count > 1) label += L" \u00d7" + std::to_wstring(count);
+		AppendMenuW(menu, MF_STRING, CMD_END_EDU_BASE + i, label.c_str());
+		++kinds;
+	}
+	// 只有一款在跑时，下面的「全部结束」和上面那条是同一件事，没必要占一行。
+	if (kinds > 1) {
+		AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+		AppendMenuW(menu, MF_STRING, CMD_END_ALL, L"\u5168\u90e8\u7ed3\u675f");
+	}
+
+	POINT point{};
+	if (actionRects[2].right > actionRects[2].left) {
+		point.x = actionRects[2].left;
+		point.y = actionRects[2].bottom + 4;
+		ClientToScreen(_hWnd, &point);
+	}
+	else {
+		GetCursorPos(&point);
+	}
+	SetForegroundWindow(_hWnd);
+	TrackPopupMenu(menu, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON,
+		point.x, point.y, 0, _hWnd, nullptr);
+	DestroyMenu(menu);
+}
+
 void MainWindow::ShowHelp()
 {
 	MessageBoxW(_hWnd,
@@ -9797,7 +9837,30 @@ void MainWindow::OnWmCommand(WPARAM wParam)
 		if (MessageBoxW(_hWnd, L"\u786e\u5b9a\u91cd\u65b0\u542f\u52a8\u8ba1\u7b97\u673a\uff1f", L"Dzjs Trainer", MB_YESNO | MB_ICONWARNING) == IDYES)
 			ExitWindowsEx(EWX_REBOOT | EWX_FORCE, 0);
 		break;
+	case CMD_END_JIYU:
+		if (currentWorker) {
+			const bool killed = currentWorker->Kill();
+			ShowFastTip(killed ? L"\u5df2\u7ed3\u675f\u6781\u57df\u7535\u5b50\u6559\u5ba4"
+				: L"\u7ed3\u675f\u6781\u57df\u7535\u5b50\u6559\u5ba4\u5931\u8d25\uff0c\u8be6\u89c1\u65e5\u5fd7");
+		}
+		break;
+	case CMD_END_ALL: {
+		if (!currentWorker) break;
+		bool any = false;
+		if (studentRunning && currentWorker->Kill()) any = true;
+		if (currentWorker->KillEduHosts(nullptr) > 0) any = true;
+		ShowFastTip(any ? L"\u5df2\u7ed3\u675f\u7535\u5b50\u6559\u5ba4"
+			: L"\u6ca1\u6709\u53ef\u4ee5\u7ed3\u675f\u7684\u7535\u5b50\u6559\u5ba4");
+		break; }
 	default:
+		if (command >= CMD_END_EDU_BASE && command < CMD_END_EDU_BASE + kEduProductCount) {
+			const wchar_t* product = kEduProducts[command - CMD_END_EDU_BASE].name;
+			const int killed = currentWorker ? currentWorker->KillEduHosts(product) : 0;
+			std::wstring tip = killed > 0 ? L"\u5df2\u7ed3\u675f" : L"\u65e0\u6cd5\u7ed3\u675f";
+			tip += product;
+			ShowFastTip(tip.c_str());
+			break;
+		}
 		if (command >= IDC_NET_DETECT_PORT && command <= IDC_NET_SCAN)
 			HandleNetworkCommand(command);
 		break;
