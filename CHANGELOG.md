@@ -2,6 +2,29 @@
 
 All notable changes to Dzjs Trainer are documented in this file.
 
+## [1.0.5.3] - 2026-11-21
+
+### Added
+
+- The main window is per-monitor DPI aware and the secondary dialogs scale with the monitor they
+  open on, so at 125% and 150% nothing comes up smaller than the rest of the desktop.
+
+### Fixed
+
+- Esc and Enter work in the process picker, the sample picker and the log save picker; Tab moves
+  focus in the AV text prompt.
+- The tray icon repair runs at all: it shared a timer id with the rerun check and the rerun branch
+  always won.
+- Selecting a student in the teacher pane switches the live view right away instead of waiting for
+  the next list refresh.
+- Typing in the teacher chat box no longer dispatches every keystroke as a button command and
+  fills the result pane.
+- Double-clicking a folder in the media picker enters it; double-clicking "up" no longer goes up
+  two levels.
+- Embedding the teacher GUI no longer terminates the process when the window search times out; it
+  falls back to the standalone window.
+- A fresh clone builds without a hardcoded Boost include path or the missing injector project.
+
 ## [1.0.5.2] - 2026-11-15
 
 ### Added
