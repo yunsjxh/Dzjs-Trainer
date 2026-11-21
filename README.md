@@ -21,7 +21,7 @@ Dzjs Trainer 是基于 JiYu Trainer 翻新和持续维护的 Windows 桌面项�
 
 当前重点维护极域电子教室与机房管理助手环境。Gakataka、红蜘蛛等电子教室产品属于后续适配计划，不代表当前版本已经完整支持。
 
-## 特性
+## 功能
 
 - Windows 桌面管理界面与托盘运行模式。
 - 教学终端兼容性检测、状态诊断与运行日志。
@@ -32,113 +32,23 @@ Dzjs Trainer 是基于 JiYu Trainer 翻新和持续维护的 Windows 桌面项�
 - 可选的画面替换，覆盖 BitBlt、StretchBlt、PrintWindow、GetDIBits 等抓屏路径。
 - 极域电子教室、机房管理助手的兼容适配基础。
 
-## 架构
+## 开始使用
 
-| 目录 | 说明 |
-| --- | --- |
-| `DzjsTrainer` | 主程序、驱动加载和资源嵌入逻辑 |
-| `DzjsTrainerUI` | 原生 Windows UI 与交互逻辑 |
-| `DzjsTrainerDriver` | x64 WDM 驱动源码 |
-| `DzjsTrainerHooks` | 兼容层与 Hook 模块源码 |
-| `DzjsTrainerUpdater` | 更新组件源码 |
-| `JiYuAvKernel` / `JiYuAvCtl` | 辅助驱动与控制工具 |
-| `tools` | 驱动构建、签名、令牌与验证脚本 |
-| `DzjsTrainer.sln` | 主解决方案 |
+发布包是单个 `DzjsTrainer.exe`，双击运行，不需要安装。首次启动会申请管理员权限，驱动和兼容层这些组件由程序自己释放，不用手动放文件。
 
-主程序使用 x86 配置构建；驱动使用 x64 配置构建。解决方案已配置二者的依赖关系。
+运行日志和配置跟着 exe 走，是同目录下的 `.ini` 和 `.log`；目录不可写时日志会回落到 `%LOCALAPPDATA%\DzjsTrainer\`。
 
-## 环境要求
+## 运行要求
 
-- Windows 10 或更高版本；内核驱动另需 Windows 10 2004（19041）起，见下面的运行限制。
-- Visual Studio 2022 或更高版本，包含 C++ 桌面开发和 MSBuild。
-- Windows 10/11 SDK。
-- 构建 `DzjsTrainerDriver` 时需要安装与系统匹配的 WDK。
-- Boost 头文件（`DzjsTrainerUI` 的 `TeacherEndpoint/` 用到 asio），路径通过 `BoostIncludeDir` 传入。
+**Windows 10 或更高版本**。内核驱动另需 Windows 10 2004（19041）起——驱动里用到了 `ExAllocatePool2`，更早的系统（含 Windows 7）内核没有这个导入，开测试模式也加载不了。
 
-### 运行限制
+**驱动不是运行前提。** 没开测试模式、驱动没加载上，程序照样能用：窗口化、进程注入、替换画面/涂黑都在。缺的只有三样依赖内核的能力——内核级杀进程、进程自保护、AV 驱动扫描。日志里会写明驱动为什么没起来。
 
-- **驱动不是运行前提。** 没开测试模式、驱动没加载上，程序照样能用：窗口化、进程注入、替换画面/涂黑都在。缺的只有三样依赖内核的能力——内核级杀进程、进程自保护、AV 驱动扫描。
-- **发布包里的驱动可以直接加载**，不用开测试模式，也不要求关闭 Secure Boot。
-- **自己编译的版本不一样。** 没有签名证书时驱动只能自签，这种驱动在 Windows 10 1607 之后必须开测试模式才能加载；Secure Boot 开着的机器还要先在 BIOS 里关掉，否则 `StartService` 返回 577，日志里是 `Load driver error in StartService : 577`。
-- **驱动要求 Windows 10 2004（19041）或更高。** 驱动里用了 `ExAllocatePool2`，更早的系统（含 Windows 7）内核里没有这个导入，开测试模式也加载不了。
-- **教师端嵌入只接受 FLTK 窗口。** 公开的 `Third-party-JiYu-Teacher-Endpoint` 是 Python 版，只有控制台；等不到 FLTK 窗口时会自动改成独立窗口运行，不会结束进程。
+**发布包里的驱动可以直接加载**，不用开测试模式，也不要求关闭 Secure Boot。
 
-## 构建
+**自己编译的版本不一样。** 没有签名证书时驱动只能自签，这种驱动在 Windows 10 1607 之后必须开测试模式才能加载；Secure Boot 开着的机器还要先在 BIOS 里关掉，否则 `StartService` 返回 577，日志里是 `Load driver error in StartService : 577`。
 
-使用 Visual Studio 打开 `DzjsTrainer.sln`，选择 `Release | x86` 后生成整个解决方案。
-
-也可以在开发者命令行中执行：
-
-```powershell
-MSBuild.exe DzjsTrainer.sln /t:Build /p:Configuration=Release /p:Platform=x86 /m
-```
-
-`DzjsTrainerUI` 通过 `TeacherEndpoint/` 用 Boost.Asio 和教师端通信，仓库不含 Boost 本体。工程里留了维护者本机的默认路径，换机器要显式指定：
-
-```powershell
-MSBuild.exe DzjsTrainer.sln /t:Build /p:Configuration=Release /p:Platform=x86 /p:BoostIncludeDir=D:\vcpkg\installed\x64-windows\include
-```
-
-路径不对时会直接报「找不到 Boost 头文件」并带出当前值，不会编到一半才失败。
-
-单独构建各工程时按这个顺序：驱动（x64）→ `DzjsTrainerHooks` / `DzjsTrainerHooks64` → `DzjsTrainerInjector64` → `DzjsTrainerUpdater` → `DzjsTrainerUI` → `DzjsTrainer`。用解决方案构建就不用管，依赖已经配好。
-
-DLL 注入模块在 `DzjsTrainer/DllInjector/`，随主工程一起编译，不需要额外的克隆步骤。
-
-驱动可单独构建：
-
-```powershell
-MSBuild.exe DzjsTrainerDriver\DzjsTrainerDriver.vcxproj /t:Build /p:Configuration=Release /p:Platform=x64 /m
-```
-
-构建产物会写入被 Git 忽略的 `Release` 目录，不应提交到源码仓库。
-
-### 更新通道公钥
-
-`DzjsTrainerUpdater` 需要一把内嵌的 RSA 公钥来验证服务器返回的时效票据。仓库里不含真实公钥，只有 `DzjsTrainerUpdater/UpdaterTicketKey.h.example` —— 示例公钥，对应私钥 `update-server/ticket-sign.pem.example` 是公开的。
-
-`UpdaterTicket.h` 通过 `__has_include` 回退到 `.example`，所以克隆下来直接就能编译。这样编出来的程序连不上正式更新服务器，会明确提示「此版本内置的是开源示例公钥」—— 这是刻意的失败方向，不是缺陷。
-
-要构建能接收正式更新的发行版，先把自己的公钥生成进去：
-
-```powershell
-python tools\make-ticket-key.py
-```
-
-脚本读取 `update-server/ticket-sign.pub.der`，生成被 Git 忽略的 `DzjsTrainerUpdater/UpdaterTicketKey.h`。加 `--check` 可确认现有头文件没有和 DER 脱节。
-
-这份 DER 同样不进版本库 —— 否则任何人都能一键编出一个连得上正式服务器的客户端，占位符就白做了。它从私钥导出：
-
-```powershell
-openssl pkey -in update-server\ticket-sign.pem -pubout -outform DER -out update-server\ticket-sign.pub.der
-```
-
-## 驱动签名与发布
-
-仓库不包含发布者的代码签名证书、私有解锁密钥或实际解锁令牌。`DzjsTrainerDriver.unlock.enc.sample` 是公开构建所需的占位资源。
-
-> **注意：用上面的 MSBuild 命令构建出来的 exe，无法卸载自己加载的驱动。**
->
-> `DzjsTrainer.vcxproj` 把 `IDR_DRIVER_UNLOCK_TOKEN` 固定绑定到
-> `$(SolutionDir)DzjsTrainerDriver.unlock.enc.sample`，而该占位令牌与本次构建产出的
-> `.sys` 并不匹配。驱动会拒绝卸载，日志中出现：
->
-> ```
-> [E] Embedded unload token is missing, invalid, or cannot be decrypted
-> [E] Driver unload authorization failed; service stop was not attempted
-> ```
->
-> 这是预期行为，不是缺陷。要获得可卸载的构建，必须走下面的签名流程，让
-> `tools\Complete-DriverSigning.ps1` 针对当次驱动重新生成令牌并回嵌主程序。
-> 开发调试阶段如需卸载，可手工 `sc stop <驱动服务名>` 后重启。
-
-发布维护者需要自行完成以下工作：
-
-1. 使用自己的证书签名最终驱动文件。
-2. 运行 `tools\Complete-DriverSigning.ps1` 更新驱动包，并重新嵌入主程序资源。
-3. 使用 `tools\Build-DzjsTrainerRelease.ps1` 验证签名者、资源哈希与发布产物。
-
-如需启用实际解锁令牌流程，请在本地使用 `tools\New-DriverUnlockKeys.ps1` 和 `tools\New-DriverUnlockToken.ps1` 生成自己的密钥与令牌；私有材料不得提交到仓库。
+**教师端嵌入只接受 FLTK 窗口。** 公开的 `Third-party-JiYu-Teacher-Endpoint` 是 Python 版，只有控制台；等不到 FLTK 窗口时会自动改成独立窗口运行，不会结束进程。
 
 ## 支持范围
 
@@ -151,16 +61,11 @@ openssl pkey -in update-server\ticket-sign.pem -pubout -outform DER -out update-
 
 不同系统版本、终端版本和安全策略的行为可能不同。请先在隔离测试环境验证，再进行经授权的部署。
 
-## 贡献
+## 参与开发
 
-动手改代码前先看 [开发者说明](DEVELOPMENT.md)：模块划分、构建约束、调试开关和几个不要踩的坑都写在那里，这份 README 只讲使用。
+从源码构建、驱动签名、更新通道配置这些内容都在 [开发者说明](DEVELOPMENT.md) 里，这份 README 只讲怎么用。装不上、跑不起来的问题，也建议先翻那份文档的调试一节。
 
-欢迎提交 Issue、修复建议和 Pull Request。提交前请确保：
-
-- 不提交 `Release`、`obj`、`bin`、日志、PDB 或其他构建产物。
-- 不提交证书、私钥、令牌、设备标识或包含敏感环境信息的日志。
-- 为功能修改提供可复现的测试步骤。
-- 保持现有 C++ 与 PowerShell 代码风格，避免无关格式化。
+欢迎提交 Issue 和 Pull Request。提交前请确认不包含构建产物、证书、私钥、令牌，或带有敏感环境信息的日志；功能改动请附可复现步骤。
 
 安全问题请不要在公开 Issue 中披露可复现细节，应先联系维护者。
 

@@ -73,6 +73,13 @@ SDK 版本对不上时分两种：用户态工程写的是 `10.0`，自动取本
 
 构建顺序（手工分步时）：驱动 x64 → `DzjsTrainerHooks`（两个位数）→ `DzjsTrainerInjector64` → `DzjsTrainerUpdaterExe` → `DzjsTrainerUI` → `DzjsTrainer`。用解决方案构建就不用管，依赖已经配好。
 
+驱动单独构建时平台写 `x64`，这是唯一不用 `x86` / `Win32` 的工程：
+
+```powershell
+& "D:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\amd64\MSBuild.exe" `
+  DzjsTrainerDriver\DzjsTrainerDriver.vcxproj /t:Build /p:Configuration=Release /p:Platform=x64 /m
+```
+
 注意 `DzjsTrainerInjector64` 不在解决方案里，用 `cl.exe` + `build.sh` 单独出。同理 `CaptureProbe`。
 
 ## 驱动
@@ -160,6 +167,15 @@ AES 那半边的拆分明文（partA / partB 异或还原）**硬编码在三处
 
 ## 发布构建
 
+**先说一件事：照「构建」那节的命令编出来的 exe，卸载不了自己加载的驱动。** `.vcxproj` 把 `IDR_DRIVER_UNLOCK_TOKEN` 绑定到 `DzjsTrainerDriver.unlock.enc.sample`，占位令牌和本次产出的 `.sys` 不匹配，驱动会拒绝。日志长这样：
+
+```
+[E] Embedded unload token is missing, invalid, or cannot be decrypted
+[E] Driver unload authorization failed; service stop was not attempted
+```
+
+这是刻意的失败方向，不是 bug。要可卸载的构建就得走下面的签名流程重新生成令牌；调试阶段等不及，手工 `sc stop <驱动服务名>` 再重启也行。
+
 `tools/` 下的脚本负责这一段，`Complete-DriverSigning.ps1` 签名并回嵌，`Build-DzjsTrainerRelease.ps1` 校验产物。手工发版时有两个地方容易翻车：
 
 1. **资源里的令牌路径要切成真实文件。** `.rc` 里默认绑的是 `.sample` 占位令牌，`.vcxproj` 的 `EmbeddedDriverUnlockResource` 只提供增量构建的 Inputs，不决定内容。切完要**同时删掉 `.res` 和 stamp**，只删 stamp 不会重跑资源编译。
@@ -168,6 +184,26 @@ AES 那半边的拆分明文（partA / partB 异或还原）**硬编码在三处
 另外 UPX 压缩是**不保真**的：`upx -d` 回来会丢掉调试目录和头部校验和，差几 KB。验收判据是「节表一致 + 内嵌资源逐字节可寻址」，不要用整文件哈希比对。
 
 更新通道有**两份端点实现**：`UpdaterMain.cpp`（子进程真正执行的）和 `UpdaterManifest.cpp`（主程序里的静态库）。探测走的是子进程，只改后者等于白改。
+
+### 更新通道公钥
+
+`DzjsTrainerUpdater` 需要一把内嵌的 RSA 公钥来验证服务器返回的时效票据。仓库里不放真实公钥，只有 `UpdaterTicketKey.h.example`（对应私钥 `update-server/ticket-sign.pem.example`，是公开的示例）。
+
+`UpdaterTicket.h` 用 `__has_include` 回退到 `.example`，所以克隆下来直接就能编。编出来的程序连不上正式更新服务器，会明确提示「此版本内置的是开源示例公钥」——同样是刻意的失败方向。
+
+要构建能接收正式更新的发行版，先把自己的公钥生成进去：
+
+```powershell
+python tools\make-ticket-key.py
+```
+
+脚本读 `update-server/ticket-sign.pub.der`，生成被 Git 忽略的 `DzjsTrainerUpdater/UpdaterTicketKey.h`。加 `--check` 可以确认现有头文件有没有和 DER 脱节。
+
+这份 DER 也不进版本库 —— 否则任何人都能一键编出一个连得上正式服务器的客户端，占位符就白做了。它从私钥导出：
+
+```powershell
+openssl pkey -in update-server\ticket-sign.pem -pubout -outform DER -out update-server\ticket-sign.pub.der
+```
 
 ## 不要做的事
 
