@@ -120,9 +120,14 @@ extern bool blockShutdown;
 void VNotifyShutdownBlocked(const wchar_t* api);
 
 // ===== 全屏 / 置顶的现场询问（2026-11-21）===================================
-// 被注入窗口（jiYuWnds 里的广播/黑屏窗口）要全屏或置顶时，不再静默吞掉，
-// 而是问用户一句：允许就按原参数重放这次调用，拒绝就记住，之后直接挡。
-// 决定按窗口记，窗口销毁时清；还没有消息中心可问时直接放行（不静默干预）。
+// 被注入窗口要全屏或置顶时，不再静默吞掉，而是问用户一句：允许就按原参数
+// 重放这次调用，拒绝就记住，之后直接挡。决定按窗口记，窗口销毁时清；
+// 还没有消息中心可问时直接放行（不静默干预）。
+//
+// 覆盖范围不只有极域：极域走 jiYuWnds 名单，其余适配的电子教室（红蜘蛛、
+// 伽卡他卡、联想传奇，以及「进程注入」指定的任意宿主）走 VWindowOpAskable
+// 的通用判据 —— 本进程的顶层窗口，且这次操作要把它变成铺满屏幕的大窗口。
+// 名单没有这些产品的窗口，硬编码标题也认不全，只能按「谁在把自己铺满」认。
 //
 // 为什么不在钩子里同步弹框：这些调用发生在极域自己的 UI 线程上，模态框会把
 // 「全屏」那一步卡住直到用户回答，中间的绘制和计时器全部停摆。所以第一次只
@@ -131,6 +136,8 @@ enum : int {
 	VOP_SRC_SETWINDOWPOS  = 0,
 	VOP_SRC_MOVEWINDOW    = 1,
 	VOP_SRC_SETWINDOWLONG = 2,
+	// ShowWindow(SW_MAXIMIZE)：没有尺寸参数，cx 字段借来存 nCmdShow。
+	VOP_SRC_SHOWWINDOW    = 3,
 };
 
 struct WindowOpRequest {
@@ -146,6 +153,14 @@ struct WindowOpRequest {
 
 // 返回 true = 调用方继续执行原操作；false = 已拦下，等用户答复后由 UI 线程重放。
 bool VAllowWindowOp(const WindowOpRequest& req, bool full, bool top);
+// 这个窗口的这次操作要不要问一句。极域看名单，其他宿主看「是不是它自己的
+// 顶层窗口、是不是在铺满屏幕」。GuardWindow 在 blockWindowOps 分支里也要用它
+// 决定该不该走询问路径，所以单独导出。
+bool VWindowOpAskable(HWND hWnd, const WindowOpRequest* req, bool full, bool top);
+// 第三方宿主的全屏请求未必严格写成 (0,0,主屏宽,主屏高)：有的用工作区尺寸，
+// 有的按窗口所在显示器算，高 DPI 下还会差几个像素。这里放宽到
+// 「贴住屏幕左上角 + 铺满所在显示器 90%」。极域那条精确判据不受影响。
+bool VEduFullScreenRequest(HWND hWnd, int x, int y, int cx, int cy);
 // 窗口销毁时清掉决定与待重放请求。
 void VForgetWindowOp(HWND hWnd);
 // 右键菜单「允许全屏和置顶」：改成允许，并把上一次被挡的请求补上。

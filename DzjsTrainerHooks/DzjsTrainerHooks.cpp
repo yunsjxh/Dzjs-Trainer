@@ -71,6 +71,13 @@
 #define IDM_HELP_GB2 25604
 // 拒绝了全屏/置顶以后，用户还能从这里改回来并补做上一次被挡的请求。
 #define IDM_ALLOW_OPS 25605
+// 第三方宿主（红蜘蛛、伽卡他卡、联想传奇、任意注入进程）的右键菜单。
+// 单独一组 ID：极域那几条命令会把结果回传主程序，这套没有主程序可回传。
+#define IDM_EDU_HINT   25610
+#define IDM_EDU_FULL   25611
+#define IDM_EDU_TOP    25612
+#define IDM_EDU_ALLOW  25613
+#define IDM_EDU_CLOSE  25614
 
 // INVALID_HHOOK_MOUSE / INVALID_HHOOK_KEYBOARD 已移到 HooksCommon.h 供 guard 模块共用
 
@@ -511,6 +518,9 @@ DWORD WINAPI VLoadBootstrapThread(LPVOID lpThreadParameter)
 	return 0;
 }
 
+// 定义在第三次全屏询问那一段，卸载时销毁第三方宿主的右键菜单。
+void VDestroyEduMenu();
+
 void VUnloadAll() {
 
 	if (loaded)
@@ -521,6 +531,7 @@ void VUnloadAll() {
 		{ VWndListGuard guard; jiYuWndCanSize.clear(); }
 		runOPWhiteList.clear();
 		if (hMenuGb) DestroyMenu(hMenuGb);
+		VDestroyEduMenu();
 		VUnInstallHooks();
 		loaded = false;
 	}
@@ -1444,6 +1455,9 @@ static DWORD WINAPI VShutdownNoticeThread(LPVOID param)
 //
 // 重放走的是 `ra*` / `fa*` 原始指针，不经过 detour，所以不会二次询问。
 
+// 定义在 namespace 之后，菜单和询问判据都要用。
+bool VEduRectCoversMonitor(HWND hWnd, long long w, long long h, int percent);
+
 namespace {
 
 enum { VOP_UNDECIDED = -1, VOP_DENY = 0, VOP_ALLOW = 1 };
@@ -1455,6 +1469,10 @@ struct WindowOpState {
 	int             top;
 	WindowOpRequest lastBlocked;
 	bool            hasLastBlocked;
+	// 右键菜单「全屏显示」要能退回来：进全屏前的矩形存这儿。
+	// 极域有主程序按 3/4 屏幕摆回去，第三方宿主没人管，只能自己记。
+	RECT            restore;
+	bool            hasRestore;
 };
 
 const int kOpStateCount = 12;
@@ -1514,9 +1532,229 @@ void VReplayWindowOp(const WindowOpRequest& req)
 			faSetWindowLongA(req.hwnd, req.index, req.value);
 		}
 		break;
+	case VOP_SRC_SHOWWINDOW:
+		// 最大化请求没有尺寸参数，nCmdShow 存在 x 字段里。
+		if (faShowWindow) faShowWindow(req.hwnd, req.x);
+		break;
 	default:
 		break;
 	}
+}
+
+// ---- 第三方宿主的右键菜单 ---------------------------------------------------
+//
+// 极域那个广播窗口有自己的 JiYuWndProc 菜单，菜单项把意图发回主程序，由主程序
+// 统一摆位置。红蜘蛛、伽卡他卡、联想传奇这些宿主没有主程序配合，VSendMessageBack
+// 在 g_customHost 下也是丢弃的，所以菜单必须自己动手。
+//
+// 所有改动都走 `ra*` / `fa*` 原始指针：经过 detour 的话会再次触发询问，
+// 点「全屏」自己弹出一个「是否允许全屏」的框，很荒谬。
+
+const wchar_t* kEduOldProcProp = L"DzjsTrainerEduOldProc";
+HMENU hMenuEdu = NULL;
+
+// 窗口覆盖了所在显示器的多少。多屏时以窗口所在那块屏为准，不拿主屏算 ——
+// 副屏 2K、主屏 1080p 的机器上，用主屏尺寸判副屏全屏会永远差一截。
+bool VEduWindowCoversMonitor(HWND hWnd, int percent)
+{
+	RECT rc;
+	if (!GetWindowRect(hWnd, &rc)) return false;
+	return VEduRectCoversMonitor(hWnd,
+		(long long)rc.right - rc.left, (long long)rc.bottom - rc.top, percent);
+}
+
+void VEnsureEduMenu()
+{
+	if (hMenuEdu) return;
+	hMenuEdu = CreatePopupMenu();
+	if (!hMenuEdu) return;
+	// 第一项不可点，说明这个菜单是谁加的。极域那边也是这个写法。
+	AppendMenu(hMenuEdu, MF_STRING | MF_GRAYED, IDM_EDU_HINT, L"DzjsTrainer 添加的菜单");
+	AppendMenu(hMenuEdu, MF_SEPARATOR, 0, NULL);
+	AppendMenu(hMenuEdu, MF_STRING, IDM_EDU_FULL, L"全屏显示");
+	AppendMenu(hMenuEdu, MF_STRING, IDM_EDU_TOP, L"窗口置顶");
+	AppendMenu(hMenuEdu, MF_STRING, IDM_EDU_ALLOW, L"允许全屏和置顶");
+	AppendMenu(hMenuEdu, MF_SEPARATOR, 0, NULL);
+	AppendMenu(hMenuEdu, MF_STRING, IDM_EDU_CLOSE, L"关闭这个窗口");
+}
+
+void VEduSetFull(HWND hWnd, bool full)
+{
+	if (raSetWindowPos == NULL) return;   // 钩子还没装好，什么都不做
+	HMONITOR mon = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST);
+	MONITORINFO mi = { sizeof(mi) };
+	if (!GetMonitorInfoW(mon, &mi)) return;
+
+	VEnsureOpCs();
+	EnterCriticalSection(&g_opCs);
+	WindowOpState* state = VFindOpStateLocked(hWnd, true);
+	RECT restore = {};
+	bool hasRestore = false;
+	if (state) {
+		if (full && !state->hasRestore) {
+			// 只在第一次进全屏时记原位置；反复点「全屏」不该把全屏矩形记成原位置。
+			if (GetWindowRect(hWnd, &state->restore)) state->hasRestore = true;
+		}
+		restore = state->restore;
+		hasRestore = state->hasRestore;
+	}
+	if (state && !full) {
+		state->hasRestore = false;
+	}
+	LeaveCriticalSection(&g_opCs);
+
+	if (full) {
+		const int w = mi.rcMonitor.right - mi.rcMonitor.left;
+		const int h = mi.rcMonitor.bottom - mi.rcMonitor.top;
+		raSetWindowPos(hWnd, NULL, mi.rcMonitor.left, mi.rcMonitor.top, w, h,
+			SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+		return;
+	}
+
+	if (hasRestore && restore.right > restore.left && restore.bottom > restore.top) {
+		raSetWindowPos(hWnd, NULL, restore.left, restore.top,
+			restore.right - restore.left, restore.bottom - restore.top,
+			SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+		return;
+	}
+	// 没有记录（注入晚于全屏，用户只能选退出）：按极域的 3/4 屏幕摆回去，
+	// 总比留在全屏没反应强。
+	const int monW = mi.rcMonitor.right - mi.rcMonitor.left;
+	const int monH = mi.rcMonitor.bottom - mi.rcMonitor.top;
+	const int w = monW * 3 / 4, h = monH * 4 / 5;
+	raSetWindowPos(hWnd, NULL, mi.rcMonitor.left + (monW - w) / 2,
+		mi.rcMonitor.top + (monH - h) / 2, w, h,
+		SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+}
+
+void VEduSetTopmost(HWND hWnd, bool top)
+{
+	if (raSetWindowPos == NULL) return;
+	raSetWindowPos(hWnd, top ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
+		SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+void VEduUpdateMenu(HWND hWnd)
+{
+	if (!hMenuEdu) return;
+	const bool full = VEduWindowCoversMonitor(hWnd, 95);
+	const bool top = (GetWindowLongW(hWnd, GWL_EXSTYLE) & WS_EX_TOPMOST) == WS_EX_TOPMOST;
+	ModifyMenuW(hMenuEdu, IDM_EDU_FULL, MF_BYCOMMAND | MF_STRING, IDM_EDU_FULL,
+		full ? L"退出全屏" : L"全屏显示");
+	ModifyMenuW(hMenuEdu, IDM_EDU_TOP, MF_BYCOMMAND | MF_STRING, IDM_EDU_TOP,
+		top ? L"取消置顶" : L"窗口置顶");
+	CheckMenuItem(hMenuEdu, IDM_EDU_FULL, MF_BYCOMMAND | (full ? MF_CHECKED : MF_UNCHECKED));
+	CheckMenuItem(hMenuEdu, IDM_EDU_TOP, MF_BYCOMMAND | (top ? MF_CHECKED : MF_UNCHECKED));
+}
+
+void VEduShowMenu(HWND hWnd, POINT screenPos)
+{
+	VEnsureEduMenu();
+	VEduUpdateMenu(hWnd);
+	const int id = TrackPopupMenu(hMenuEdu,
+		TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON,
+		screenPos.x, screenPos.y, 0, hWnd, NULL);
+	// 菜单关掉后补一条空消息：宿主的消息循环不一定会重画，菜单有时会留在屏幕上。
+	PostMessageW(hWnd, WM_NULL, 0, 0);
+	if (!id) return;
+
+	switch (id) {
+	case IDM_EDU_FULL:
+		VEduSetFull(hWnd, !VEduWindowCoversMonitor(hWnd, 95));
+		break;
+	case IDM_EDU_TOP: {
+		const bool top = (GetWindowLongW(hWnd, GWL_EXSTYLE) & WS_EX_TOPMOST) == WS_EX_TOPMOST;
+		VEduSetTopmost(hWnd, !top);
+		break;
+	}
+	case IDM_EDU_ALLOW:
+		VGrantWindowOps(hWnd);
+		break;
+	case IDM_EDU_CLOSE: {
+		WCHAR title[96] = L"";
+		GetWindowTextW(hWnd, title, _countof(title));
+		WCHAR text[320];
+		swprintf_s(text, L"确定要关闭「%s」吗？\n\n这是电子教室自己的窗口，关掉可能中断教师端的投屏。",
+			title[0] ? title : L"远程窗口");
+		if (MessageBoxW(hWnd, text, L"DzjsTrainer - 提示",
+				MB_YESNO | MB_ICONEXCLAMATION | MB_TOPMOST | MB_DEFBUTTON2) == IDYES) {
+			// 跨线程销毁窗口不成立（DestroyWindow 只能动本线程的窗口），
+			// 投一条 WM_CLOSE 让宿主自己走关闭流程。
+			PostMessageW(hWnd, WM_CLOSE, 0, 0);
+		}
+		break;
+	}
+	default:
+		break;
+	}
+}
+
+LRESULT CALLBACK VEduSubclassProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+	WNDPROC oldProc = (WNDPROC)GetPropW(hWnd, kEduOldProcProp);
+
+	if (message == WM_RBUTTONUP || (message == WM_NCRBUTTONUP && wParam == HTCAPTION)) {
+		// 只在铺满屏幕的窗口上弹：窗口化时右键多半是宿主自己的菜单，
+		// 抢过来会把别人的功能弄没。
+		if (VEduWindowCoversMonitor(hWnd, 85)) {
+			POINT pos;
+			if (message == WM_RBUTTONUP) {
+				pos.x = GET_X_LPARAM(lParam);
+				pos.y = GET_Y_LPARAM(lParam);
+				ClientToScreen(hWnd, &pos);
+			}
+			else {
+				pos.x = GET_X_LPARAM(lParam);
+				pos.y = GET_Y_LPARAM(lParam);
+			}
+			VEduShowMenu(hWnd, pos);
+			return 0;
+		}
+	}
+	else if (message == WM_NCDESTROY) {
+		RemovePropW(hWnd, kEduOldProcProp);
+		VForgetWindowOp(hWnd);
+	}
+
+	if (oldProc) return CallWindowProcW(oldProc, hWnd, message, wParam, lParam);
+	return DefWindowProcW(hWnd, message, wParam, lParam);
+}
+
+// 给第三方宿主的窗口挂上菜单。重复调用无害：属性在就说明已经挂过。
+void VAttachEduWindow(HWND hWnd)
+{
+	if (!g_customHost || !hWnd || !IsWindow(hWnd)) return;
+	if (GetPropW(hWnd, kEduOldProcProp)) return;
+	// 只处理宿主自己的顶层窗口。子窗口（渲染面、工具栏）右键另有主人。
+	if (GetAncestor(hWnd, GA_ROOT) != hWnd) return;
+	if (GetWindowLongW(hWnd, GWL_STYLE) & WS_CHILD) return;
+	if (hWnd == hWndMsgCenter) return;
+	if (GetWindowLongW(hWnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) return;
+
+	WNDPROC oldProc = (WNDPROC)GetWindowLongPtrW(hWnd, GWLP_WNDPROC);
+	if (!oldProc || oldProc == VEduSubclassProc) return;
+	if (!SetPropW(hWnd, kEduOldProcProp, (HANDLE)oldProc)) return;
+	SetWindowLongPtrW(hWnd, GWLP_WNDPROC, (LONG_PTR)VEduSubclassProc);
+	WCHAR title[64] = L"";
+	GetWindowTextW(hWnd, title, _countof(title));
+	VDebugLog(L"edu window menu attached hwnd=%p title=%s", hWnd, title);
+}
+
+// 注入往往发生在宿主已经全屏之后（主程序刚启动、刚开始扫描），那时候一次
+// 窗口钩子都没走过，菜单自然挂不上。这里把已经铺满屏幕的窗口补挂一遍。
+BOOL CALLBACK VEduEnumWindowsProc(HWND hWnd, LPARAM)
+{
+	DWORD pid = 0;
+	GetWindowThreadProcessId(hWnd, &pid);
+	if (pid == GetCurrentProcessId() && VEduWindowCoversMonitor(hWnd, 60))
+		VAttachEduWindow(hWnd);
+	return TRUE;
+}
+
+void VAttachEduWindows()
+{
+	if (!g_customHost) return;
+	EnumWindows(VEduEnumWindowsProc, 0);
 }
 
 // 由消息中心线程调用（WM_DZJS_ASK_WINDOWOP）。这里可以安全地弹模态框：
@@ -1546,13 +1784,17 @@ void VAskWindowOp()
 		: (want == VOP_TOP) ? L"置顶显示"
 		: L"全屏并置顶显示";
 
+	// 第三方宿主（红蜘蛛、伽卡他卡，或用户自己注入的进程）未必是「电子教室」，
+	// 文案跟着宿主走，免得在一个普通程序里冒出「电子教室正在请求」。
+	const wchar_t* who = (g_customHost && !g_eduHost) ? L"已注入的程序" : L"电子教室";
+
 	WCHAR text[640];
 	swprintf_s(text,
-		L"电子教室正在请求把「%s」%s。\n\n"
+		L"%s正在请求把「%s」%s。\n\n"
 		L"是：允许，本窗口以后不再询问\n"
 		L"否：拒绝，本窗口以后不再询问\n"
 		L"取消：只拒绝这一次",
-		title[0] ? title : L"远程窗口", action);
+		who, title[0] ? title : L"远程窗口", action);
 
 	// MB_TOPMOST 是必须的：请求的往往正是「铺满整屏」的那个窗口，
 	// 不置顶就会被它盖住，学生只会看到一片全屏画面而不知道有人在问什么。
@@ -1598,13 +1840,97 @@ void VAskWindowOp()
 
 } // namespace
 
+// 给 VUnloadAll 用。DLL 卸载时不销毁，菜单句柄会跟着注入进程一直留着。
+void VDestroyEduMenu()
+{
+	if (hMenuEdu) {
+		DestroyMenu(hMenuEdu);
+		hMenuEdu = NULL;
+	}
+}
+
+// 给定一块目标尺寸，看它铺满所在显示器多少。全屏请求拿的就是目标尺寸，
+// 置顶请求因为 SetWindowLong 不带尺寸，改取当前矩形。
+bool VEduRectCoversMonitor(HWND hWnd, long long w, long long h, int percent)
+{
+	if (w <= 0 || h <= 0) return false;
+	HMONITOR mon = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST);
+	MONITORINFO mi = { sizeof(mi) };
+	if (!GetMonitorInfoW(mon, &mi)) return false;
+	const long long monW = mi.rcMonitor.right - mi.rcMonitor.left;
+	const long long monH = mi.rcMonitor.bottom - mi.rcMonitor.top;
+	if (monW <= 0 || monH <= 0) return false;
+	return w * h * 100 >= monW * monH * percent;
+}
+
+bool VEduFullScreenRequest(HWND hWnd, int x, int y, int cx, int cy)
+{
+	if (!g_customHost || cx <= 0 || cy <= 0) return false;
+	HMONITOR mon = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST);
+	MONITORINFO mi = { sizeof(mi) };
+	if (!GetMonitorInfoW(mon, &mi)) return false;
+	const int monW = mi.rcMonitor.right - mi.rcMonitor.left;
+	const int monH = mi.rcMonitor.bottom - mi.rcMonitor.top;
+	if (monW <= 0 || monH <= 0) return false;
+	// 起点允许 8 像素误差：无边框窗口常把边框算进位置里。
+	if (x < mi.rcMonitor.left - 8 || x > mi.rcMonitor.left + 8) return false;
+	if (y < mi.rcMonitor.top - 8 || y > mi.rcMonitor.top + 8) return false;
+	return (long long)cx * cy * 100 >= (long long)monW * monH * 90;
+}
+
+bool VWindowOpAskable(HWND hWnd, const WindowOpRequest* req, bool full, bool top)
+{
+	if (!hWnd || !IsWindow(hWnd)) return false;
+	// 极域：主程序点过名的窗口（广播、黑屏），名单说了算。
+	if (VIsInIllegalWindows(hWnd)) return true;
+	if (!g_customHost) return false;
+
+	// 其他电子教室 / 任意注入宿主：没有名单可分，只能按「谁在把自己铺满」认。
+	// 条件卡在本进程的顶层窗口上，宿主子窗口（渲染面、工具栏）不归这个菜单管。
+	DWORD pid = 0;
+	GetWindowThreadProcessId(hWnd, &pid);
+	if (pid != GetCurrentProcessId()) return false;
+	if (GetAncestor(hWnd, GA_ROOT) != hWnd) return false;
+	if (GetWindowLongW(hWnd, GWL_STYLE) & WS_CHILD) return false;
+	if (hWnd == hWndMsgCenter) return false;
+	if (GetWindowLongW(hWnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) return false;
+
+	// 全屏请求本身就是铺满，直接问。置顶请求要看面积：宿主的工具条常年置顶，
+	// 每条都弹框会把用户烦死，也分不清哪个才是上课画面。
+	if (full) {
+		// ShowWindow 没有目标尺寸，按窗口现状兜底：小工具窗最大化不该来问。
+		if (req && req->source == VOP_SRC_SHOWWINDOW)
+			return VEduWindowCoversMonitor(hWnd, 25);
+		return true;
+	}
+	if (!top) return false;
+
+	long long w = 0, h = 0;
+	if (req) {
+		w = req->cx;
+		h = req->cy;
+	}
+	if (w <= 0 || h <= 0) {
+		RECT rc;
+		if (!GetWindowRect(hWnd, &rc)) return false;
+		w = (long long)rc.right - rc.left;
+		h = (long long)rc.bottom - rc.top;
+	}
+	// 50%：极域窗口化时是 3/4 × 4/5 = 60% 面积，留一点余量给不同产品的默认尺寸。
+	return VEduRectCoversMonitor(hWnd, w, h, 50);
+}
+
 bool VAllowWindowOp(const WindowOpRequest& req, bool full, bool top)
 {
 	const int want = (full ? VOP_FULL : 0) | (top ? VOP_TOP : 0);
 	if (!want) return true;
 	if (!loaded || !askWindowOps) return true;
-	// 只管被注入的那个电子教室自己的窗口；别的进程的窗口不在讨论范围里。
-	if (!req.hwnd || !VIsInIllegalWindows(req.hwnd)) return true;
+	// 极域的名单窗口 + 其他适配产品的「大窗口」都在这里过一遍。
+	// 别的进程的窗口不在讨论范围里。
+	if (!VWindowOpAskable(req.hwnd, &req, full, top)) return true;
+	// 第三方宿主没有 JiYuWndProc 那套菜单，第一次问的时候顺手挂一个。
+	if (g_customHost && !VIsInIllegalWindows(req.hwnd))
+		VAttachEduWindow(req.hwnd);
 	// 还没有消息中心可问（DLL 早期，或主程序已经退出）：不静默干预。
 	if (!hWndMsgCenter) return true;
 
@@ -3480,6 +3806,9 @@ INT_PTR CALLBACK MainWndProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 			ShowWindow(hDlg, SW_SHOW);
 			UpdateWindow(hDlg);
 		}
+		// 注入常常发生在宿主已经全屏之后，此时一次窗口钩子都没走过，
+		// 右键菜单只能靠这次补挂。
+		if (g_customHost) VAttachEduWindows();
 		VDebugLog(L"MainWndProc initialization completed customHost=%d eduHost=%d whitePreviewOnly=%d",
 			g_customHost, g_eduHost, whitePreviewOnly);
 		return TRUE;
