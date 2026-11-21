@@ -579,7 +579,9 @@ bool TrainerWorkerInternal::KillProcess(DWORD pid, bool force)
 	}
 
 	HANDLE hProcess;
-	NTSTATUS status = MOpenProcessNt(_StudentMainPid, &hProcess);
+	// 这个函数也用来结束别的进程（例如注入的电子教室宿主），不能拿 _StudentMainPid
+	// 顶替入参 —— 那样点「结束」会去杀极域，而目标进程安然无恙。
+	NTSTATUS status = MOpenProcessNt(pid, &hProcess);
 	if (!NT_SUCCESS(status)) {
 		if (status == STATUS_INVALID_CID || status == STATUS_INVALID_HANDLE) {
 			currentLogger->LogError2(L"找不到进程 [%d] ", pid);
@@ -616,7 +618,7 @@ bool TrainerWorkerInternal::KillProcess(DWORD pid, bool force)
 FORCEKILL:
 	if (XDriverLoaded())
 	{
-		if (KForceKill(_StudentMainPid, &status)) {
+		if (KForceKill(pid, &status)) {
 			currentLogger->Log(L"进程 [%d] 强制结束成功", pid);
 			CloseHandle(hProcess);
 			return true;
@@ -1530,6 +1532,36 @@ std::wstring TrainerWorkerInternal::GetEduHostSummary()
 		}
 	}
 	return text;
+}
+
+// 「结束电子教室」里收拾其他教室的那一半。极域走的是 Kill()，这里是通用
+// 宿主：注入记录里的每个产品进程都给一条，能结束的从列表里划掉，结束不掉
+// 的留着（下一轮扫描会因为进程还在而重新注入）。
+int TrainerWorkerInternal::KillEduHosts()
+{
+	if (_CustomInjected.empty()) return 0;
+
+	int killed = 0;
+	for (auto it = _CustomInjected.begin(); it != _CustomInjected.end(); ) {
+		if (it->product.empty()) { ++it; continue; }
+		const DWORD pid = it->pid;
+		const std::wstring name = it->name;
+		if (KillProcess(pid, true)) {
+			currentLogger->LogInfo(L"已结束电子教室 %s [PID %lu]", name.c_str(), pid);
+			it = _CustomInjected.erase(it);
+			++killed;
+		}
+		else {
+			currentLogger->LogWarn(L"结束电子教室 %s [PID %lu] 失败", name.c_str(), pid);
+			++it;
+		}
+	}
+
+	if (killed > 0) {
+		NotifyEduHosts();
+		UpdateState();
+	}
+	return killed;
 }
 
 void TrainerWorkerInternal::SetEduCompatAutoInject(bool enabled)

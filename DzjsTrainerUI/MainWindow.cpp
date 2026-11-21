@@ -4707,7 +4707,7 @@ void MainWindow::PaintOverview(Graphics& g, int width, int height, int offsetY)
 	Text(g, L"\u5e38\u7528\u7684\u8fd0\u884c\u63a7\u5236\u548c\u8bbe\u5907\u5de5\u5177", contentX + 20, actionsY + 44, 340, 18, 10, FontStyleRegular, C(darkMode, 91, 99, 95, 166, 177, 171));
 	// 「重启极域」在只装了别家教室的机器上没有意义 —— 点下去会去拉 StudentMain，
 	// 而这台机器上根本没有。那种情况改成跳到注入页看当前接管了谁。
-	const wchar_t* hostAction = studentRunning ? L"\u7ed3\u675f\u6781\u57df"
+	const wchar_t* hostAction = studentRunning ? L"\u7ed3\u675f\u7535\u5b50\u6559\u5ba4"
 		: (eduHostCount > 0 ? L"\u67e5\u770b\u5bbf\u4e3b" : L"\u91cd\u542f\u6781\u57df");
 	const wchar_t* labels[] = { L"\u9632\u62a4\u72b6\u6001", setTopMost ? L"\u53d6\u6d88\u7f6e\u9876" : L"\u5f00\u542f\u7f6e\u9876", hostAction, L"\u63a7\u5236\u4e0e\u8bbe\u7f6e", L"\u7535\u6e90\u63a7\u5236" };
 	const float actionY = actionsY + 64.0f;
@@ -8035,8 +8035,15 @@ void MainWindow::HandleClick(POINT point)
 			switch (i) {
 			case 0: ShowFastTip(currentControlled ? L"\u5f53\u524d\u5df2\u542f\u7528\u5b8c\u6574\u9632\u62a4\u3002" : L"\u9632\u62a4\u670d\u52a1\u6b63\u5728\u76d1\u63a7\u3002"); break;
 			case 1: RequestSuperTopmost(); break;
+			// 「结束电子教室」不能只结束极域：机器上还接着红蜘蛛、伽卡他卡的时候，
+			// 按下去就该都停掉，否则按钮名和实际效果对不上。
 			case 2:
-				if (studentRunning) { if (currentWorker) currentWorker->Kill(); }
+				if (studentRunning) {
+					if (currentWorker) {
+						currentWorker->Kill();
+						currentWorker->KillEduHosts();
+					}
+				}
 				else if (eduHostCount > 0) SelectPage(Page::Injection);
 				else if (currentWorker) currentWorker->Rerun();
 				break;

@@ -85,6 +85,9 @@ public:
 	virtual bool GetEduCompatAutoInject() { return true; }
 	virtual int GetEduHostCount() { return 0; }
 	virtual std::wstring GetEduHostSummary() { return L""; }
+	// 结束所有已接管的电子教室宿主进程，返回实际结束的个数。界面上的
+	// 「结束电子教室」用：「结束」的语义不能只落在极域身上。
+	virtual int KillEduHosts() { return 0; }
 	// 让已注入的电子教室宿主重读 ini。界面上改了显示相关开关（信息流保护、
 	// 允许监看）之后调用，否则要等宿主重启或者下一次保存设置才生效。
 	virtual void SyncCustomHosts() {}
@@ -128,6 +131,7 @@ public:
 	bool GetEduCompatAutoInject() override { return _EduCompatEnabled; }
 	int GetEduHostCount() override;
 	std::wstring GetEduHostSummary() override;
+	int KillEduHosts() override;
 	void SyncCustomHosts() override;
 
 	// 扫描 EduProducts.h 里登记的学生端进程，命中就按通用宿主注入。
