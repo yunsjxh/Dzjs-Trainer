@@ -149,6 +149,8 @@ public:
 	int StopEduGuards(const EduProduct& product);
 	int StopServicesByImage(const wchar_t* exeName, const wchar_t* serviceName);
 	int KillProcessesByName(const wchar_t* exeName);
+	// 顺着宿主往上清：同目录（含子目录）的进程 + 非系统父进程。
+	int SweepEduCompanions(DWORD rootPid, const std::wstring& imagePath);
 	// 受控宿主有增减时通知界面。调用点只有注入成功、卸载、清理死进程三处。
 	void NotifyEduHosts();
 
