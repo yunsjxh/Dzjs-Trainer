@@ -2,6 +2,7 @@
 #include "stdafx.h"
 #include <string>
 #include <list>
+#include <map>
 #include "SysHlp.h"
 
 enum TrainerWorkerOp {
@@ -110,6 +111,10 @@ public:
 	std::wstring GetCustomInjectedList() override;
 	bool IsCustomInjected(DWORD pid) override;
 
+	// 扫描 EduProducts.h 里登记的学生端进程，命中就按通用宿主注入。
+	// 只在 _EduCompatEnabled 打开时做事，失败的目标会被压住一段时间不重试。
+	void RunEduCompatInject();
+
 	bool Kill(bool autoWork = false);
 	bool KillStAuto();
 	bool Rerun(bool autoWork = false);
@@ -140,6 +145,12 @@ private:
 		bool is64 = false;
 	};
 	std::list<CustomInjectedProcess> _CustomInjected;
+
+	// 电子教室自动适配（见 EduProducts.h）。扫描本身有 10 秒间隔，失败目标
+	// 再压 10 分钟，避免「2 秒一次的重扫」把注入失败刷满日志。
+	bool _EduCompatEnabled = true;
+	ULONGLONG _LastEduCompatScan = 0;
+	std::map<DWORD, ULONGLONG> _EduInjectBlocked;
 	bool ResolveCustomTarget(LPCWSTR target, DWORD* outPid, std::wstring* outName, std::wstring* status);
 	bool IsSelfCustomTarget(DWORD pid, LPCWSTR name, std::wstring* status);
 	bool DetectTargetBitness(DWORD pid, bool* outIs64, std::wstring* status);

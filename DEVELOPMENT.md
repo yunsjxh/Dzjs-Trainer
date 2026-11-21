@@ -8,7 +8,7 @@ README 写给使用者：怎么跑起来、什么系统能跑、驱动为什么�
 
 | 目录 | 内容 |
 | --- | --- |
-| `DzjsTrainer/` | 主程序（x86）。`App.cpp` 负责装配，`TrainerWorker.cpp` 是后台工作线程，`DriverLoader.cpp` / `DriverGuard.cpp` 管驱动，`KernelUtils.cpp` 封装 IOCTL，`DllInjector/` 是注入器 |
+| `DzjsTrainer/` | 主程序（x86）。`App.cpp` 负责装配，`TrainerWorker.cpp` 是后台工作线程，`DriverLoader.cpp` / `DriverGuard.cpp` 管驱动，`KernelUtils.cpp` 封装 IOCTL，`DllInjector/` 是注入器，`EduProducts.h` 是其他电子教室的目标表 |
 | `DzjsTrainerUI/` | 界面静态库，链进主程序。`MainWindow.cpp` 是自绘主窗口，`DriverServiceActions.cpp` 管驱动服务启停 |
 | `DzjsTrainerDriver/` | x64 WDM 驱动。`IoCtl.h` 是与用户态共享的协议定义 |
 | `DzjsTrainerHooks/` | 注入到目标进程的兼容层（Win32 / x64 两个配置）。`HookEngine.*` 是引擎，`HookRegistry.cpp` 是钩子表 |
@@ -136,6 +136,22 @@ AES 那半边的拆分明文（partA / partB 异或还原）**硬编码在三处
 第三档是给 `CreateDCW(L"DISPLAY")` 用的。**只判 `WindowFromDC` 会漏掉这条路径**，看起来像漏画面，其实是判据不全。也不要退回 `GetObjectType(hdcSrc) == OBJ_DC` 这种写法，那会把宿主自己的窗口绘制一起贴图。
 
 16bpp 可以贴（555 `BI_RGB` / 565 `BI_BITFIELDS`，掩码 F800-07E0-001F），8bpp 只能纯色兜底。DXGI 桌面复制、WGC、内核态抓屏目前没覆盖——OBS、会议软件、浏览器共享走的就是这些路径。
+
+## 其他电子教室
+
+伽卡他卡、红蜘蛛、联想传奇走的是**另一条路**，不碰极域那套单进程语义。
+
+极域这条线写死了：`StudentMain.exe` 一个 PID，注入状态、握手、`hkb:` 协议全绑在一起，主程序按 2 秒一次的定时器盯着它。其他产品没有这套东西，也不想为每一个复制一遍，所以复用「进程注入」那条通用宿主路径——Hooks 里 `g_customHost` 分支，装同一张 34 项钩子表。
+
+三个要点：
+
+- **目标表在 `DzjsTrainer/EduProducts.h`。** 每条规则是「进程名 + 路径特征」，两个都命中才注入。路径特征不是保险措施而是必要条件：`Student.exe` 这种名字满地都是，只按名字匹配等于给无关进程装钩子。
+- **自动注入在 `TrainerWorker::RunEduCompatInject()`。** 扫描 10 秒一次（`RunResetPid` 是 2 秒一次的定时器，直接挂上去太密），每轮最多注入一个新目标（64 位目标要起注入助手并等它返回，一次进来三个会把界面卡住）。失败的目标压 10 分钟再试，过期清掉。
+- **通用宿主不回传、不握手。** `VSendMessageBack()` 开头判 `g_customHost` 直接返回，所以注入这些进程不会污染主程序里极域的状态机。这条是前提，改之前先确认它还在。
+
+关掉自动注入：ini 里 `[JTSettings] EduCompatAutoInject=0`。
+
+**验证状态**：匹配逻辑有离线和多组用例（真实路径、大小写、同名反例、极域 `StudentMain.exe` 不该被认领），`cl` 编过、跑过。**注入之后的实际拦截效果没有实机验证过**——三款软件各自走哪些抓屏路径、锁屏用什么手段，都还不知道。`Display` 域在通用宿主下拿不到假桌面，`hk26/27/33` 那套不生效，只能靠 `PrintWindow` / `GetDIBits` / `StretchBlt`；`BitBlt`（hk41）是全局禁用的，如果它们用 BitBlt 抓屏就拦不住。真机跑起来先看日志里注入了谁，再看画面有没有漏。
 
 ## 界面层
 

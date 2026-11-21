@@ -13,6 +13,7 @@
 #include "SysHlp.h"
 #include "SettingHlp.h"
 #include "RegHlp.h"
+#include "EduProducts.h"
 #include <TlHelp32.h>
 
 extern JTApp *currentApp;
@@ -104,6 +105,12 @@ void TrainerWorkerInternal::Start()
 		
 		SetTimer(hWndMain, TIMER_CK, setCkInterval, TimerProc);
 		SetTimer(hWndMain, TIMER_RESET_PID, 2000, TimerProc);
+
+		// 其他电子教室产品的自动适配，默认开。自动往第三方进程里装钩子毕竟
+		// 是个有副作用的事，留一个 ini 开关给不想用的人关掉。
+		if (currentApp && currentApp->GetSettings())
+			_EduCompatEnabled = currentApp->GetSettings()->GetSettingBool(L"EduCompatAutoInject", true);
+		currentLogger->LogInfo(L"EduCompat autoInject=%d products=%d", _EduCompatEnabled ? 1 : 0, kEduProductCount);
 
 		UpdateState();
 
@@ -467,6 +474,8 @@ void TrainerWorkerInternal::RunResetPid()
 		UnInjectDll(_MasterHelperPid, L"DzjsTrainerHooks.dll");
 		_MasterHelperPid = 0;
 	}
+
+	RunEduCompatInject();
 }
 
 bool TrainerWorkerInternal::FlushProcess()
@@ -1226,6 +1235,84 @@ bool TrainerWorkerInternal::UninjectCustomProcess(LPCWSTR target, std::wstring* 
 	SetCustomInjectStatus(status, message);
 	currentLogger->LogInfo(L"自定义注入已卸载 pid=%lu name=%s is64=%d", pid, recordName.c_str(), is64);
 	return true;
+}
+
+// 取进程完整路径。先走 Nt 打开（受保护的进程也能拿到），失败再退普通权限。
+static bool QueryProcessImagePath(DWORD pid, std::wstring* outPath)
+{
+	if (!outPath) return false;
+	HANDLE process = nullptr;
+	if (!NT_SUCCESS(MOpenProcessNt(pid, &process)) || !process)
+		process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+	if (!process) return false;
+
+	WCHAR buffer[MAX_PATH * 2] = {};
+	DWORD size = _countof(buffer);
+	const BOOL ok = QueryFullProcessImageNameW(process, 0, buffer, &size);
+	CloseHandle(process);
+	if (!ok || size == 0) return false;
+	*outPath = buffer;
+	return true;
+}
+
+// 扫描其他电子教室的学生端进程，命中产品表就按通用宿主注入。
+//
+// 两个限流：扫描本身 10 秒一次（RunResetPid 是 2 秒一次的定时器），每轮最多
+// 注入一个新目标（64 位目标要起注入助手并等待，一次进来三个会把界面卡住）。
+void TrainerWorkerInternal::RunEduCompatInject()
+{
+	if (!_EduCompatEnabled) return;
+
+	const ULONGLONG now = GetTickCount64();
+	if (now - _LastEduCompatScan < 10000) return;
+	_LastEduCompatScan = now;
+
+	// 失败记录压 10 分钟。PID 会被系统复用，过期就清掉重新试。
+	for (auto it = _EduInjectBlocked.begin(); it != _EduInjectBlocked.end(); )
+	{
+		if (now - it->second > 10 * 60 * 1000) it = _EduInjectBlocked.erase(it);
+		else ++it;
+	}
+
+	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snapshot == INVALID_HANDLE_VALUE) return;
+
+	bool injectedOne = false;
+	PROCESSENTRY32W entry = {};
+	entry.dwSize = sizeof(entry);
+	if (Process32FirstW(snapshot, &entry)) {
+		do {
+			if (injectedOne) break;
+
+			const DWORD pid = entry.th32ProcessID;
+			if (pid <= 4) continue;
+			if (_EduInjectBlocked.find(pid) != _EduInjectBlocked.end()) continue;
+
+			// 先取路径再匹配：产品表要求路径特征，只看进程名会误伤同名程序。
+			std::wstring path;
+			if (!QueryProcessImagePath(pid, &path)) continue;
+			const wchar_t* product = EduCompatMatch(entry.szExeFile, path.c_str());
+			if (!product) continue;
+
+			bool alreadyInjected = false;
+			for (const auto& record : _CustomInjected)
+				if (record.pid == pid) { alreadyInjected = true; break; }
+			if (alreadyInjected) continue;
+
+			std::wstring status;
+			const std::wstring target = std::to_wstring(pid);
+			if (InjectCustomProcess(target.c_str(), &status)) {
+				injectedOne = true;
+				currentLogger->Log(L"[%s] 已自动注入 %s [PID %lu]", product, entry.szExeFile, pid);
+			}
+			else {
+				_EduInjectBlocked[pid] = now;
+				currentLogger->LogError(L"[%s] 自动注入 %s [PID %lu] 失败：%s",
+					product, entry.szExeFile, pid, status.c_str());
+			}
+		} while (Process32NextW(snapshot, &entry));
+	}
+	CloseHandle(snapshot);
 }
 
 std::wstring TrainerWorkerInternal::GetCustomInjectedList()

@@ -193,8 +193,9 @@
     <ClInclude Include="DriverLoader.h" />
     <ClInclude Include="DriverGuard.h" />
     <ClInclude Include="DriverPublisherAllowlist.h" />
-	<ClInclude Include="DriverSignerPin.h" />
+    <ClInclude Include="DriverSignerPin.h" />
     <ClInclude Include="DriverSignaturePolicy.h" />
+    <ClInclude Include="EduProducts.h" />
     <ClInclude Include="GuardTerminator.h" />
     <ClInclude Include="RepositoryCleanup.h" />
     <ClInclude Include="DzjsTrainer.h" />
