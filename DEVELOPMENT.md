@@ -67,6 +67,7 @@ SDK 版本对不上时：用户态工程写的是 `10.0`，自动取本机最新
 - **解决方案的平台名是 `x86`，工程文件里叫 `Win32`。** 跑解决方案用 `x86`；单独构建某个 `.vcxproj` 时要写 `Platform=Win32`，写成 `x86` 会报 MSB4126。
 - **单工程构建必须显式给 `-p:SolutionDir=<仓库根>\`。** 否则 `$(SolutionDir)` 会解析到 vcxproj 所在目录，资源路径和输出路径全错。
 - **`-p:BuildProjectReferences=false` 不会重建 `DzjsTrainerUI` 静态库。** 只改 UI 时先单独编 UI，再编主程序；判据是新符号真的进了 `Release/DzjsTrainerUI.lib`（`dumpbin /symbols` 或直接 grep），不是构建返回 0。
+- **发版时重建主程序会把压好的 `DzjsTrainerUpdater.exe` 覆盖回未压缩版。** 主工程对它有 ProjectReference，`-t:Rebuild` 会连带重建依赖，`upx -9` 白做，内嵌进主程序的是 275 KB 的胖版。压完只能 `-t:Build -p:BuildProjectReferences=false` 重链；判据是内嵌资源的 size（压缩后约 130 KB），不是"构建成功"。
 - **`/t:Build` 会静默跳过它认为「最新」的工程。** 构建成功与否看产物时间戳，不看退出码。
 - **带中文注释的源文件必须是 UTF-8 BOM。** MSVC 在没有 BOM 时按本地代码页读，中文注释会把后面的换行和字符串一起吃掉，报出来的错误位置和真实位置对不上。
 - **Boost 只能外部提供。** `DzjsTrainerUI` 的 `TeacherEndpoint/` 用 asio，仓库不含 Boost 本体，通过 `-p:BoostIncludeDir=` 传入；路径不对会在编译前直接报错，不会编到一半才炸。
