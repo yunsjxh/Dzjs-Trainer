@@ -732,6 +732,9 @@ constexpr UINT TIMER_RERUN = 21;
 constexpr UINT TIMER_AUTO_SHUT = 22;
 // 更新替换完成后停一下再退出，让「更新完成」这一帧留得住。
 constexpr UINT TIMER_UPDATE_RESTART = 24;
+// 普通置顶靠每 50ms 重设一次 HWND_TOPMOST 压住别的 topmost 窗口；超级置顶
+// 走 UIAccess 窗口带，用不上这个循环，切换时就把定时器停掉。
+constexpr UINT TIMER_TOPMOST_KEEP = 26;
 constexpr int CMD_POWER_SHUTDOWN = 41001;
 constexpr int CMD_POWER_RESTART = 41002;
 constexpr int CMD_POWER_EXIT = 41003;
@@ -4581,6 +4584,23 @@ void MainWindow::PaintPrimaryButton(Graphics& g, const RectF& rect, LPCWSTR labe
 	PaintButton(g, rect, label, hoverId, ButtonStyle::Primary, radius);
 }
 
+void MainWindow::SyncTopmostKeepTimer()
+{
+	// 只有「普通置顶」需要这个循环：它只是把自己的窗口设成 topmost，别人
+	// 同样设了 topmost（极域广播、前台强制上浮）就能盖上来，只能靠不停地
+	// 重新置顶把位置抢回来。超级置顶是 UIAccess 的窗口带，本身就压得住，
+	// 再跑一遍反而是白费。
+	const bool wanted = setTopMost && !topMostUiAccessBand;
+	if (wanted == topmostKeepTimerRunning) return;
+	if (wanted) {
+		topmostKeepTimerRunning = SetTimer(_hWnd, TIMER_TOPMOST_KEEP, 50, nullptr) != 0;
+	}
+	else {
+		KillTimer(_hWnd, TIMER_TOPMOST_KEEP);
+		topmostKeepTimerRunning = false;
+	}
+}
+
 void MainWindow::RequestSuperTopmost()
 {
 	const bool currentlyEnabled = setTopMost && IsWindowActuallyTopmost(_hWnd);
@@ -4592,6 +4612,7 @@ void MainWindow::RequestSuperTopmost()
 		setTopMost = false;
 		topMostUiAccessBand = false;
 		SaveSettings();
+		SyncTopmostKeepTimer();
 		ShowFastTip(L"\u5df2\u53d6\u6d88\u7f6e\u9876");
 		InvalidateRect(_hWnd, nullptr, FALSE);
 		return;
@@ -4624,6 +4645,7 @@ void MainWindow::RequestSuperTopmost()
 	setTopMost = true;
 	topMostUiAccessBand = bandApplied;
 	SaveSettings();
+	SyncTopmostKeepTimer();
 	ShowFastTip(bandApplied ? L"\u5df2\u542f\u7528\u8d85\u7ea7\u7f6e\u9876" : L"\u5df2\u542f\u7528\u666e\u901a\u7f6e\u9876");
 	InvalidateRect(_hWnd, nullptr, FALSE);
 }
@@ -11407,6 +11429,7 @@ void MainWindow::OnFirstShow()
 			topMostUiAccessBand = bandApplied;
 		}
 	}
+	SyncTopmostKeepTimer();
 	if (currentWorker) {
 		currentWorker->Init();
 		currentWorker->Start();
@@ -11549,6 +11572,20 @@ void MainWindow::EnsureAnimationTimer()
 
 void MainWindow::OnWmTimer(WPARAM timer)
 {
+	if (timer == TIMER_TOPMOST_KEEP) {
+		if (!setTopMost || topMostUiAccessBand) {
+			KillTimer(_hWnd, TIMER_TOPMOST_KEEP);
+			topmostKeepTimerRunning = false;
+			return;
+		}
+		// 菜单、AV 提示、进程选择器这些都是主窗口的 owned 弹窗，同样在
+		// topmost 带上。这一拍再置顶会把它们压到主窗口下面，跳过。
+		if (GetWindow(_hWnd, GW_ENABLEDPOPUP) != nullptr) return;
+		if (!IsWindowVisible(_hWnd) || IsIconic(_hWnd)) return;
+		SetWindowPos(_hWnd, HWND_TOPMOST, 0, 0, 0, 0,
+			SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+		return;
+	}
 	if (timer == TIMER_SERVICE_POLL) {
 		PollEmbeddedTeacherGui();
 		PollTeacherService();
@@ -11682,6 +11719,8 @@ void MainWindow::OnWmDestroy()
 	KillTimer(_hWnd, TIMER_SERVICE_POLL);
 	animationTimerRunning = false;
 	KillTimer(_hWnd, TIMER_TRAY_REPAIR);
+	KillTimer(_hWnd, TIMER_TOPMOST_KEEP);
+	topmostKeepTimerRunning = false;
 	UnregisterHotKey(_hWnd, hotkeyShowHide);
 	UnregisterHotKey(_hWnd, hotkeySwFull);
 	if (trayIconRegistered) Shell_NotifyIconW(NIM_DELETE, &nid);

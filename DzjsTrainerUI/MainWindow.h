@@ -298,6 +298,8 @@ private:
 	bool hideTipShowed = false;
 	bool setTopMost = false;
 	bool topMostUiAccessBand = false;
+	// 普通置顶的 50ms 重设循环是否在跑。超级置顶不需要它。
+	bool topmostKeepTimerRunning = false;
 	bool studentRunning = false;
 	bool currentControlled = false;
 	DWORD studentPid = 0;
@@ -523,6 +525,7 @@ private:
 	// 弹窗期间要先把它们藏起来，关掉后再按页面状态恢复。
 	void ApplyDialogOcclusion();
 	void RequestSuperTopmost();
+	void SyncTopmostKeepTimer();
 	void SelectPage(Page target);
 	void PaintInjection(Gdiplus::Graphics& g, int width, int height, int offsetY);
 	// 自绘进程选择器
