@@ -88,6 +88,13 @@ void TrainerWorkerInternal::InitSettings()
 		SendMessageToVirus(L"hk:setvideo:0");
 		SendMessageToVirus(L"hk:setvideomode:image");
 	}
+
+	// 第三方电子教室宿主没有极域的握手机制，上面那几条 hk: 命令到不了它们，
+	// 它们在注入时只读过一次 ini。补一条 reset：对端会重读 ini、按新的
+	// AllowMonitor / EnableVideoModify 补装钩子，界面上刚改的开关才真的生效。
+	const int customHosts = MsgCenterSendToCustomHosts(L"hk:reset", hWndMain);
+	if (customHosts > 0)
+		currentLogger->LogInfo(L"已向 %d 个电子教室宿主同步显示设置", customHosts);
 }
 void TrainerWorkerInternal::UpdateScreenSize()
 {

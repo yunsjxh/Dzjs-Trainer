@@ -141,17 +141,22 @@ AES 那半边的拆分明文（partA / partB 异或还原）**硬编码在三处
 
 伽卡他卡、红蜘蛛、联想传奇走的是**另一条路**，不碰极域那套单进程语义。
 
-极域这条线写死了：`StudentMain.exe` 一个 PID，注入状态、握手、`hkb:` 协议全绑在一起，主程序按 2 秒一次的定时器盯着它。其他产品没有这套东西，也不想为每一个复制一遍，所以复用「进程注入」那条通用宿主路径——Hooks 里 `g_customHost` 分支，装同一张 34 项钩子表。
+极域这条线写死了：`StudentMain.exe` 一个 PID，注入状态、握手、`hkb:` 协议全绑在一起，主程序按 2 秒一次的定时器盯着它。这些产品没有这套东西，所以复用「进程注入」的通用宿主路径（`g_customHost`），装同一张 34 项钩子表。
 
-三个要点：
+目标表在 `DzjsTrainer/EduProducts.h`，主程序和 Hooks 共用一份。每条规则是「进程名 + 路径特征」，两个都命中才作数。路径特征不是保险，是必要条件：`Student.exe` 这种名字满地都是，只按名字匹配等于给无关进程装钩子。
 
-- **目标表在 `DzjsTrainer/EduProducts.h`。** 每条规则是「进程名 + 路径特征」，两个都命中才注入。路径特征不是保险措施而是必要条件：`Student.exe` 这种名字满地都是，只按名字匹配等于给无关进程装钩子。
-- **自动注入在 `TrainerWorker::RunEduCompatInject()`。** 扫描 10 秒一次（`RunResetPid` 是 2 秒一次的定时器，直接挂上去太密），每轮最多注入一个新目标（64 位目标要起注入助手并等它返回，一次进来三个会把界面卡住）。失败的目标压 10 分钟再试，过期清掉。
-- **通用宿主不回传、不握手。** `VSendMessageBack()` 开头判 `g_customHost` 直接返回，所以注入这些进程不会污染主程序里极域的状态机。这条是前提，改之前先确认它还在。
+**命中产品表的宿主（`g_eduHost`）显示域与极域同口径，泛化的注入宿主不是。** 这条区别是整套适配的核心：
 
-关掉自动注入：ini 里 `[JTSettings] EduCompatAutoInject=0`。
+- 泛化宿主强制 `allowMonitor = true`，装钩子但不拦；
+- 电子教室宿主按 ini 的 `AllowMonitor` / `EnableVideoModify` 走，`whitePreviewOnly` 生效，假桌面窗口会在屏幕外（`-screenWidth, -screenHeight`）show 出来，给 `hk26/27/33` 提供取 DC 的真窗口；
+- 也只在这条路径上，`hk41`（BitBlt）在「禁止教师看屏」时跟着装。极域不装是因为它的抓屏走 LibDeskMonitor / DispFilter，而这三款的抓屏就是裸 BitBlt，不装等于没拦。拦截范围仍由 `IsScreenCaptureInto` 限死在「屏幕 → 内存 DC」，宿主自己的双缓冲和 UI 绘制不受影响。
+- 白屏同样只对电子教室宿主生效。极域 `blackFill` 分支画的是黑或替换图，改颜色属于行为变更，没顺手统一。
 
-**验证状态**：匹配逻辑有离线和多组用例（真实路径、大小写、同名反例、极域 `StudentMain.exe` 不该被认领），`cl` 编过、跑过。**注入之后的实际拦截效果没有实机验证过**——三款软件各自走哪些抓屏路径、锁屏用什么手段，都还不知道。`Display` 域在通用宿主下拿不到假桌面，`hk26/27/33` 那套不生效，只能靠 `PrintWindow` / `GetDIBits` / `StretchBlt`；`BitBlt`（hk41）是全局禁用的，如果它们用 BitBlt 抓屏就拦不住。真机跑起来先看日志里注入了谁，再看画面有没有漏。
+**注入的实例用独立窗口标题**（`EDZU_CUSTOM_HOST_WINDOW_TITLE`）。主程序靠 `FindWindow("JiYu Trainer Virus Window")` 找极域消息中心，注入进程要是同名，`hk:` 命令会投给错误的进程。标题分开之后，要给它们同步设置得走 `MsgCenterSendToCustomHosts()` —— `InitSettings()` 每次保存设置都会发一条 `hk:reset`，对端重读 ini 并按新开关补装钩子。
+
+自动注入在 `TrainerWorker::RunEduCompatInject()`。扫描 10 秒一次（`RunResetPid` 是 2 秒一次的定时器，直接挂上去太密），每轮最多注入一个新目标，64 位目标要起注入助手并等它返回。失败的目标压 10 分钟再试。关掉自动注入：ini 里 `[JTSettings] EduCompatAutoInject=0`。
+
+**验证状态**：匹配逻辑有离线和多组用例（真实路径、大小写、同名反例、极域 `StudentMain.exe` 不该被认领），`cl` 编过。**注入之后的实际拦截没有实机验证过** —— 三款软件各自走哪些抓屏路径、锁屏用什么手段，都还不知道。真机跑起来先看日志里的 `product=` 和「已自动注入」，再看教师端画面。
 
 ## 界面层
 

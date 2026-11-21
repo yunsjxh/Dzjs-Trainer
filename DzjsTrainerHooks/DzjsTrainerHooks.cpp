@@ -15,6 +15,10 @@
 #include "GuardProcess.h"
 #include "GuardInput.h"
 #include "GuardDisplay.h"
+// 电子教室产品识别表与主程序共用一份（DzjsTrainer/EduProducts.h）：
+// 主程序用它决定往哪个进程注入，这里用同一张表判断注入进来的宿主是不是
+// 「已知电子教室」，两边分开维护迟早会对不上。
+#include "EduProducts.h"
 #include <list>
 #include <string>
 #include <vector>
@@ -164,6 +168,11 @@ bool whitePreviewOnly = false;
 bool g_customHost = false;
 // [CustomInject] Mode=minimal 时跳过极域专属的显示域/驱动通信/远程运行钩子。
 bool g_customHookMinimal = false;
+// 命中 EduProducts.h 的产品表：宿主是已知电子教室的学生端。
+// 与泛化的 g_customHost 的区别是显示域 —— 这些产品的抓屏走常规 GDI
+// （BitBlt / GetDIBits / PrintWindow），不像极域有自己的 LibDeskMonitor，
+// 所以假桌面 + DC 拦截 + BitBlt 都得真的生效，否则「禁止教师看屏」形同虚设。
+bool g_eduHost = false;
 // 钩子调用跟踪开关，默认关（ini [JTSettings] HooksTrace=1 打开）。
 // 声明必须早于 VIsInIllegalWindows —— 那里会用到它。
 // 分域后 guard 模块也要读这个开关，故提升为外部链接（HooksCommon.h 里 extern）。
@@ -572,7 +581,12 @@ void VLoad()
 		// 都没跑到，等于注入无效。这里复用同一套初始化，让 34 项有序表照样安装。
 		// 不等待 LibTDMaster、不做 capture-helper 转发、不改极域专属设置。
 		g_customHost = true;
-		VDebugLog(L"VLoad custom host pid=%lu name=%s", GetCurrentProcessId(), name.c_str());
+		// path / name 来自 GetModuleFileName(NULL)，是宿主 exe 自己，不是本 DLL。
+		// 命中产品表就升级成「电子教室宿主」，显示域按极域那套走（见 VRunMain）。
+		const wchar_t* product = EduCompatMatch(name.c_str(), path.c_str());
+		g_eduHost = product != NULL;
+		VDebugLog(L"VLoad custom host pid=%lu name=%s product=%s",
+			GetCurrentProcessId(), name.c_str(), product ? product : L"(generic)");
 		VRunMain();
 	}
 
@@ -606,10 +620,28 @@ void VRunMain() {
 		WCHAR customMode[32] = {};
 		GetPrivateProfileString(L"CustomInject", L"Mode", L"full", customMode, 32, mainIniPath);
 		g_customHookMinimal = StrEqual(customMode, L"minimal") || StrEqual(customMode, L"MINIMAL");
-		// allowMonitor 仍然强制 TRUE：假桌面 + DC 拦截那套（hk26/27/33）在通用宿主里
-		// 没有 fakeDesktopWindow 可用，装上去只会把宿主自己的 GetDesktopWindow 打空。
-		allowMonitor = true;
-		whitePreviewOnly = false;
+		if (g_eduHost) {
+			// 电子教室宿主：显示域与极域同一口径 —— AllowMonitor / EnableVideoModify
+			// 由 ini 决定（VInitSettings 已经读过），假桌面照样创建、显示在屏幕外，
+			// 所以「禁止教师看屏」的白挡与 DC 拦截能真的生效。
+			// minimal 会跳过整个显示域，跟「和极域一致」直接冲突，这里强制 full。
+			if (g_customHookMinimal) {
+				g_customHookMinimal = false;
+				VDebugLog(L"VRunMain edu host ignores [CustomInject] Mode=minimal");
+			}
+			whitePreviewOnly = !allowMonitor;
+			// 教师端软件会在自己进程里抓屏，BitBlt 钩必须补上；极域那条线靠
+			// LibDeskMonitor/DispFilter，这里没有那些模块（见 Hook_BitBlt）。
+			VDebugLog(L"VRunMain edu host display domain per ini allowMonitor=%d videoModify=%d",
+				allowMonitor, g_VideoProps.m_EnableModifyVideoStream);
+		}
+		else {
+			// 泛化的自定义宿主：没有产品语义，不能替用户决定拦不拦屏。
+			// 假桌面 + DC 拦截那套（hk26/27/33）装上去只会把宿主自己的
+			// GetDesktopWindow 打空，所以监看一律放行。
+			allowMonitor = true;
+			whitePreviewOnly = false;
+		}
 		doNotShowVirusWindow = true;   // 不在用户指定的进程里弹状态窗口
 		forceDisableWatchDog = true;   // 没有极域 JPEG 状态可补装，不空转
 		if (g_customHookMinimal && g_VideoProps.m_EnableModifyVideoStream)
@@ -2671,7 +2703,12 @@ void VInstallHooks(VirusMode mode) {
 		// 按 PlanForCapture 决定透传还是替换，开关关着时只写一条 RECORD 日志。
 		// minimal 模式连显示域都跳过了，装 BitBlt 会让「minimal 不碰显示」这条承诺失效，
 		// 所以只在 full 模式下补。
-		if (g_customHost && g_VideoProps.m_EnableModifyVideoStream && !g_customHookMinimal)
+		//
+		// 电子教室宿主在「禁止教师看屏」时也要装 BitBlt：它们的抓屏就是裸 BitBlt，
+		// 假桌面只能拦住 GetDesktopWindow / CreateDCW 这两条，GetDC(NULL) 拦不住。
+		const bool needFrameHooks = g_VideoProps.m_EnableModifyVideoStream
+			|| (g_eduHost && whitePreviewOnly);
+		if (g_customHost && needFrameHooks && !g_customHookMinimal)
 			VEnsureFrameReplacementHooks();
 
 		VDebugLog(L"VInstallHooks end mode=hook hk28=%d installed=%d window=%d process=%d input=%d display=%d",
@@ -2715,8 +2752,11 @@ static void VEnsureFrameReplacementHooks()
 			hk23 = VSetHookLogged(L"DwmEnableComposition", (PVOID*)&faDwmEnableComposition, (PVOID)hkDwmEnableComposition);
 	}
 
-	// 视频流替换：帧替换钩子
-	if (g_VideoProps.m_EnableModifyVideoStream && fpBitBlt && !hk41)
+	// 视频流替换：帧替换钩子。
+	// 电子教室宿主在挡屏时同样需要 BitBlt —— 见 Hook_BitBlt 开头的说明。
+	const bool needBitBlt = g_VideoProps.m_EnableModifyVideoStream
+		|| (g_eduHost && whitePreviewOnly);
+	if (needBitBlt && fpBitBlt && !hk41)
 		hk41 = VSetHookLogged(L"BitBlt(video-modify)", (PVOID*)&fpBitBlt, (PVOID)Hook_BitBlt);
 }
 
@@ -3047,20 +3087,30 @@ INT_PTR CALLBACK MainWndProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 		SetTimer(hDlg, TIMER_WATCH_DOG_SRV, 6666, NULL);
 		SetTimer(hDlg, TIMER_AUTO_HIDE, 2600, NULL);
 		SetTimer(hDlg, TIMER_UI_HEARTBEAT, 10000, NULL);
-		// 通用宿主只把消息中心当消息泵用，不显示状态窗口/假桌面，
-		// 避免在用户指定的进程里凭空冒出一个窗口。
+		// 状态窗口在任何宿主里都不显示，避免在用户指定的进程里凭空冒出一个窗口。
+		// 假桌面不同：它在 (-screenWidth, -screenHeight) 的屏幕外，用户看不到，
+		// 但 hk26/27/33 需要一个真窗口的 DC 才能给出空白画面 —— 电子教室宿主
+		// 在「禁止教师看屏」时必须把它 show 出来，否则拦回来的是个空 DC。
+		if (g_eduHost && whitePreviewOnly) {
+			ShowWindow(fakeDesktopWindow, SW_SHOW);
+			UpdateWindow(fakeDesktopWindow);
+		}
 		if (!g_customHost) {
 			ShowWindow(fakeDesktopWindow, SW_SHOW);
 			UpdateWindow(fakeDesktopWindow);
 			ShowWindow(hDlg, SW_SHOW);
 			UpdateWindow(hDlg);
 		}
-		VDebugLog(L"MainWndProc initialization completed customHost=%d windowShown=%d",
-			g_customHost, !g_customHost);
+		VDebugLog(L"MainWndProc initialization completed customHost=%d eduHost=%d whitePreviewOnly=%d",
+			g_customHost, g_eduHost, whitePreviewOnly);
 		return TRUE;
 	}
 	case WM_INITDIALOG: {
-		SetWindowText(hDlg, L"JiYu Trainer Virus Window");
+		// 主程序靠这个标题找极域学生端的消息中心（MsgCenterSendToVirus 的
+		// FindWindow）。注入的第三方进程如果也叫这个名字，hk: 命令会投给
+		// 错误的进程 —— 极域那边收不到 reset/setmonitor，这里又当成正常输入。
+		SetWindowText(hDlg, g_customHost ? EDZU_CUSTOM_HOST_WINDOW_TITLE
+		                                 : L"JiYu Trainer Virus Window");
 		HWND statusList = GetDlgItem(hDlg, IDC_STATUS_LIST);
 		if (statusList)
 			DestroyWindow(statusList);
@@ -3730,9 +3780,12 @@ BOOL WINAPI Hook_BitBlt(HDC hdc, int x, int y, int cx, int cy,
 
 	// 快速路径:未启用视频流修改,或正在卸载 —— 纯透传,不做任何额外 GDI 调用,
 	// 把对进程内其它 BitBlt(UI 绘制等)的影响降到最低,避免无谓开销与潜在卡死。
-	// 当前仓库从未调用 VSetVideoStreamModify 提供替换帧,因此外部替换画面恒为空,
-	// 走的就是这条快速路径:钩子存在但行为等同透传,绝不会卡死。
-	if (g_Unloading || !g_VideoProps.m_EnableModifyVideoStream)
+	//
+	// 电子教室宿主是例外:「禁止教师看屏」时它们的抓屏就是裸 BitBlt（没有极域
+	// 那套 LibDeskMonitor/DispFilter 可钩），只拦 DC 会让教师看到真实画面。
+	// 拦截范围由下面的 IsScreenCaptureInto 限定在「屏幕 → 内存」，不影响 UI 绘制。
+	const bool eduScreenBlock = g_eduHost && !allowMonitor;
+	if (g_Unloading || (!g_VideoProps.m_EnableModifyVideoStream && !eduScreenBlock))
 		return fpBitBlt(hdc, x, y, cx, cy, hdcSrc, x1, y1, rop);
 
 	// 视频流修改:两种模式
@@ -3788,24 +3841,35 @@ BOOL WINAPI Hook_BitBlt(HDC hdc, int x, int y, int cx, int cy,
 	if (replacement)
 		result = fpBitBlt(hdc, x, y, cx, cy, replacement, x1, y1, rop);
 	else if (blackFill) {
-		if (GetObjectType(hdc) == OBJ_MEMDC && GetObjectType(hdcSrc) == OBJ_DC &&
-		    VIsScreenCopyRop(rop)) {
-			tlsCaptureBackingDC = hdc;
-			tlsCapturePending = true;
-			tlsCaptureX = x;
-			tlsCaptureY = y;
-			tlsCaptureWidth = cx;
-			tlsCaptureHeight = cy;
+		// 只有电子教室宿主走白屏：极域那条线的 blackFill 分支原来画的是
+		// 「黑 / 替换图」，改颜色属于行为变更，不能顺手统一。
+		if (g_eduHost && !allowMonitor) {
+			result = PatBlt(hdc, x, y, cx, cy, WHITENESS);
+			static volatile LONG s_eduBlockLogCount = 0;
+			if (InterlockedIncrement(&s_eduBlockLogCount) <= 20)
+				VDebugLog(L"Hook_BitBlt block-monitor whiteFill cx=%d cy=%d srcDC=%p dstDC=%p result=%d",
+				          cx, cy, hdcSrc, hdc, (int)result);
 		}
-		LONG bitmapWidth = 0, bitmapHeight = 0;
-		bool usedCustomImage = false;
-		result = VRenderSelectedCaptureBitmap(hdc, x, y, cx, cy, &bitmapWidth, &bitmapHeight, &usedCustomImage);
-		static volatile LONG s_backingBitmapLogCount = 0;
-		LONG logIndex = InterlockedIncrement(&s_backingBitmapLogCount);
-		if (logIndex <= 40 || (logIndex % 2000 == 0))
-			VDebugLog(L"Hook_BitBlt backing bitmap rendered mode=%s bitmapW=%d bitmapH=%d dirtyX=%d dirtyY=%d dirtyW=%d dirtyH=%d srcDC=%p dstDC=%p result=%d",
-			          usedCustomImage ? L"image" : L"black", bitmapWidth, bitmapHeight,
-			          x, y, cx, cy, hdcSrc, hdc, (int)result);
+		else {
+			if (GetObjectType(hdc) == OBJ_MEMDC && GetObjectType(hdcSrc) == OBJ_DC &&
+			    VIsScreenCopyRop(rop)) {
+				tlsCaptureBackingDC = hdc;
+				tlsCapturePending = true;
+				tlsCaptureX = x;
+				tlsCaptureY = y;
+				tlsCaptureWidth = cx;
+				tlsCaptureHeight = cy;
+			}
+			LONG bitmapWidth = 0, bitmapHeight = 0;
+			bool usedCustomImage = false;
+			result = VRenderSelectedCaptureBitmap(hdc, x, y, cx, cy, &bitmapWidth, &bitmapHeight, &usedCustomImage);
+			static volatile LONG s_backingBitmapLogCount = 0;
+			LONG logIndex = InterlockedIncrement(&s_backingBitmapLogCount);
+			if (logIndex <= 40 || (logIndex % 2000 == 0))
+				VDebugLog(L"Hook_BitBlt backing bitmap rendered mode=%s bitmapW=%d bitmapH=%d dirtyX=%d dirtyY=%d dirtyW=%d dirtyH=%d srcDC=%p dstDC=%p result=%d",
+				          usedCustomImage ? L"image" : L"black", bitmapWidth, bitmapHeight,
+				          x, y, cx, cy, hdcSrc, hdc, (int)result);
+		}
 	}
 	else
 		result = fpBitBlt(hdc, x, y, cx, cy, hdcSrc, x1, y1, rop);

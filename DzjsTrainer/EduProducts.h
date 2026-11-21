@@ -17,6 +17,13 @@
 #include <windows.h>
 #include <wchar.h>
 #include <string.h>
+#include <stdlib.h>   // _countof
+
+// 注入到第三方进程的 hooks 实例，消息中心窗口用这个标题。
+// 不能复用极域学生端的 "JiYu Trainer Virus Window"：主程序是靠
+// FindWindow(标题) 找极域消息中心的，同名会让 hk: 命令投到错误的进程 ——
+// 极域那边收不到 reset/setmonitor，注入的进程反而当成正常输入处理。
+#define EDZU_CUSTOM_HOST_WINDOW_TITLE L"Dzjs Trainer Custom Host Window"
 
 struct EduProcessRule {
 	const wchar_t* exe;       // 学生端进程名

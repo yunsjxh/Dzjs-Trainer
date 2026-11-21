@@ -114,8 +114,9 @@ void VRecordHook(const wchar_t* name, const wchar_t* fmt, ...);
 bool VVideoReplacementEnabled();
 extern bool doNotShowVirusWindow, forceDisableWatchDog;
 extern bool whitePreviewOnly, captureHelperForwarding;
-// 「进程注入」通用宿主标记（定义在 DzjsTrainerHooks.cpp）
-extern bool g_customHost, g_customHookMinimal;
+// 「进程注入」通用宿主标记（定义在 DzjsTrainerHooks.cpp）。
+// g_eduHost 表示宿主同时命中 EduProducts.h 的产品表，显示域按极域口径处理。
+extern bool g_customHost, g_customHookMinimal, g_eduHost;
 extern bool isLocked, gbCurrentIsTop, isGbFounded;
 extern std::list<std::wstring> runOPWhiteList;
 extern bool forceKill;
