@@ -912,14 +912,27 @@ void TrainerWorkerInternal::UpdateState()
 		else if (eduHosts > 0) {
 			// 极域没装也没跑，但其他教室的学生端已经在钩子里。这属于正常受控，
 			// 不该再报「极域电子教室未运行」——防护确实在工作，只是对象换了。
+			// 标题直呼产品名；同时来了几款才笼统说「多个」，完整清单在概览第二张卡。
+			std::wstring single;
+			bool mixed = false;
+			for (const auto& item : _CustomInjected) {
+				if (item.product.empty()) continue;
+				if (single.empty()) single = item.product;
+				else if (item.product != single) { mixed = true; break; }
+			}
 			if (!_Running) {
 				_StatusTextMain = L"控制器未启动";
 				_StatusTextMore = L"已接管 " + eduSummary + L"<br / >您已手动停止控制器，当前不会对电子教室做任何操作";
 				status = TrainerWorkerCallback::TrainerStatus::TrainerStatusStopped;
 			}
-			else {
-				_StatusTextMain = L"已接管其他电子教室";
+			else if (mixed || single.empty()) {
+				_StatusTextMain = L"已接管多个电子教室";
 				_StatusTextMore = eduSummary + L"。您可以放心继续您的工作";
+				status = TrainerWorkerCallback::TrainerStatus::TrainerStatusControlled;
+			}
+			else {
+				_StatusTextMain = L"已接管" + single;
+				_StatusTextMore = L"您可以放心继续您的工作";
 				status = TrainerWorkerCallback::TrainerStatus::TrainerStatusControlled;
 			}
 		}
