@@ -723,6 +723,9 @@ constexpr int CMD_POWER_EXIT = 41003;
 constexpr int CMD_END_JIYU = 41010;
 constexpr int CMD_END_EDU_BASE = 41100;
 constexpr int CMD_END_ALL = 41011;
+// 启动那一半。极域走 Rerun()，其他教室按产品名走 StartEduHost()。
+constexpr int CMD_START_JIYU = 41012;
+constexpr int CMD_START_EDU_BASE = 41200;
 constexpr int IDC_NET_IP = 42001;
 constexpr int IDC_NET_PORT = 42002;
 constexpr int IDC_NET_MESSAGE = 42003;
@@ -4710,13 +4713,9 @@ void MainWindow::PaintOverview(Graphics& g, int width, int height, int offsetY)
 	StrokeRound(g, RectF(contentX, actionsY, contentW, actionsH), 12, C(darkMode, 236, 241, 238, 45, 53, 49));
 	Text(g, L"\u5feb\u6377\u64cd\u4f5c", contentX + 20, actionsY + 18, 180, 24, 14, FontStyleBold, C(darkMode, 24, 30, 27, 226, 233, 229));
 	Text(g, L"\u5e38\u7528\u7684\u8fd0\u884c\u63a7\u5236\u548c\u8bbe\u5907\u5de5\u5177", contentX + 20, actionsY + 44, 340, 18, 10, FontStyleRegular, C(darkMode, 91, 99, 95, 166, 177, 171));
-	// 「重启极域」在只装了别家教室的机器上没有意义 —— 点下去会去拉 StudentMain，
-	// 而这台机器上根本没有。那种情况改成跳到注入页看当前接管了谁。
-	// 极域在跑、或者其他教室已经接管，都算「有东西可以结束」。点下去先弹菜单，
-	// 让人挑到底结束哪一款，而不是不声不响全停掉。
-	const wchar_t* hostAction = (studentRunning || eduHostCount > 0) ? L"\u7ed3\u675f\u7535\u5b50\u6559\u5ba4"
-		: L"\u91cd\u542f\u6781\u57df";
-	const wchar_t* labels[] = { L"\u9632\u62a4\u72b6\u6001", setTopMost ? L"\u53d6\u6d88\u7f6e\u9876" : L"\u5f00\u542f\u7f6e\u9876", hostAction, L"\u63a7\u5236\u4e0e\u8bbe\u7f6e", L"\u7535\u6e90\u63a7\u5236" };
+	// 这一格不写「结束」也不写「重启」：它既是结束也是启动，写哪一半都会让
+	// 另一半像是坏掉了。点开之后按当前在跑的是谁决定能点什么。
+	const wchar_t* labels[] = { L"\u9632\u62a4\u72b6\u6001", setTopMost ? L"\u53d6\u6d88\u7f6e\u9876" : L"\u5f00\u542f\u7f6e\u9876", L"\u7535\u5b50\u6559\u5ba4\u64cd\u4f5c", L"\u63a7\u5236\u4e0e\u8bbe\u7f6e", L"\u7535\u6e90\u63a7\u5236" };
 	const float actionY = actionsY + 64.0f;
 	for (int i = 0; i < 5; ++i) {
 		const float x = contentX + 20 + i * (actionW + actionGap);
@@ -8042,11 +8041,10 @@ void MainWindow::HandleClick(POINT point)
 			switch (i) {
 			case 0: ShowFastTip(currentControlled ? L"\u5f53\u524d\u5df2\u542f\u7528\u5b8c\u6574\u9632\u62a4\u3002" : L"\u9632\u62a4\u670d\u52a1\u6b63\u5728\u76d1\u63a7\u3002"); break;
 			case 1: RequestSuperTopmost(); break;
-			// 「结束电子教室」弹选择框：机器上可能同时接着极域、红蜘蛛、伽卡他卡，
-			// 直接全停容易误伤，交给用户挑。
+			// 「电子教室操作」弹选择框：机器上可能同时接着极域、红蜘蛛、伽卡他卡，
+			// 直接全停容易误伤，交给用户挑。结束和启动都在这一个菜单里。
 			case 2:
-				if (studentRunning || eduHostCount > 0) ShowEndClassroomMenu();
-				else if (currentWorker) currentWorker->Rerun();
+				ShowEduMenu();
 				break;
 			case 3: SelectPage(Page::Protection); break;
 			case 4: ShowPowerMenu(); break;
@@ -9417,28 +9415,59 @@ void MainWindow::ShowPowerMenu()
 	DestroyMenu(menu);
 }
 
-void MainWindow::ShowEndClassroomMenu()
+void MainWindow::ShowEduMenu()
 {
-	const int eduTotal = currentWorker ? currentWorker->GetEduHostCount() : 0;
 	const bool hasJiYu = studentRunning;
-	if (!hasJiYu && eduTotal <= 0) return;
+	const bool jiYuLocated = hasJiYu || (currentWorker && currentWorker->IsStudentMainLocated());
 
-	int kinds = hasJiYu ? 1 : 0;
+	// 结束和启动共用一个菜单。分成两个入口的话，用户得先自己判断「它现在算不算
+	// 在跑」才知道该点哪个，而这件事本来就是程序更清楚。
 	HMENU menu = CreatePopupMenu();
-	if (hasJiYu)
+	int running = 0;
+	if (hasJiYu) {
 		AppendMenuW(menu, MF_STRING, CMD_END_JIYU, L"\u6781\u57df\u7535\u5b50\u6559\u5ba4");
+		++running;
+	}
 	for (int i = 0; i < kEduProductCount; ++i) {
 		const int count = currentWorker ? currentWorker->GetEduHostCountOf(kEduProducts[i].name) : 0;
 		if (count <= 0) continue;
 		std::wstring label = kEduProducts[i].name;
 		if (count > 1) label += L" \u00d7" + std::to_wstring(count);
 		AppendMenuW(menu, MF_STRING, CMD_END_EDU_BASE + i, label.c_str());
-		++kinds;
+		++running;
 	}
 	// 只有一款在跑时，下面的「全部结束」和上面那条是同一件事，没必要占一行。
-	if (kinds > 1) {
+	if (running > 1) {
 		AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 		AppendMenuW(menu, MF_STRING, CMD_END_ALL, L"\u5168\u90e8\u7ed3\u675f");
+	}
+
+	// 启动这一半只列「装过、现在没跑」的。极域那一条沿用原来那句话的意思：
+	// 没在跑的时候点它就是把它拉起来。
+	std::vector<int> startable;
+	if (!hasJiYu && jiYuLocated) startable.push_back(CMD_START_JIYU);
+	if (currentWorker) {
+		for (int i = 0; i < kEduProductCount; ++i)
+			if (currentWorker->CanStartEduHost(kEduProducts[i].name))
+				startable.push_back(CMD_START_EDU_BASE + i);
+	}
+	if (!startable.empty()) {
+		AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+		for (int command : startable) {
+			if (command == CMD_START_JIYU)
+				AppendMenuW(menu, MF_STRING, command, L"\u91cd\u542f\u7535\u5b50\u6559\u5ba4");
+			else {
+				std::wstring label = L"\u542f\u52a8";
+				label += kEduProducts[command - CMD_START_EDU_BASE].name;
+				AppendMenuW(menu, MF_STRING, command, label.c_str());
+			}
+		}
+	}
+
+	if (running == 0 && startable.empty()) {
+		DestroyMenu(menu);
+		ShowFastTip(L"\u6ca1\u6709\u68c0\u6d4b\u5230\u7535\u5b50\u6559\u5ba4");
+		return;
 	}
 
 	POINT point{};
@@ -9844,6 +9873,13 @@ void MainWindow::OnWmCommand(WPARAM wParam)
 				: L"\u7ed3\u675f\u6781\u57df\u7535\u5b50\u6559\u5ba4\u5931\u8d25\uff0c\u8be6\u89c1\u65e5\u5fd7");
 		}
 		break;
+	case CMD_START_JIYU:
+		if (currentWorker) {
+			const bool started = currentWorker->Rerun();
+			ShowFastTip(started ? L"\u5df2\u542f\u52a8\u7535\u5b50\u6559\u5ba4"
+				: L"\u65e0\u6cd5\u542f\u52a8\u7535\u5b50\u6559\u5ba4\uff0c\u8be6\u89c1\u65e5\u5fd7");
+		}
+		break;
 	case CMD_END_ALL: {
 		if (!currentWorker) break;
 		bool any = false;
@@ -9857,6 +9893,14 @@ void MainWindow::OnWmCommand(WPARAM wParam)
 			const wchar_t* product = kEduProducts[command - CMD_END_EDU_BASE].name;
 			const int killed = currentWorker ? currentWorker->KillEduHosts(product) : 0;
 			std::wstring tip = killed > 0 ? L"\u5df2\u7ed3\u675f" : L"\u65e0\u6cd5\u7ed3\u675f";
+			tip += product;
+			ShowFastTip(tip.c_str());
+			break;
+		}
+		if (command >= CMD_START_EDU_BASE && command < CMD_START_EDU_BASE + kEduProductCount) {
+			const wchar_t* product = kEduProducts[command - CMD_START_EDU_BASE].name;
+			const bool started = currentWorker && currentWorker->StartEduHost(product);
+			std::wstring tip = started ? L"\u5df2\u542f\u52a8" : L"\u65e0\u6cd5\u542f\u52a8";
 			tip += product;
 			ShowFastTip(tip.c_str());
 			break;

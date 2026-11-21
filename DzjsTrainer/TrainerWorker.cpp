@@ -1231,8 +1231,13 @@ bool TrainerWorkerInternal::InjectCustomProcess(LPCWSTR target, std::wstring* st
 	// 它属于哪套电子教室。路径查不到就当普通进程处理，不影响注入结果。
 	std::wstring imagePath;
 	if (QueryProcessImagePath(pid, &imagePath)) {
+		record.path = imagePath;
 		const wchar_t* product = EduCompatMatch(name.c_str(), imagePath.c_str());
-		if (product) record.product = product;
+		if (product) {
+			record.product = product;
+			// 结束之后还得靠它把学生端拉回来，记一份不跟着注入记录走的。
+			_EduLaunchPaths[product] = imagePath;
+		}
 	}
 	_CustomInjected.push_back(record);
 	if (!record.product.empty()) NotifyEduHosts();
@@ -1653,23 +1658,19 @@ static bool StopServiceEntry(SC_HANDLE manager, const wchar_t* name)
 	return stopped;
 }
 
-// 按「服务名」或「服务二进制路径里有这个 exe 名」找服务并停掉。
-// 服务名给 nullptr 时走路径匹配：红蜘蛛的 checkrs 在各版本里服务名不统一，
+// 按「服务名」或「服务二进制路径里有这个 exe 名」把服务挑出来。
+// 服务名给 nullptr 时只走路径匹配：红蜘蛛的 checkrs 在各版本里服务名不统一，
 // 但可执行文件名一直是 checkrs.exe。
-int TrainerWorkerInternal::StopServicesByImage(const wchar_t* exeName, const wchar_t* serviceName)
+//
+// 停止和启动都要这一套查法，抄两遍迟早会改漏一边。
+static int FindServicesByImage(SC_HANDLE manager, const wchar_t* exeName,
+	const wchar_t* serviceName, std::vector<std::wstring>* out)
 {
 	const bool byName = (serviceName != nullptr && serviceName[0] != L'\0');
 	const bool byPath = (exeName != nullptr && exeName[0] != L'\0');
-	if (!byName && !byPath) return 0;
+	if (out == nullptr || (!byName && !byPath)) return 0;
 
-	SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr,
-		SC_MANAGER_CONNECT | SC_MANAGER_ENUMERATE_SERVICE);
-	if (manager == nullptr) {
-		currentLogger->LogWarn(L"停止守护服务：打开服务管理器失败 error=%lu", GetLastError());
-		return 0;
-	}
-
-	int stopped = 0;
+	int found = 0;
 	std::vector<BYTE> buffer(16 * 1024);
 	DWORD needed = 0, count = 0, resume = 0;
 	for (;;) {
@@ -1683,7 +1684,7 @@ int TrainerWorkerInternal::StopServicesByImage(const wchar_t* exeName, const wch
 				resume = 0;  // 从头再枚举一遍，免得跳过已经返回过的条目
 				continue;
 			}
-			currentLogger->LogWarn(L"停止守护服务：枚举服务失败 error=%lu", error);
+			currentLogger->LogWarn(L"枚举服务失败 error=%lu", error);
 			break;
 		}
 
@@ -1712,41 +1713,101 @@ int TrainerWorkerInternal::StopServicesByImage(const wchar_t* exeName, const wch
 				}
 			}
 			if (!match) continue;
-
-			SC_HANDLE service = OpenServiceW(manager, name, SERVICE_STOP | SERVICE_QUERY_STATUS);
-			if (service == nullptr) {
-				currentLogger->LogWarn(L"停止守护服务 %s：打开失败 error=%lu", name, GetLastError());
-				continue;
-			}
-			SERVICE_STATUS status{};
-			if (ControlService(service, SERVICE_CONTROL_STOP, &status)) {
-				if (WaitServiceStopped(service, 5000)) {
-					currentLogger->LogInfo(L"已停止守护服务 %s", name);
-					++stopped;
-				}
-				else {
-					currentLogger->LogWarn(L"守护服务 %s 5 秒内没有停下来", name);
-				}
-			}
-			else {
-				const DWORD error = GetLastError();
-				if (error == ERROR_SERVICE_NOT_ACTIVE) {
-					// 本来就没在跑，不是失败。
-				}
-				else if (error == ERROR_SERVICE_CANNOT_ACCEPT_CTRL &&
-					status.dwCurrentState == SERVICE_STOP_PENDING) {
-					if (WaitServiceStopped(service, 5000)) ++stopped;
-				}
-				else {
-					currentLogger->LogWarn(L"停止守护服务 %s 失败 error=%lu", name, error);
-				}
-			}
-			CloseServiceHandle(service);
+			out->push_back(name);
+			++found;
 		}
 		if (resume == 0) break;
 	}
+	return found;
+}
+
+int TrainerWorkerInternal::StopServicesByImage(const wchar_t* exeName, const wchar_t* serviceName)
+{
+	SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr,
+		SC_MANAGER_CONNECT | SC_MANAGER_ENUMERATE_SERVICE);
+	if (manager == nullptr) {
+		currentLogger->LogWarn(L"停止守护服务：打开服务管理器失败 error=%lu", GetLastError());
+		return 0;
+	}
+
+	std::vector<std::wstring> names;
+	FindServicesByImage(manager, exeName, serviceName, &names);
+
+	int stopped = 0;
+	for (const auto& name : names) {
+		SC_HANDLE service = OpenServiceW(manager, name.c_str(), SERVICE_STOP | SERVICE_QUERY_STATUS);
+		if (service == nullptr) {
+			currentLogger->LogWarn(L"停止守护服务 %s：打开失败 error=%lu", name.c_str(), GetLastError());
+			continue;
+		}
+		SERVICE_STATUS status{};
+		if (ControlService(service, SERVICE_CONTROL_STOP, &status)) {
+			if (WaitServiceStopped(service, 5000)) {
+				currentLogger->LogInfo(L"已停止守护服务 %s", name.c_str());
+				++stopped;
+			}
+			else {
+				currentLogger->LogWarn(L"守护服务 %s 5 秒内没有停下来", name.c_str());
+			}
+		}
+		else {
+			const DWORD error = GetLastError();
+			if (error == ERROR_SERVICE_NOT_ACTIVE) {
+				// 本来就没在跑，不是失败。
+			}
+			else if (error == ERROR_SERVICE_CANNOT_ACCEPT_CTRL &&
+				status.dwCurrentState == SERVICE_STOP_PENDING) {
+				if (WaitServiceStopped(service, 5000)) ++stopped;
+			}
+			else {
+				currentLogger->LogWarn(L"停止守护服务 %s 失败 error=%lu", name.c_str(), error);
+			}
+		}
+		CloseServiceHandle(service);
+	}
 	CloseServiceHandle(manager);
 	return stopped;
+}
+
+// 停的逆操作。服务起来了它自己会把学生端拉起来，而且用的命令行参数、工作目录
+// 都是它自己那套，比我们拿着一个 exe 路径瞎拉要靠谱。
+int TrainerWorkerInternal::StartServicesByImage(const wchar_t* exeName, const wchar_t* serviceName)
+{
+	SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr,
+		SC_MANAGER_CONNECT | SC_MANAGER_ENUMERATE_SERVICE);
+	if (manager == nullptr) {
+		currentLogger->LogWarn(L"启动守护服务：打开服务管理器失败 error=%lu", GetLastError());
+		return 0;
+	}
+
+	std::vector<std::wstring> names;
+	FindServicesByImage(manager, exeName, serviceName, &names);
+
+	int started = 0;
+	for (const auto& name : names) {
+		SC_HANDLE service = OpenServiceW(manager, name.c_str(), SERVICE_START | SERVICE_QUERY_STATUS);
+		if (service == nullptr) {
+			currentLogger->LogWarn(L"启动守护服务 %s：打开失败 error=%lu", name.c_str(), GetLastError());
+			continue;
+		}
+		if (StartServiceW(service, 0, nullptr)) {
+			currentLogger->LogInfo(L"已启动守护服务 %s", name.c_str());
+			++started;
+		}
+		else {
+			const DWORD error = GetLastError();
+			if (error == ERROR_SERVICE_ALREADY_RUNNING) {
+				++started;
+			}
+			else {
+				// 服务被禁用或者被安全软件拦住时只有这条线索，写清楚错误码。
+				currentLogger->LogWarn(L"启动守护服务 %s 失败 error=%lu", name.c_str(), error);
+			}
+		}
+		CloseServiceHandle(service);
+	}
+	CloseServiceHandle(manager);
+	return started;
 }
 
 // 按进程名收集 PID。只比名字，调用方自己决定路径要不要对。
@@ -2151,6 +2212,116 @@ int TrainerWorkerInternal::GetEduHostCountOf(LPCWSTR product)
 		++count;
 	}
 	return count;
+}
+
+// 这款教室的学生端现在有没有进程在跑（按产品表里的 exe 名查，不看注入记录：
+// 刚起来的进程要等下一轮扫描才会被接管）。
+static bool AnyProductHostRunning(const EduProduct& product)
+{
+	for (int r = 0; r < product.ruleCount; ++r) {
+		std::vector<DWORD> pids;
+		CollectProcessIdsByName(product.rules[r].exe, &pids);
+		if (!pids.empty()) return true;
+	}
+	return false;
+}
+
+// 菜单里要不要给「启动」这一条，看这里。判据要便宜：菜单是一次点击里现拼的。
+bool TrainerWorkerInternal::CanStartEduHost(LPCWSTR product)
+{
+	if (product == nullptr || product[0] == L'\0') return false;
+	if (GetEduHostCountOf(product) > 0) return false;
+
+	for (int i = 0; i < kEduProductCount; ++i) {
+		const EduProduct& item = kEduProducts[i];
+		if (_wcsicmp(item.name, product) != 0) continue;
+		// 学生端已经有进程在跑（只是还没被接管），那不叫「可以启动」。
+		if (AnyProductHostRunning(item)) return false;
+		// 本轮注入过、后来被结束掉的：路径还留着，一定能拉起来。
+		if (_EduLaunchPaths.find(product) != _EduLaunchPaths.end()) return true;
+		// 守护进程还挂在内存里（多半是我们自己挂起的），恢复它就能连锁拉起学生端。
+		for (int g = 0; g < item.guardCount; ++g) {
+			std::vector<DWORD> pids;
+			CollectProcessIdsByName(item.guards[g].exe, &pids);
+			if (!pids.empty()) return true;
+		}
+	}
+	return false;
+}
+
+bool TrainerWorkerInternal::StartEduHost(LPCWSTR product)
+{
+	const bool all = (product == nullptr || product[0] == L'\0');
+
+	// 盯梢得先撤：还在盯着的话，起来一个就被收一个，按下去等于没按。
+	if (_EduKillWatchActive &&
+		(all || _EduKillWatchProduct.empty() ||
+			_wcsicmp(_EduKillWatchProduct.c_str(), product) == 0)) {
+		_EduKillWatchActive = false;
+		_EduKillWatchProduct.clear();
+		_EduKillWatchHosts.clear();
+		_EduKillWatchGuards.clear();
+		_EduKillWatchDirectories.clear();
+		currentLogger->LogInfo(L"已停止电子教室盯梢（要求启动）");
+	}
+
+	bool acted = false;
+	for (int i = 0; i < kEduProductCount; ++i) {
+		const EduProduct& item = kEduProducts[i];
+		if (!all && _wcsicmp(item.name, product) != 0) continue;
+		if (GetEduHostCountOf(item.name) > 0) {
+			currentLogger->LogInfo(L"[%s] 已经在运行，不需要启动", item.name);
+			continue;
+		}
+
+		bool started = false;
+		for (int g = 0; g < item.guardCount; ++g)
+			if (StartServicesByImage(item.guards[g].exe, item.guards[g].service) > 0) started = true;
+
+		// 服务起不来（被禁用、被安全软件拦住、或者压根没有服务）就恢复被挂起的
+		// 守护进程。恢复不触发 SCM 的恢复计数，比重新起一个干净。
+		for (int g = 0; g < item.guardCount; ++g) {
+			std::vector<DWORD> pids;
+			CollectProcessIdsByName(item.guards[g].exe, &pids);
+			for (DWORD pid : pids) {
+				if (MResumeProcessNt(pid, nullptr) == STATUS_SUCCESS) {
+					currentLogger->LogInfo(L"已恢复守护进程 %s [PID %lu]", item.guards[g].exe, pid);
+					started = true;
+				}
+			}
+		}
+
+		// 恢复一个「本来就没挂起」的守护进程也会返回成功，光看返回值会误判成
+		// 已经起来了。真正的判据是学生端有没有进程，等它一下再决定要不要自己拉。
+		if (started) {
+			for (int wait = 0; wait < 8 && !AnyProductHostRunning(item); ++wait) Sleep(100);
+		}
+
+		// 服务没起、守护进程也没把学生端带出来，才按记下的路径自己拉一个：
+		// 联想传奇这种没有服务、守护进程又被结束掉的，只剩这一条路。
+		if (!AnyProductHostRunning(item)) {
+			auto saved = _EduLaunchPaths.find(item.name);
+			if (saved == _EduLaunchPaths.end() || saved->second.empty()) {
+				currentLogger->LogWarn(L"[%s] 学生端没有起来，也不知道它在哪", item.name);
+				continue;
+			}
+			if (SysHlp::RunApplication(saved->second.c_str(), NULL)) {
+				currentLogger->LogInfo(L"已启动电子教室 %s（%s）", item.name, saved->second.c_str());
+				started = true;
+			}
+			else {
+				currentLogger->LogWarn(L"启动电子教室 %s 失败：%s", item.name, saved->second.c_str());
+			}
+		}
+		else {
+			started = true;
+		}
+		if (started) acted = true;
+	}
+
+	// 刚起来的进程让下一轮扫描立刻接手，不用等满 10 秒。
+	if (acted && _EduCompatEnabled) _LastEduCompatScan = 0;
+	return acted;
 }
 
 void TrainerWorkerInternal::SetEduCompatAutoInject(bool enabled)

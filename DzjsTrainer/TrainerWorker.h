@@ -94,6 +94,12 @@ public:
 	// 结束已接管的电子教室宿主进程，返回实际结束的个数。product 为空表示全部；
 	// 给具体产品名时只结束那一款。界面上的「结束电子教室」按名字逐个调。
 	virtual int KillEduHosts(LPCWSTR product) { return 0; }
+	// 极域学生端的 exe 找不找得到。菜单据此决定要不要给「重启电子教室」这一条。
+	virtual bool IsStudentMainLocated() { return false; }
+	// 某款教室现在能不能拉起来：记得它的学生端路径，或者它的服务/守护进程还在。
+	virtual bool CanStartEduHost(LPCWSTR product) { return false; }
+	// 「启动」某款教室（product 为空表示全部），返回是否真的发起了启动动作。
+	virtual bool StartEduHost(LPCWSTR product) { return false; }
 	// 让已注入的电子教室宿主重读 ini。界面上改了显示相关开关（信息流保护、
 	// 允许监看）之后调用，否则要等宿主重启或者下一次保存设置才生效。
 	virtual void SyncCustomHosts() {}
@@ -139,6 +145,9 @@ public:
 	int GetEduHostCountOf(LPCWSTR product) override;
 	std::wstring GetEduHostSummary() override;
 	int KillEduHosts(LPCWSTR product) override;
+	bool IsStudentMainLocated() override { return _StudentMainFileLocated; }
+	bool CanStartEduHost(LPCWSTR product) override;
+	bool StartEduHost(LPCWSTR product) override;
 	void SyncCustomHosts() override;
 
 	// 扫描 EduProducts.h 里登记的学生端进程，命中就按通用宿主注入。
@@ -149,6 +158,9 @@ public:
 	// 否则学生端刚被杀就被重新拉起来。返回停掉的服务/进程个数。
 	int StopEduGuards(const EduProduct& product);
 	int StopServicesByImage(const wchar_t* exeName, const wchar_t* serviceName);
+	// 「启动」那一半：先把服务拉起来（它拉起学生端时用的参数和版本都对），
+	// 再恢复被挂起的守护进程，最后才按记住的路径直接拉学生端。
+	int StartServicesByImage(const wchar_t* exeName, const wchar_t* serviceName);
 	// 顺着宿主往上清：同目录（含子目录）的进程 + 非系统父进程。
 	int SweepEduCompanions(DWORD rootPid, const std::wstring& imagePath);
 	// 结束之后盯梢：产品会在几秒内把学生端重新拉起来（服务恢复、守护进程），
@@ -189,8 +201,13 @@ private:
 		// 命中 EduProducts.h 的产品名（如「红蜘蛛」）。手动注入的普通进程为空，
 		// 界面据此把自动接管的目标和用户自己选的分开显示。
 		std::wstring product;
+		// 映像完整路径。结束之后「启动」要用它把学生端拉回来，所以注入时记下。
+		std::wstring path;
 	};
 	std::list<CustomInjectedProcess> _CustomInjected;
+	// 产品名 → 学生端 exe 路径。进程被结束（记录随之删掉）之后还要靠它恢复，
+	// 所以单独存一份，生命周期跟着进程走。
+	std::map<std::wstring, std::wstring> _EduLaunchPaths;
 
 	// 电子教室自动适配（见 EduProducts.h）。扫描本身有 10 秒间隔，失败目标
 	// 再压 10 分钟，避免「2 秒一次的重扫」把注入失败刷满日志。
