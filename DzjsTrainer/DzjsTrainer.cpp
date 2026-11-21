@@ -70,7 +70,7 @@ BOOL GenerateCrashInfo(PEXCEPTION_POINTERS pExInfo, LPCWSTR info_file_name, LPCW
 		fwprintf_s(fp, L"\r\n我们生成了关于描述这个错误的错误报告(不包含您的个人信息)：");
 		fwprintf_s(fp, L"\r\n=== 文件内容 =====================================");
 		fwprintf_s(fp, L"\r\n[错误转储文件] %s", file_name);
-		fwprintf_s(fp, L"\r\n[程序运行日志] %s\\DzjsTrainer.log", dir);
+		fwprintf_s(fp, L"\r\n[程序运行日志] %s\\logs\\DzjsTrainer-YYYY-MM-DD.log", dir);
 		fwprintf_s(fp, L"\r\n=== %hs =================================", CURRENT_VERSION);
 		fflush(fp);
 		fclose(fp);

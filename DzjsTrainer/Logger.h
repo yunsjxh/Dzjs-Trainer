@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #include "stdafx.h"
 #include <stdio.h>
 #include <string>
@@ -83,7 +83,17 @@ public:
 
 private:
 
+	// 日志一天一个文件：<目录>\<主干>-YYYY-MM-DD.log。SetLogOutPutFile 给的是
+	// 完整路径，这里拆成目录与主干存着，真正写哪个文件由当天日期决定 ——
+	// 程序跨天运行也能自己换到新文件，不用重启。
+	bool ResolveDailyFile();
+	bool ApplyLogDirectory(const std::wstring& dir, const std::wstring& stem);
+
 	std::list< LOG_SLA> logPendingBuffer;
+	std::wstring logRequested;
+	std::wstring logDir;
+	std::wstring logStem;
+	SYSTEMTIME logFileDate{};
 	WCHAR logFilePath[MAX_PATH]{};
 	LogLevel level = LogLevelInfo;
 	LogOutPut outPut = LogOutPutConsolne;

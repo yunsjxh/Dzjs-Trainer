@@ -597,7 +597,22 @@ void JTAppInternal::UnInstall()
 		std::wstring legacyAvDriverPath = fullDir + L"\\JiYuAvKernel.sys";
 		if (Path::Exists(legacyAvDriverPath)) DeleteFileW(legacyAvDriverPath.c_str());
 	}
-	if (Path::Exists(fullLogPath)) DeleteFile(fullLogPath.c_str());
+	// 日志目录里一天一个文件，卸载时整目录清掉（只删本程序写的 .log）。
+	if (!fullLogDir.empty()) {
+		WIN32_FIND_DATAW findData = {};
+		HANDLE find = FindFirstFileW((fullLogDir + L"\\*.log").c_str(), &findData);
+		if (find != INVALID_HANDLE_VALUE) {
+			do {
+				if ((findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+					DeleteFileW((fullLogDir + L"\\" + findData.cFileName).c_str());
+			} while (FindNextFileW(find, &findData));
+			FindClose(find);
+		}
+		RemoveDirectoryW(fullLogDir.c_str());
+	}
+	// 旧版单文件日志
+	const std::wstring legacyLogPath = fullDir + L"\\DzjsTrainer.log";
+	if (Path::Exists(legacyLogPath)) DeleteFile(legacyLogPath.c_str());
 	if (Path::Exists(fullIniPath)) DeleteFile(fullIniPath.c_str());
 
 	//写入删除本体exe的bat
@@ -804,7 +819,9 @@ int JTAppInternal::RunInternal()
 
 	//指定日志为文件模式
 	appLogger->SetLogOutPut(LogOutPutFile);
-	appLogger->SetLogOutPutFile(fullLogPath.c_str());
+	// 交给 logger 的是模板（不含日期），它拆出目录与主干后按当天日期拼文件名。
+	// 直接给 fullLogPath 会拼成 DzjsTrainer-2026-11-21-2026-11-21.log。
+	appLogger->SetLogOutPutFile((fullLogDir + L"\\DzjsTrainer.log").c_str());
 
 	// Fast protection path: do not parse arguments, read settings, check a
 	// previous instance, install resources, create workers, or create UI before
@@ -1083,6 +1100,8 @@ void JTAppInternal::ExitClear()
 	if (appLogger) appLogger->LogInfo(L"ExitClear: completed");
 }
 
+namespace { std::wstring BuildDailyLogPath(const std::wstring& directory); }
+
 LPCWSTR JTAppInternal::GetPartFullPath(int partId)
 {
 	if (partId == PART_MAIN)
@@ -1099,8 +1118,11 @@ LPCWSTR JTAppInternal::GetPartFullPath(int partId)
 		return fullDriverPath.c_str();
 	if (partId == PART_AV_DRIVER)
 		return fullAvDriverPath.c_str();
-	if (partId == PART_LOG)
+	if (partId == PART_LOG) {
+		// 日期可能已经翻过去了，报给调用方之前重算一次。
+		fullLogPath = BuildDailyLogPath(fullLogDir);
 		return fullLogPath.c_str();
+	}
 	return NULL;
 }
 LPVOID JTAppInternal::RunOperation(AppOperation op)
@@ -1193,6 +1215,21 @@ void JTAppInternal::MergePathString()
 	fullHooker64Path = fullDir + L"\\DzjsTrainerHooks64.dll";
 	fullInjector64Path = fullDir + L"\\DzjsTrainerInjector64.exe";
 }
+namespace
+{
+	// 运行日志一天一个文件。目录和主干由 InitPath 定下，日期现取 —— 程序可能
+	// 跨天运行，GetPartFullPath(PART_LOG) 也得拿到当天的那个文件。
+	std::wstring BuildDailyLogPath(const std::wstring& directory)
+	{
+		SYSTEMTIME now{};
+		GetLocalTime(&now);
+		WCHAR name[64] = {};
+		swprintf_s(name, L"DzjsTrainer-%04d-%02d-%02d.log",
+			now.wYear, now.wMonth, now.wDay);
+		return directory + L"\\" + name;
+	}
+}
+
 void JTAppInternal::InitPath()
 {
 	WCHAR buffer[MAX_PATH];
@@ -1205,8 +1242,11 @@ void JTAppInternal::InitPath()
 	GetModuleFileName(hInstance, buffer, MAX_PATH);
 	PathRenameExtension(buffer, L".ini");
 	fullIniPath = buffer;
-	PathRenameExtension(buffer, L".log");
-	fullLogPath = buffer;
+
+	// 日志统一收在 exe 目录的 logs 下，一天一个文件。旧版那一个
+	// DzjsTrainer.log 不再写，卸载时才清。
+	fullLogDir = fullDir + L"\\logs";
+	fullLogPath = BuildDailyLogPath(fullLogDir);
 
 	appIsInstaller = Path::GetFileName(fullPath) == L"DzjsTrainerUpdater.exe";
 	appNeedInstallIniTemple = !Path::Exists(fullIniPath);

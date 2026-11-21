@@ -2952,11 +2952,23 @@ LRESULT CALLBACK LogSavePickerProc(HWND window, UINT message, WPARAM wParam, LPA
 		ListView_InsertColumn(context->list, 0, &column);
 		column.cx = AuxPx(window, 120); column.pszText = const_cast<LPWSTR>(L"类型");
 		ListView_InsertColumn(context->list, 1, &column);
-		wchar_t modulePath[32768] = {};
-		GetModuleFileNameW(nullptr, modulePath, _countof(modulePath));
-		wchar_t* slash = wcsrchr(modulePath, L'\\');
-		if (slash) *slash = L'\0';
-		NavigateLogSavePicker(context, slash ? modulePath : L"");
+		// 导出的日志也默认落在 logs 目录，和按天写的运行日志放在一起。
+		std::wstring startDir;
+		const wchar_t* todayLog = currentApp ? currentApp->GetPartFullPath(PART_LOG) : nullptr;
+		if (todayLog && *todayLog) {
+			startDir = todayLog;
+			const size_t separator = startDir.find_last_of(L"\\/");
+			if (separator != std::wstring::npos) startDir.resize(separator);
+			if (GetFileAttributesW(startDir.c_str()) == INVALID_FILE_ATTRIBUTES) startDir.clear();
+		}
+		if (startDir.empty()) {
+			wchar_t modulePath[32768] = {};
+			GetModuleFileNameW(nullptr, modulePath, _countof(modulePath));
+			wchar_t* slash = wcsrchr(modulePath, L'\\');
+			if (slash) *slash = L'\0';
+			startDir = slash ? modulePath : L"";
+		}
+		NavigateLogSavePicker(context, startDir);
 		SetFocus(context->nameEdit);
 		SendMessageW(context->nameEdit, EM_SETSEL, 0, -1);
 		return 0;

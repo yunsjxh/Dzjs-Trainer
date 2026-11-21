@@ -1,4 +1,4 @@
-#include "stdafx.h"
+﻿#include "stdafx.h"
 #include "Logger.h"
 #include <time.h>
 #include <share.h>
@@ -148,41 +148,90 @@ void LoggerInternal::SetLogOutPut(LogOutPut output)
 	std::lock_guard<std::mutex> guard(outputMutex);
 	this->outPut = output;
 }
+bool LoggerInternal::ApplyLogDirectory(const std::wstring& dir, const std::wstring& stem)
+{
+	logDir = dir;
+	logStem = stem;
+	logFileDate = SYSTEMTIME{};
+	logFilePath[0] = L'\0';
+	return ResolveDailyFile();
+}
+
+bool LoggerInternal::ResolveDailyFile()
+{
+	if (logDir.empty() || logStem.empty()) return false;
+
+	SYSTEMTIME now{};
+	GetLocalTime(&now);
+	if (logFilePath[0] != L'\0' &&
+		now.wYear == logFileDate.wYear && now.wMonth == logFileDate.wMonth &&
+		now.wDay == logFileDate.wDay) {
+		return true;
+	}
+
+	// 只建一级：父目录是 exe 所在目录或 %LOCALAPPDATA%\DzjsTrainer，都已经在。
+	CreateDirectoryW(logDir.c_str(), nullptr);
+
+	WCHAR path[MAX_PATH] = {};
+	swprintf_s(path, L"%s\\%s-%04d-%02d-%02d.log", logDir.c_str(), logStem.c_str(),
+		now.wYear, now.wMonth, now.wDay);
+
+	FILE* file = _wfsopen(path, L"a+", _SH_DENYNO);
+	if (file == nullptr) {
+		logFilePath[0] = L'\0';
+		return false;
+	}
+	// 同一天里程序重启过几次、跨天换到新文件，都能从这一行看出来。
+	fwprintf_s(file, L"\n========== DzjsTrainer session started %04d-%02d-%02d %02d:%02d:%02d ==========\n",
+		now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond);
+	fflush(file);
+	fclose(file);
+
+	wcsncpy_s(logFilePath, path, MAX_PATH);
+	logFileDate = now;
+	return true;
+}
+
 void LoggerInternal::SetLogOutPutFile(const wchar_t * filePath)
 {
 	std::lock_guard<std::mutex> guard(outputMutex);
-	if (StrEqual(logFilePath, filePath)) return;
+	if (filePath == nullptr || *filePath == L'\0') return;
 
-	CloseLogFile();
-	wcsncpy_s(logFilePath, filePath, MAX_PATH);
-	FILE* sessionFile = _wfsopen(logFilePath, L"a+", _SH_DENYNO);
-	if (sessionFile) {
-		fwprintf_s(sessionFile, L"\n========== DzjsTrainer session started ==========\n");
-		fflush(sessionFile);
-		fclose(sessionFile);
-		return;
+	const std::wstring requested(filePath);
+	if (requested == logRequested) return;
+	logRequested = requested;
+
+	// 拆出目录和文件名主干。传进来的路径里的日期只是当天日期，真正写哪个
+	// 文件由 ResolveDailyFile 按当前时间决定。
+	std::wstring directory;
+	std::wstring name = requested;
+	const size_t separator = requested.find_last_of(L"\\/");
+	if (separator != std::wstring::npos) {
+		directory = requested.substr(0, separator);
+		name = requested.substr(separator + 1);
 	}
+	const size_t dot = name.find_last_of(L'.');
+	const std::wstring stem = dot == std::wstring::npos ? name : name.substr(0, dot);
+
+	if (ApplyLogDirectory(directory, stem)) return;
 
 	// An elevated driver loader may run from Program Files, but a child or
 	// recovery instance can still lack write access to that directory.
 	// Keep logs durable by falling back to a per-user location.
 	WCHAR localAppData[MAX_PATH] = {};
-	DWORD length = GetEnvironmentVariableW(
+	const DWORD length = GetEnvironmentVariableW(
 		L"LOCALAPPDATA", localAppData, _countof(localAppData));
 	if (length == 0 || length >= _countof(localAppData)) return;
 
-	std::wstring logDirectory = std::wstring(localAppData) + L"\\DzjsTrainer";
-	if (!CreateDirectoryW(logDirectory.c_str(), NULL) &&
-		GetLastError() != ERROR_ALREADY_EXISTS) return;
+	const std::wstring appDirectory = std::wstring(localAppData) + L"\\DzjsTrainer";
+	CreateDirectoryW(appDirectory.c_str(), NULL);
+	if (!ApplyLogDirectory(appDirectory + L"\\logs", stem)) return;
 
-	std::wstring fallbackPath = logDirectory + L"\\DzjsTrainer.log";
-	wcsncpy_s(logFilePath, fallbackPath.c_str(), MAX_PATH);
-	sessionFile = _wfsopen(logFilePath, L"a+", _SH_DENYNO);
-	if (sessionFile) {
-		fwprintf_s(sessionFile, L"\n========== DzjsTrainer session started ==========\n");
-		fwprintf_s(sessionFile, L"[I] Log path fallback: %s\n", logFilePath);
-		fflush(sessionFile);
-		fclose(sessionFile);
+	FILE* file = _wfsopen(logFilePath, L"a+", _SH_DENYNO);
+	if (file) {
+		fwprintf_s(file, L"[I] Log path fallback: %s\n", logFilePath);
+		fflush(file);
+		fclose(file);
 	}
 }
 void LoggerInternal::SetLogOutPutCallback(LogCallBack callback, LPARAM lparam)
@@ -249,8 +298,10 @@ void LoggerInternal::LogOutput(LogLevel level, const wchar_t * str, size_t len)
 	{
 		std::lock_guard<std::mutex> guard(outputMutex);
 		bool wroteFile = false;
+		// 跨天运行时先换到当天的文件，再写这一条。
+		if (!logDir.empty()) ResolveDailyFile();
 		// Open with shared access and close after every record so a hung process
-		// never keeps DzjsTrainer.log locked.
+		// never keeps the day's log locked.
 		if (logFilePath[0]) {
 			FILE* writeFile = _wfsopen(logFilePath, L"a+", _SH_DENYNO);
 			if (writeFile) {

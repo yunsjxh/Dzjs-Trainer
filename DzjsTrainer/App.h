@@ -82,6 +82,9 @@ private:
 	std::wstring fullSourceInstallerPath;
 	std::wstring fullSourceInstallerDir;
 	std::wstring fullIniPath;
+	// 日志按天分文件，全部放在 fullLogDir 下；fullLogPath 是「今天」那个文件的
+	// 完整路径，给错误提示和崩溃报告用，日期变化时由 GetPartFullPath 重算。
+	std::wstring fullLogDir;
 	std::wstring fullLogPath;
 	std::wstring fullArgBuffer;
 	// CLI custom injection: -inject / -uninject <PID|process name>
