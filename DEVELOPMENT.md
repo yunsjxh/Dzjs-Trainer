@@ -35,8 +35,32 @@ README 写给使用者：怎么用、装不上怎么办。这份文档写给改�
 ## 构建
 
 ```powershell
-MSBuild.exe DzjsTrainer.sln /t:Build /p:Configuration=Release /p:Platform=x86 /m
+& "D:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\amd64\MSBuild.exe" `
+  DzjsTrainer.sln /t:Build /p:Configuration=Release /p:Platform=x86 /m
 ```
+
+### 环境
+
+换机器第一件事是把三样装齐：
+
+- **Visual Studio**，本机是 18 Community（MSVC 14.51）。安装时勾「使用 C++ 的桌面开发」，组件里要带上 **v143 生成工具** —— 新版本默认给的是 v145，而工程文件全部固定 `v143`，缺了就报找不到工具集。
+- **Windows SDK**，本机 10.0.28000。
+- **WDK**，勾「Windows 驱动程序工具包」。装完才有 `WindowsKernelModeDriver10.0` 这个平台工具集，驱动工程要靠它。
+
+**别用 Build Tools 顶替 Visual Studio。** 驱动工具集只在完整 VS 实例里注册，Build Tools 加 WDK 的裸组合编驱动会直接报工具集缺失，而且报错信息不会告诉你是这个原因。
+
+SDK 版本对不上时分两种：用户态工程写的是 `10.0`，自动取本机最新，不用管；`DzjsTrainerDriver.vcxproj` 里固定写死 `10.0.28000.0`，装不到这个版本就改这一行，换成实际装上的版本号。
+
+确认装在哪：
+
+```powershell
+# VS
+& "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+# Kits
+(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots').KitsRoot10
+```
+
+本机两者都不在默认的 C 盘：VS 在 `D:\Program Files\Microsoft Visual Studio\18\Community`，Kits 在 `D:\Windows Kits\10`。普通 PowerShell 里 `MSBuild.exe` 不在 PATH，要么写完整路径，要么用 VS 附带的「开发者 PowerShell」。
 
 ### 几个必须知道的约束
 
@@ -152,6 +176,8 @@ AES 那半边的拆分明文（partA / partB 异或还原）**硬编码在三处
 - 别用 `Get-AuthenticodeSignature` 的「根不受信任」去推断「必须开测试模式」。它只看第一个嵌入签名，跟内核实际加载时走的检查不是一回事。
 - 别把 `/MT` 换成 `/MD`。发布包是静态 CRT，换掉就要求目标机装运行库——这是被人提过的「修复」，实际是回归。
 - 别在 UI 线程做更新探测。子进程 + 超时是刻意设计，探测期间的卡顿全部来自这里。
+- 别加「绕过 MSBuild 直接用 cl 编驱动」的兜底脚本。绕过去拿不到 Inf2Cat 生成的 `.cat`，驱动装不上；`.sys` 又是嵌进主程序资源的，绕出来的产物想进包还得回头重编一次 exe。只想验证驱动改动能编过，用 cl 单文件检查就够，犯不上凑齐一整条 link 命令。
+- 别加「便携包」打包脚本往 exe 旁边拷 VC++ 运行时。工程是静态 CRT，实测发布版 exe 的导入表里没有 `vcruntime140.dll`、`msvcp140.dll`、`ucrtbase.dll` 中的任何一个，单独一个文件就是完整的。
 - 别提交 `Release`、`obj`、`bin`、PDB、日志、证书、私钥、令牌。
 
 ## 提交约定
