@@ -69,3 +69,12 @@ UPEXPORT_CFUNC(BOOL) JUpdater_LaunchApply(LPCWSTR packagePath, LPCWSTR sha256Hex
 // 回来（total 在 wParam、done 在 lParam），界面靠它画真实进度条。
 UPEXPORT_CFUNC(BOOL) JUpdater_LaunchDownload(LPCWSTR url, LPCWSTR destPath, LPCWSTR sha256Hex,
 	DWORD timeoutMs, HWND notifyWindow);
+
+// 提交一条用户反馈：bundlePath 是打包好的 zip，metaJson 是 UTF-8 JSON 文本
+// （由调用方拼好：描述、复现步骤、版本、构建时间、系统信息）。
+//
+// 上传由独立更新器进程完成，理由和下载一样 —— 主程序进程里 WinHTTP 的 TLS
+// 起不来。这里同步等待结果，调用方要放到后台线程去调，否则界面会卡住。
+// 失败时把原因写进 errorText（例如"服务器返回 HTTP 413：文件太大"）。
+UPEXPORT_CFUNC(BOOL) JUpdater_SubmitFeedback(LPCWSTR bundlePath, LPCWSTR metaJson,
+	LPWSTR errorText, size_t errorChars, DWORD timeoutMs);

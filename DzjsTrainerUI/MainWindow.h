@@ -55,6 +55,7 @@ public:
 	void OnSimpleMessageCallback(LPCWSTR text) override;
 	void OnAllowGbTop() override;
 	void OnShowHelp() override;
+	void OnShutdownBlocked(LPCWSTR api) override;
 
 private:
 	struct TeacherBackend;
@@ -144,6 +145,9 @@ private:
 	HBRUSH advancedFieldBrush = nullptr;
 	// 进程选择器的搜索框是原生 EDIT，底色同样要和自绘的圆角框对齐。
 	HBRUSH processPickerFieldBrush = nullptr;
+	// 反馈弹窗里三个 EDIT 的方底色。必须和自绘圆角框的填充同色，
+	// 否则圆角里会露出一个颜色略深的方块。
+	HBRUSH feedbackFieldBrush = nullptr;
 	HWND processPickerSearchEdit = nullptr;
 	WNDPROC processPickerSearchEditProc = nullptr;
 	std::array<HWND, 15> networkControls{};
@@ -258,7 +262,8 @@ private:
 	int pressTarget = -1;
 	// 交互元素比早期多得多（导航 10 + 页面按钮 + 诊断列表行），留够槽位。
 	// 原来 80 个槽，restoreTeacherView(81) 和 superTopMost(80) 已经越界。
-	std::array<float, 128> hoverProgress{};
+	// 弹窗越来越多，槽位跟着扩；索引不做边界检查，加 id 时记得同步这里。
+	std::array<float, 144> hoverProgress{};
 	// 开关滑块的插值位置（0=关，1=开）。防护策略 7 个、高级配置 6 个，
 	// 两页分槽（0-7 / 8-15），否则翻页时滑块会串味。
 	std::array<float, 24> toggleMotion{};
@@ -286,6 +291,9 @@ private:
 	bool firstShow = true;
 	bool isUserCancel = false;
 	bool closeButtonClickPending = false;
+	// 电源菜单里的关机/重启会先把这一位立起来 —— 只有自己发起的关机才放行，
+	// 别的进程（电子教室、关机脚本）来的请求一律拦下。
+	bool allowShutdown = false;
 	bool mouseTracking = false;
 	bool hideTipShowed = false;
 	bool setTopMost = false;
@@ -360,6 +368,7 @@ private:
 	RECT advancedSaveRect{};
 	RECT networkProjectRect{};
 	RECT aboutUpdateRect{};
+	RECT aboutFeedbackRect{};
 	RECT aboutExitRect{};
 	HWND aboutExitButton = nullptr;
 	RECT teacherLaunchRect{};
@@ -449,7 +458,57 @@ private:
 	RECT updateDialogPrimaryRect{};
 	RECT updateDialogSecondaryRect{};
 	bool UpdateDialogVisible() const { return updateDialog.mode != UpdateDialogMode::None; }
-	bool ModalDialogVisible() const { return UpdateDialogVisible() || ProcessPickerVisible(); }
+	// 「防护状态」快捷卡点开的信息面板。内容在打开那一刻采一次快照 ——
+	// 用户是来看"现在是什么情况"的，不是来看数字在眼前变来变去的。
+	struct ProtectInfoRow {
+		std::wstring label;
+		std::wstring value;
+	};
+	bool protectDialogVisible = false;
+	float protectDialogAppear = 0.0f;
+	std::wstring protectHeadline;
+	std::wstring protectSummary;
+	std::vector<ProtectInfoRow> protectRows;
+	RECT protectDialogCloseRect{};
+	bool ProtectDialogVisible() const { return protectDialogVisible; }
+	bool ModalDialogVisible() const {
+		return UpdateDialogVisible() || ProcessPickerVisible() || ProtectDialogVisible() ||
+			FeedbackDialogVisible();
+	}
+	void PaintProtectDialog(Gdiplus::Graphics& g, int width, int height);
+	void OpenProtectDialog();
+	void CloseProtectDialog();
+	int HitProtectDialogAt(POINT point) const;
+	bool HandleProtectDialogClick(POINT point);
+	// 「意见反馈」：自绘卡片 + 三个原生 EDIT。描述和复现步骤都必填 ——
+	// 只有一句"用不了"的反馈，没有上下文也没法查。
+	bool feedbackDialogVisible = false;
+	float feedbackDialogAppear = 0.0f;
+	bool feedbackSubmitting = false;
+	bool feedbackSubmitFailed = false;
+	std::wstring feedbackStatus;
+	HWND feedbackDescEdit = nullptr;
+	HWND feedbackReproEdit = nullptr;
+	HWND feedbackContactEdit = nullptr;
+	WNDPROC feedbackEditProc = nullptr;
+	RECT feedbackDescRect{};
+	RECT feedbackReproRect{};
+	RECT feedbackContactRect{};
+	RECT feedbackCancelRect{};
+	RECT feedbackSubmitRect{};
+	bool FeedbackDialogVisible() const { return feedbackDialogVisible; }
+	void PaintFeedbackDialog(Gdiplus::Graphics& g, int width, int height);
+	void OpenFeedbackDialog();
+	void CloseFeedbackDialog();
+	void EnsureFeedbackEdits();
+	void PositionFeedbackEdits();
+	void SubmitFeedback();
+	std::wstring BuildFeedbackSystemInfo();
+	void OnFeedbackSubmitted();
+	int HitFeedbackDialogAt(POINT point) const;
+	bool HandleFeedbackDialogClick(POINT point);
+	void CycleFeedbackFocus(int from, int step);
+	static LRESULT CALLBACK FeedbackEditProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
 	// 一次探测还没回来时不再起第二次。两次并行探测会各弹一次结果，谁先到不确定；
 	// 用户看到的就是「点了没动静，再点一下突然说已是最新版本」。
 	std::atomic<bool> updateProbeInFlight{ false };

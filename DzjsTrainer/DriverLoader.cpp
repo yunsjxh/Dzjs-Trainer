@@ -9,7 +9,6 @@
 #include "Logger.h"
 #include <shellapi.h>
 #include <Shlwapi.h>
-#include "ActiveDefenseDemo.h"
 #include "DriverSignaturePolicy.h"
 #include "DriverGuard.h"
 #include "AvIntegrated.h"
@@ -110,11 +109,6 @@ static DWORD WINAPI DriverEventMonitorThread(LPVOID)
 				}
 				imagePath[pathLength] = L'\0';
 				if (currentLogger) {
-					BOOL highRisk = ActiveDefenseDemoScoreImage(
-						eventRecord.processId,
-						pathLength != 0UL ? imagePath : L"",
-						(eventRecord.flags & JDRV_EVENT_FLAG_SYSTEM_IMAGE) != 0UL,
-						(eventRecord.flags & JDRV_EVENT_FLAG_PROTECTED_TARGET) != 0UL);
 					currentLogger->LogInfo(
 						L"Kernel image event seq=%I64u pid=%lu system=%u target=%u base=0x%I64X size=%I64u path=%s",
 						eventRecord.sequence,
@@ -124,8 +118,6 @@ static DWORD WINAPI DriverEventMonitorThread(LPVOID)
 						eventRecord.imageBase,
 						eventRecord.imageSize,
 						pathLength != 0UL ? imagePath : L"<unknown>");
-					if (highRisk)
-						currentLogger->LogWarn(L"[DEFENSE-DEMO] high-risk image requires operator review");
 				}
 			}
 			else if (eventRecord.type == JDRV_EVENT_TYPE_DRIVER_BLOCKED) {

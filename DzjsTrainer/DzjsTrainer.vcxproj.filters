@@ -99,9 +99,6 @@
     <ClInclude Include="DriverPublisherAllowlist.h">
       <Filter>头文件\Utils</Filter>
     </ClInclude>
-    <ClInclude Include="ActiveDefenseDemo.h">
-      <Filter>头文件\Utils</Filter>
-    </ClInclude>
     <ClInclude Include="RegHlp.h">
       <Filter>头文件\Utils</Filter>
     </ClInclude>
@@ -183,9 +180,6 @@
       <Filter>源文件\Utils</Filter>
     </ClCompile>
     <ClCompile Include="AvIntegrated.cpp">
-      <Filter>源文件\Utils</Filter>
-    </ClCompile>
-    <ClCompile Include="ActiveDefenseDemo.cpp">
       <Filter>源文件\Utils</Filter>
     </ClCompile>
     <ClCompile Include="RegHlp.cpp">

@@ -82,6 +82,19 @@ const HookSpec kFullSet[] = {
 	HOOK_ITEM(44, Display, "StretchBlt",                faStretchBlt,                hkStretchBlt,                hk44),
 	// 原来只钩了 A 版，实际调用方绝大多数走 W 版。
 	HOOK_ITEM(45, Input,   "SetWindowsHookExW",         faSetWindowsHookExW,         hkSetWindowsHookExW,         hk45),
+	// ---- hk46..hk52：关机拦截 ----------------------------------------------
+	// hk19 的 ExitWindowsEx 是老的「拦截结束进程」开关（ProhibitKillProcess，
+	// 默认关，只记录）。教师端真发关机时带 EWX_FORCE，主程序那边
+	// WM_QUERYENDSESSION 的否决会被忽略 —— 所以必须在发起方进程里挡。
+	// 这一组由 blockShutdown 控制，默认开，与 ProhibitKillProcess 无关。
+	// advapi32 的四个必有；ntdll 的三个按导出情况装（见 GetProcAddress 段）。
+	HOOK_ITEM(46, Process, "InitiateSystemShutdownExW", faInitiateSystemShutdownExW, hkInitiateSystemShutdownExW, hk46),
+	HOOK_ITEM(47, Process, "InitiateSystemShutdownExA", faInitiateSystemShutdownExA, hkInitiateSystemShutdownExA, hk47),
+	HOOK_ITEM(48, Process, "InitiateSystemShutdownW",   faInitiateSystemShutdownW,   hkInitiateSystemShutdownW,   hk48),
+	HOOK_ITEM(49, Process, "InitiateSystemShutdownA",   faInitiateSystemShutdownA,   hkInitiateSystemShutdownA,   hk49),
+	HOOK_IF_ORIGINAL(50, Process, "NtShutdownSystem",       faNtShutdownSystem,     hkNtShutdownSystem,     hk50),
+	HOOK_IF_ORIGINAL(51, Process, "NtSetSystemPowerState",  faNtSetSystemPowerState, hkNtSetSystemPowerState, hk51),
+	HOOK_IF_ORIGINAL(52, Process, "NtInitiatePowerAction",  faNtInitiatePowerAction, hkNtInitiatePowerAction, hk52),
 };
 
 const size_t kFullSetCount = sizeof(kFullSet) / sizeof(kFullSet[0]);
@@ -101,6 +114,9 @@ bool CustomHostSkip(const HookSpec& s)
 	switch (s.seq) {
 	case 5:  case 6:  case 7:   // DeviceIoControl / CreateFileA/W（极域驱动通信）
 	case 19:                    // ExitWindowsEx（阻止远程关机）
+	case 46: case 47: case 48: case 49: case 50: case 51: case 52:
+	                            // 关机拦截（InitiateSystemShutdown* / Nt*）——
+	                            // 用户明确注入的第三方进程不该被挡关机
 	case 22: case 24: case 30:  // CreateProcessW / WinExec / CreateProcessA 白名单
 	case 39: case 40:           // TerminateProcess / FilterConnectCommunicationPort
 		return true;

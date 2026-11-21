@@ -70,6 +70,7 @@ SDK 版本对不上时：用户态工程写的是 `10.0`，自动取本机最新
 - **`/t:Build` 会静默跳过它认为「最新」的工程。** 构建成功与否看产物时间戳，不看退出码。
 - **带中文注释的源文件必须是 UTF-8 BOM。** MSVC 在没有 BOM 时按本地代码页读，中文注释会把后面的换行和字符串一起吃掉，报出来的错误位置和真实位置对不上。
 - **Boost 只能外部提供。** `DzjsTrainerUI` 的 `TeacherEndpoint/` 用 asio，仓库不含 Boost 本体，通过 `-p:BoostIncludeDir=` 传入；路径不对会在编译前直接报错，不会编到一半才炸。
+- **`MSB6001 命令行的开关无效` 通常不是参数写错。** 这个报错往外带的是 `System.ArgumentException: 已添加项。字典中的关键字:"Path" 所添加的关键字:"PATH"` —— 说明当前进程的环境块里同时存在 `Path` / `PATH` / `path` 几份同名变量，MSBuild 给 cl.exe 拼环境时字典撞了。换个干净的 shell 跑就没事（本机 PowerShell 会话里是脏的，走 Git Bash 反而正常）。查法：`[Environment]::GetEnvironmentVariables().Keys | ? { $_ -match '(?i)^path$' }`，返回好几个就是它。
 
 构建顺序（手工分步时）：驱动 x64 → `DzjsTrainerHooks`（两个位数）→ `DzjsTrainerInjector64` → `DzjsTrainerUpdaterExe` → `DzjsTrainerUI` → `DzjsTrainer`。用解决方案构建就不用管，依赖已经配好。
 
@@ -166,6 +167,9 @@ AES 那半边的拆分明文（partA / partB 异或还原）**硬编码在三处
 
 - 宿主数量由 `NotifyEduHosts()` 推给界面（`TrainerWorkerCallback::OnUpdateEduHosts`），只在注入成功、卸载成功、清理死进程三处触发。界面不轮询 `_CustomInjected` —— 那是工作线程的数据。
 - 概览页的徽标和「受控宿主」卡片。极域没跑但其他教室已经接管时显示「已接管 / 其他教室 N 个」，卡片下面一行列产品名；原来固定写「待检测 / 进程未运行」，装了别的教室也像没生效。
+- 概览页「防护状态」那一格点开是块只读信息面板（`PaintProtectDialog`）：总体状态、受控宿主、已接管教室、主驱动、自我保护、拦截项数、版本、构建时间，一行一项。数据在打开那一刻采一次，不跟着后面刷新 —— 用户是来看「现在什么情况」的，数字在眼前跳反而看不明白。采集段在 `stateMutex` 里，采完立刻放锁；之后才碰窗口，因为 `SetForegroundWindow` / `SetFocus` 会同步回调窗口过程，那些路径也走这把锁。
+
+**「构建」那行精确到分钟**（`2026-11-21 16:14`），来自本进程 PE 头里的 `TimeDateStamp`，也就是链接时刻，增量构建也准。打包器把时间戳清零时退回 `BuildStamp.cpp` 的 `__DATE__` + `__TIME__` —— 那一档停在它自己被重编的时刻，会旧一些，但不至于空着。
 - 注入列表里，命中产品表的目标带 `· 红蜘蛛` 这样的后缀，手动注入的普通进程不带。
 
 `SyncCustomHosts()` 是给「界面改了显示开关」用的。`ApplyTemporaryVideoProtection()` 改完媒体和 `EnableVideoModify` 之后要广播一次 `hk:reset`，否则宿主还按旧的 ini 值拦或放 —— 极域那几条 `hk:` 命令它们不认。
@@ -210,11 +214,61 @@ AES 那半边的拆分明文（partA / partB 异或还原）**硬编码在三处
 - **找窗口按类名**（`DzjsTrainerNativeWindow`），标题只做 fallback。按标题找会因为改文案而恒返回 NULL，最后表现成「失联」弹窗。
 - 自绘控件要吃双击就得带 `CS_DBLCLKS`，否则 `WM_LBUTTONDBLCLK` 根本不来。
 
-**弹出菜单（`Md3RunMenu`）也是自绘的**，「电子教室操作」和电源控制都走它。`TrackPopupMenu` 出来的是方角 + 系统字体 + 灰底，跟整套圆角卡片摆一起像从别的程序借的。现在的做法是一个 `WS_EX_LAYERED` 的无边框窗口，自己画 16 圆角、48 行高（这里取 42）、悬停与按下各压一层主色状态层，键盘上下键 / 回车 / Esc 都能用。三个坑：
+**弹出菜单（`Md3RunMenu`）也是自绘的**，「电子教室操作」和电源控制都走它。`TrackPopupMenu` 出来的是方角 + 系统字体 + 灰底，跟整套圆角卡片摆一起像从别的程序借的。现在的做法是一个 `WS_EX_LAYERED` 的无边框窗口，自己画 16 圆角、48 行高（这里取 42）、悬停与按下各压一层主色状态层，键盘上下键 / 回车 / Esc 都能用。四个坑：
 
 - **画在 `Bitmap` 上再拷进 DIB，不要 `Graphics(HDC)`。** 往 DIB 的 DC 上画，GDI+ 不保证写 alpha，分层窗口拿到的是一块不透明方块。拷的时候顺手把颜色乘上 alpha 变成预乘，否则圆角边缘挂一圈发白。
 - **位置用 `SetWindowPos` 定，`UpdateLayeredWindow` 的 `pptDst` 传 `nullptr`。** 窗口显示出来、`SetFocus` 激活那一刻，系统会拿一个我们没给过的坐标再 `SetWindowPos` 一次（`SWP_NOSIZE|SWP_NOZORDER`），菜单会跑到触发卡片的左上方约 129×235 的位置。所以激活之后再显式摆一次。
 - **命令要 `PostMessage` 回主窗口**，不要在自己的消息循环里直接调处理函数 —— 那是在菜单窗口销毁的半路上重入界面。
+- **命中判定要连 x 一起算**：菜单自己 `SetCapture`，光标从左右两侧移出去之后鼠标消息仍然往这个窗口送，`WM_MOUSELEAVE` 不会来。只按 y 算的话，那一行会一直停在悬停色上；同样的原因，在外面点一下也会被判成点中那一行，直接执行了。
+
+**退出确认是独立桌面上的全屏窗口**（`ExitConfirmProc`）：暗化壁纸 + 一块居中面板，`SwitchDesktop` 切过去，之后切回来才算退出成功。原来是 6 位数字的真人校验，现在整块面板点一下就退，`Esc` 取消 —— 但「只认真实输入」这条没丢，判据从输入验证码换成了 RawInput 的设备句柄：
+
+- 键盘和鼠标都按 `RIDEV_INPUTSINK` 注册到弹窗窗口。`SendInput` 造出来的 `WM_INPUT` 事件 `header.hDevice` 是空句柄，`PostMessage` 投的鼠标消息压根不产生 `WM_INPUT`，两条注入路径都进不来。
+- 按钮的 `BN_CLICKED` 分不出来源，所以真正的门设在 `WM_COMMAND`：没有 `hardwareConfirm` 就不退。`WM_LBUTTONDOWN` 也只在 RawInput 没注册上的机器才当数。
+- 面板命中按逻辑坐标算，物理坐标要先除以 `scale`，不然 125%/150% 下点不中。
+- 「取消」是真子按钮，点在它身上消息不会到父窗口，所以「点面板哪都算确认」不必额外排除它 —— 但鼠标的 RawInput 路径要自己 `PtInRect` 排除，否则点取消也会被当成确认。
+
+## 关机拦截
+
+主窗口处理 `WM_QUERYENDSESSION`：不是自己发起的关机 / 重启 / 注销，一律 `ShutdownBlockReasonCreate` 再返回 `FALSE`。原因文本在 `WM_ENDSESSION`（`wParam` 为 `FALSE`，表示关机被取消）里撤掉，否则下一次关机会挂着一句已经过期的话。
+
+- 「自己发起的」靠 `allowShutdown` 一位，只有电源菜单里的关机 / 重启会立起来。极域远程关机、关机脚本都没有这位，全部拦下。
+- 拦下之后弹提示，走 `PostMessage(WM_MY_SHUTDOWN_BLOCKED)` 回到正常消息流 —— `WM_QUERYENDSESSION` 只有几毫秒预算，不能在里面显示窗口。这个 ID 用 `WM_APP+47`，`+46` 被 `UpdaterIpc.h` 的下载进度占了，撞上就是 `case 值已使用`。
+- 窗口缩在托盘时先 `ShowWindow` 再提示，提示里写清出路：要关机用「电源控制」。否则用户从开始菜单关机被拦一次，会以为程序坏了。
+- 这一层只挡得住没带 `EWX_FORCE` 的关机。教师端的关机基本都带 force，系统会照样结束进程、照样关 —— 2026-11-21 那次「拦截没成功」的日志里就有 `Blocked a shutdown/restart request`，机器还是关了。
+- 所以真正干活的是钩子层：`blockShutdown`（默认开，ini 里 `BlockShutdown=FALSE` 可关）在注入的教室进程里挡住 `ExitWindowsEx`、`InitiateSystemShutdownExW/A`、`InitiateSystemShutdownW/A`、`NtShutdownSystem`、`NtSetSystemPowerState`、`NtInitiatePowerAction`，以及 `CreateProcess*/WinExec` 里对 `shutdown.exe` 的拉起。挡下之后 `VNotifyShutdownBlocked()` 发 `hkb:shutdown:<api>` 回主窗口，界面弹一句提示。
+- 那条通知不能复用 `VSendMessageBack()`：它在 `g_customHost` 下直接丢弃回传，而红蜘蛛、伽卡他卡这些宿主就是通用宿主，挡了关机主程序也不知道。
+- `EWX_LOGOFF` 的值是 0，判断「是不是注销」不能位测试，要先看有没有关机 / 重启 / 断电位。
+- 还没兜住的一种：关机由系统服务发起、且带着 force 时，用户态没有否决点。要封死得在内核里拦（SSDT / inline hook，本项目明确不做）。
+
+## 意见反馈
+
+关于页「检查更新」右边那个「意见反馈」，弹出卡片要用户填**问题描述**和**复现步骤**（都必填），联系方式可选。提交时顺手把当天的运行日志和一份系统信息打包上传。
+
+上传不在主程序里做。主进程里 WinHTTP/Schannel 起不来（`SEC_E_SECPKG_NOT_FOUND`），所以照旧借 `DzjsTrainerUpdater.exe` 子进程跑：`--feedback <包> --meta <文件> --result <文件> --no-elevate`，结果文件第一行 `ok` / `fail`，第二行起是服务端原话或失败原因。父进程等结果文件，最多 90 秒。
+
+- **包里有什么**：`logs/DzjsTrainer-YYYY-MM-DD.log`（超过 1.5 MB 只取尾部）、`logs/DzjsTrainerHooks-debug.log`（384 KB 尾部）、`system.txt`（版本、构建时间、运行环境、窗口 DPI、分辨率、CPU、内存、驱动状态、自我保护、拦截策略、日志目录）、`feedback.txt`（用户填的三段，给人看）。zip 是自己写的 store-only 实现，`XZip.cpp` 不在任何工程里，链接会报 LNK2001。
+- **接口**：`update-server/feedback.php`，multipart 两个 part（`meta` / `bundle`），单包上限 8 MB。限流按真实来源 IP 算：一小时内 1 次、24 小时内 2 次，都是滚动窗口，不按自然日重置。落盘 `feedback/<日期>/<时分秒>-<8hex>/`，`meta.json` 里追加一段 `_server`（收件时间、客户端 IP、边缘节点 IP、UA、实际字节数、客户端时间）。
+- **请求必须签名，这是"只收官方客户端"的唯一依据。** 接口在公网上，User-Agent 谁都能抄，限流换个 IP 就绕过去了。客户端拿内嵌的 RSA-2048 私钥签 `DZJS-FEEDBACK/1|<ts>|<nonce>|<metaSha>|<bundleSha>`，服务端用 `feedback-pub.php` 里的公钥验。两个摘要都对着服务端**实收的字节**算，header 里声称的值不作数 —— 中途改一个字节就验不过。
+- **回复也签名，方向相反。** 成功响应带 `X-Dzjs-Reply: 1|<ts>|<sha256(body)>|<sig>`，客户端用编进 exe 的票据公钥验。这条挡的是"企业代理换张根证书伪造一个 200"：TLS 只证明连到了一个证书合法的对端，证明不了那是我们。两个方向合起来才算双向。
+- **私钥加密存放，但别当成保密措施。** `tools/make-feedback-key.py` 把 PKCS#1 DER 用 AES-256-CBC 包成 `FeedbackSignKey.h`。AES 密钥与密文必然同处一个文件，它把"`grep` 一下就有"抬成"要真正逆向"，仅此而已。真正的防线是服务端那四道：验签、时间窗、nonce、限流。
+- **四道的顺序不能乱。** 签名格式和时间窗先看（纯字符串判断），再查限流记录（读一个小文件），然后才是 meta / bundle 校验，最后验签，**验签通过后才写 nonce**。写早了，一个随机 nonce 就能把 `.nonce/` 撑满；nonce 用 `fopen(..., 'x')` 原子创建，两个并发的相同请求只有一个能过。
+- **换钥必须两边一起改。** 换私钥 → 重跑脚本 → 重编发版，同时替换服务端的 `feedback-pub.php`。只改一半的表现是所有反馈 403「签名验证失败」。开源构建用 `FeedbackSignKey.h.example`（示例私钥，公开），它的请求会被正式服务端拒掉 —— 客户端在签名前就报「当前为开源示例构建」，不用等服务器。
+- **换私钥之后必须 `-t:Rebuild`，`touch` 不管用。** `__has_include` 的切换不被增量构建感知：把 `FeedbackSignKey.h` 移走编一次（走 `.example`），再放回来，MSBuild 的 tlog 里没有这个文件的依赖记录，`-t:Build` 会一路"成功"却继续用示例私钥。现象是产物能跑、体积略小，但每次提交都报「当前为开源示例构建」。跟 rc 里那个令牌的坑是一类。
+- **`BCryptImportKeyPair` 这条路走不通。** 自拼的 `BCRYPT_RSAKEY_BLOB`（magic、位长、e/n/p1/p2 全对，密钥的数学关系也验过）一直回 `STATUS_UNSUCCESSFUL(0xC0000001)`。最终用 CryptoAPI：`CryptDecodeObjectEx(PKCS_RSA_PRIVATE_KEY)` 一步把 DER 变成它认的 `PRIVATEKEYBLOB`，导入一个临时 key container 再 `CryptSignHash`。注意 `CryptSignHash` 只认 `AT_SIGNATURE` / `AT_KEYEXCHANGE`，不接收导入的句柄，所以那两个槽要先 `CryptGetUserKey` 探一遍 —— 猜错就是 `NTE_BAD_KEYSET(0x80090016)`，从错误码看不出是猜错槽位还是压根没导入。容器签完立刻 `CRYPT_DELETEKEYSET`，不在用户 profile 里留东西。
+- **nginx 那两道比 PHP 早。** 站点配了 CF 网段的 `set_real_ip_from` + `real_ip_header CF-Connecting-IP`（直连源站伪造这个头不会被采信），`limit_req` 打在 `location = /update-server/feedback.php` 上：20 次/分钟、突发 5 个。`limit_req` 在 preaccess 阶段生效，早于 nginx 读请求体 —— 被拒的请求连那 8 MB 都不会开始收，PHP 也就不会落临时文件。这个 location 不能 `include enable-php-82.conf`（那本身是个 location 块），是抄了一份进去的；换 PHP 版本要改两处。
+- **429 只回一个 `429`。** 还剩多久是客户端该说的话，服务端报个数就够；客户端把这一档翻译成「提交太频繁，过一会儿再试」再显示。其余 4xx 的正文才原样当提示用，所以那边写的都是给人看的中文、不带状态码。
+- **看反馈在 `admin.php` 下半页。** 登录后有一个「用户反馈」区块：按时间倒序列出最近 40 条，点开看描述、复现、联系方式、版本构建、真实 IP 与边缘 IP、系统信息快照；`bundle.zip` 走后台下载（链接带 csrf），旁边还有删除。总数与总大小照实算，超过 40 条会写「只列最近 N 条」。
+- **`feedback/` 不让直接访问。** nginx 里一条 `location ^~ /update-server/feedback/ { return 404; }` 就挡掉了，下载统一走后台；`admin.php` 读的是文件系统，不受影响。加这条之前，知道完整路径的人能直接把别人的日志包拖走。
+- 输入框是真 `EDIT`（两个多行带 `ES_WANTRETURN`，一个单行），不是画出来的 —— 理由和进程选择器那条一样。
+
+三个坑，加别的弹窗时会再遇到：
+
+- **弹窗按钮要登记进 `TargetRect()`。** `FocusableTargets()` 只负责列出可聚焦的 id，真正取矩形、以及 Tab 之后回车触发（`ActivateFocus()` 是取中心点再仿一次点击）都走 `TargetRect()`。漏一个的表现是那按钮只能鼠标点，键盘按下去没反应，而且不报错。
+- **模态弹窗得自己画焦点环。** 通用那圈在 `focusTarget >= 0 && !ModalDialogVisible()` 里，弹窗一开就被关掉。更新弹窗、防护面板、进程选择器各画各的，新的也得画，否则 Tab 转过去看不见焦点在哪。
+- **Tab 的环要连按钮一起算。** 输入框的 Tab 由 `FeedbackEditProc` 接管（多行 EDIT 默认拿 Tab 当制表符），焦点一旦换到按钮就走主窗口的 `WM_KEYDOWN`。两处各管一段没关系，但必须围成同一个环 —— 否则从按钮回不到输入框，纯键盘用户就卡在按钮上。
+
+行为上两个刻意的选择：点卡片外面**不关**弹窗（里面可能是刚敲的几百字，误点一下全丢比关不掉难受），以及上传过程中不给关（关了也看不到结果，请求还在服务器那边跑）。
 
 ## 调试
 

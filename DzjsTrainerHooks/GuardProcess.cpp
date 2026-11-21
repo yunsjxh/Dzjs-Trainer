@@ -85,8 +85,39 @@ HANDLE WINAPI hkCreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess,  DWORD dw
 	return faCreateFileW(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
 }
 
+// ---- 关机拦截 ---------------------------------------------------------------
+// 为什么要在发起方进程里挡：极域教师端发关机走的是 ExitWindowsEx(带
+// EWX_FORCE) 或 InitiateSystemShutdownEx(bForceAppsClosed=TRUE)。这两条路都会
+// 先广播 WM_QUERYENDSESSION 问一圈应用，但**不理会否决**，直接强制结束进程。
+// 主程序那边返回 FALSE 只是让日志里多一行 Blocked，机器照样关 —— 这就是
+// 2026-11-21 那次「拦截没成功」的全部原因。想真拦住，只能在调用的源头返回失败。
+//
+// EWX_LOGOFF 的值是 0，不能用位测试判断「是不是注销」：先看有没有
+// 关机/重启/断电位，都没有才是注销。
+constexpr LONG kStatusAccessDenied = static_cast<LONG>(0xC0000022u);
+
+static bool ShutdownLikeFlags(UINT flags)
+{
+	return (flags & (EWX_SHUTDOWN | EWX_REBOOT | EWX_POWEROFF | EWX_HYBRID_SHUTDOWN)) != 0;
+}
+
+// POWER_ACTION：2=Sleep 3=Hibernate 4=Shutdown 5=ShutdownReset 6=ShutdownOff。
+// 只挡 4..6 —— 休眠和睡眠不是「关机」，挡了反而是毛病。
+static bool ShutdownLikePowerAction(ULONG action)
+{
+	return action >= 4 && action <= 6;
+}
+
 BOOL WINAPI hkExitWindowsEx(UINT uFlags, DWORD dwReason) {
 	VTraceHook(L"hkExitWindowsEx");
+	// blockShutdown 与 ProhibitKillProcess 是两件事，见 HooksCommon.h 的说明。
+	if (loaded && blockShutdown) {
+		const bool shutdownLike = ShutdownLikeFlags(uFlags);
+		VDebugLog(L"BLOCK ExitWindowsEx flags=0x%X reason=0x%lX logoff=%d", uFlags, dwReason, shutdownLike ? 0 : 1);
+		VNotifyShutdownBlocked(shutdownLike ? L"ExitWindowsEx" : L"ExitWindowsEx(注销)");
+		SetLastError(ERROR_ACCESS_DENIED);
+		return FALSE;
+	}
 	// 只记录：没打开「阻止远程结束进程 / 关机」时直接放行，也不弹确认框。
 	if (!ProhibitKillProcess) {
 		VRecordHook(L"ExitWindowsEx", L"flags=0x%X", uFlags);
@@ -102,6 +133,86 @@ BOOL WINAPI hkExitWindowsEx(UINT uFlags, DWORD dwReason) {
 		return faExitWindowsEx(uFlags, dwReason);
 	SetLastError(ERROR_ACCESS_DENIED);
 	return FALSE;
+}
+
+BOOL WINAPI hkInitiateSystemShutdownExW(LPWSTR lpMachineName, LPWSTR lpMessage, DWORD dwTimeout, BOOL bForceAppsClosed, BOOL bRebootAfterShutdown, DWORD dwReason) {
+	VTraceHook(L"hkInitiateSystemShutdownExW");
+	if (loaded && blockShutdown) {
+		VDebugLog(L"BLOCK InitiateSystemShutdownExW machine=%s force=%d reboot=%d",
+			lpMachineName && lpMachineName[0] ? lpMachineName : L"(local)", bForceAppsClosed, bRebootAfterShutdown);
+		VNotifyShutdownBlocked(bRebootAfterShutdown ? L"InitiateSystemShutdownExW(重启)"
+			: L"InitiateSystemShutdownExW");
+		SetLastError(ERROR_ACCESS_DENIED);
+		return FALSE;
+	}
+	return faInitiateSystemShutdownExW(lpMachineName, lpMessage, dwTimeout, bForceAppsClosed, bRebootAfterShutdown, dwReason);
+}
+
+BOOL WINAPI hkInitiateSystemShutdownExA(LPSTR lpMachineName, LPSTR lpMessage, DWORD dwTimeout, BOOL bForceAppsClosed, BOOL bRebootAfterShutdown, DWORD dwReason) {
+	VTraceHook(L"hkInitiateSystemShutdownExA");
+	if (loaded && blockShutdown) {
+		VDebugLog(L"BLOCK InitiateSystemShutdownExA machine=%S force=%d reboot=%d",
+			lpMachineName && lpMachineName[0] ? lpMachineName : "(local)", bForceAppsClosed, bRebootAfterShutdown);
+		VNotifyShutdownBlocked(bRebootAfterShutdown ? L"InitiateSystemShutdownExA(重启)"
+			: L"InitiateSystemShutdownExA");
+		SetLastError(ERROR_ACCESS_DENIED);
+		return FALSE;
+	}
+	return faInitiateSystemShutdownExA(lpMachineName, lpMessage, dwTimeout, bForceAppsClosed, bRebootAfterShutdown, dwReason);
+}
+
+BOOL WINAPI hkInitiateSystemShutdownW(LPWSTR lpMachineName, LPWSTR lpMessage, DWORD dwTimeout, BOOL bForceAppsClosed, BOOL bRebootAfterShutdown) {
+	VTraceHook(L"hkInitiateSystemShutdownW");
+	if (loaded && blockShutdown) {
+		VDebugLog(L"BLOCK InitiateSystemShutdownW machine=%s force=%d",
+			lpMachineName && lpMachineName[0] ? lpMachineName : L"(local)", bForceAppsClosed);
+		VNotifyShutdownBlocked(L"InitiateSystemShutdownW");
+		SetLastError(ERROR_ACCESS_DENIED);
+		return FALSE;
+	}
+	return faInitiateSystemShutdownW(lpMachineName, lpMessage, dwTimeout, bForceAppsClosed, bRebootAfterShutdown);
+}
+
+BOOL WINAPI hkInitiateSystemShutdownA(LPSTR lpMachineName, LPSTR lpMessage, DWORD dwTimeout, BOOL bForceAppsClosed, BOOL bRebootAfterShutdown) {
+	VTraceHook(L"hkInitiateSystemShutdownA");
+	if (loaded && blockShutdown) {
+		VDebugLog(L"BLOCK InitiateSystemShutdownA machine=%S force=%d",
+			lpMachineName && lpMachineName[0] ? lpMachineName : "(local)", bForceAppsClosed);
+		VNotifyShutdownBlocked(L"InitiateSystemShutdownA");
+		SetLastError(ERROR_ACCESS_DENIED);
+		return FALSE;
+	}
+	return faInitiateSystemShutdownA(lpMachineName, lpMessage, dwTimeout, bForceAppsClosed, bRebootAfterShutdown);
+}
+
+LONG NTAPI hkNtShutdownSystem(ULONG action) {
+	VTraceHook(L"hkNtShutdownSystem");
+	if (loaded && blockShutdown) {
+		VDebugLog(L"BLOCK NtShutdownSystem action=%lu", action);
+		VNotifyShutdownBlocked(L"NtShutdownSystem");
+		return kStatusAccessDenied;
+	}
+	return faNtShutdownSystem ? faNtShutdownSystem(action) : kStatusAccessDenied;
+}
+
+LONG NTAPI hkNtSetSystemPowerState(ULONG action, ULONG minState, ULONG flags) {
+	VTraceHook(L"hkNtSetSystemPowerState");
+	if (loaded && blockShutdown && ShutdownLikePowerAction(action)) {
+		VDebugLog(L"BLOCK NtSetSystemPowerState action=%lu", action);
+		VNotifyShutdownBlocked(L"NtSetSystemPowerState");
+		return kStatusAccessDenied;
+	}
+	return faNtSetSystemPowerState ? faNtSetSystemPowerState(action, minState, flags) : kStatusAccessDenied;
+}
+
+LONG NTAPI hkNtInitiatePowerAction(ULONG action, ULONG minState, ULONG flags, BOOLEAN asynchronous) {
+	VTraceHook(L"hkNtInitiatePowerAction");
+	if (loaded && blockShutdown && ShutdownLikePowerAction(action)) {
+		VDebugLog(L"BLOCK NtInitiatePowerAction action=%lu", action);
+		VNotifyShutdownBlocked(L"NtInitiatePowerAction");
+		return kStatusAccessDenied;
+	}
+	return faNtInitiatePowerAction ? faNtInitiatePowerAction(action, minState, flags, asynchronous) : kStatusAccessDenied;
 }
 
 HINSTANCE WINAPI hkShellExecuteW(HWND hwnd, LPCWSTR lpOperation, LPCWSTR lpFile, LPCWSTR lpParameters, LPCWSTR lpDirectory, INT nShowCmd) {
@@ -215,6 +326,17 @@ BOOL WINAPI hkCreateProcessW(LPCWSTR lpApplicationName, LPWSTR lpCommandLine, LP
 	}
 
 	bool canContinue = true;
+	// 关机拦截优先于「不干预远程行为」：allowAllRunOp 为真只是不拦远程启动的程序，
+	// 不等于允许极域用 shutdown.exe 把机器关掉。返回 TRUE 是「假装创建成功」，
+	// 免得极域自己再弹一个启动失败。
+	if (loaded && blockShutdown &&
+		((lpApplicationName && StrStrIW(lpApplicationName, L"shutdown.exe")) ||
+		 (lpCommandLine && StrStrIW(lpCommandLine, L"shutdown.exe")))) {
+		VDebugLog(L"BLOCK CreateProcessW cmd=%s",
+			lpCommandLine ? lpCommandLine : (lpApplicationName ? lpApplicationName : L""));
+		VNotifyShutdownBlocked(L"shutdown.exe");
+		return TRUE;
+	}
 	if (allowAllRunOp) {
 		VRecordHook(L"CreateProcessW", L"app=%s",
 			lpApplicationName ? lpApplicationName : (lpCommandLine ? lpCommandLine : L""));
@@ -270,6 +392,15 @@ BOOL WINAPI hkCreateProcessA(LPCSTR lpApplicationName, LPSTR lpCommandLine, LPSE
 	}
 
 	bool canContinue = true;
+	// 同上：shutdown.exe 先于 allowAllRunOp 处理。
+	if (loaded && blockShutdown &&
+		((lpApplicationName && StrStrIA(lpApplicationName, "shutdown.exe")) ||
+		 (lpCommandLine && StrStrIA(lpCommandLine, "shutdown.exe")))) {
+		VDebugLog(L"BLOCK CreateProcessA cmd=%S",
+			lpCommandLine ? lpCommandLine : (lpApplicationName ? lpApplicationName : ""));
+		VNotifyShutdownBlocked(L"shutdown.exe");
+		return TRUE;
+	}
 	if (allowAllRunOp) {
 		VRecordHook(L"CreateProcessA", L"app=%S",
 			lpApplicationName ? lpApplicationName : (lpCommandLine ? lpCommandLine : ""));
@@ -312,6 +443,11 @@ BOOL WINAPI hkCreateProcessA(LPCSTR lpApplicationName, LPSTR lpCommandLine, LPSE
 UINT WINAPI hkWinExec(LPCSTR lpCmdLine, UINT uCmdShow) {
 	VTraceHook(L"hkWinExec");
 	bool canContinue = true;
+	if (loaded && blockShutdown && lpCmdLine && StrStrIA(lpCmdLine, "shutdown.exe")) {
+		VDebugLog(L"BLOCK WinExec cmd=%S", lpCmdLine);
+		VNotifyShutdownBlocked(L"shutdown.exe");
+		return 32;   // 假装成功，别让极域再弹一个失败提示
+	}
 	if (allowAllRunOp) {
 		VRecordHook(L"WinExec", L"cmd=%S", lpCmdLine ? lpCmdLine : "");
 		return faWinExec(lpCmdLine, uCmdShow);

@@ -45,6 +45,9 @@ public:
 	virtual void OnBeforeSendStartConf() {}
 	virtual void OnAllowGbTop() {}
 	virtual void OnShowHelp() {}
+	// 被注入的教室进程里挡下了一次关机/重启/注销。api 是拦在哪个函数上
+	// （ExitWindowsEx / shutdown.exe / InitiateSystemShutdownExW …），只用于日志。
+	virtual void OnShutdownBlocked(LPCWSTR api) {}
 	virtual void OnSwitchLockStatus(bool locked) {}
 	virtual HWND GetMainHWND() { return NULL; }
 };

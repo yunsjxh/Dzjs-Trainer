@@ -47,6 +47,12 @@ unlock-key-material/
 # 里面是公开私钥对应的示例公钥，只能用于编译和自测。
 /DzjsTrainerUpdater/UpdaterTicketKey.h
 
+# 反馈上行签名私钥（由 tools/make-feedback-key.py 从 update-server/feedback-client.der
+# 加密生成）。这个跟上面那条性质不同：上面是公钥，这条是**私钥**。它必然会被
+# 编进客户端、也必然能被逆向出来，但开源仓库里不该有一份现成的。
+# 仓库带的是 FeedbackSignKey.h.example，装着一把公开的示例私钥，只能编译和自测。
+/DzjsTrainerUpdater/FeedbackSignKey.h
+
 # Local or unrelated source copies and inspection artifacts
 /dzjstools-main/
 /src/

@@ -251,6 +251,11 @@ constexpr UINT WM_AV_SCAN_FINISHED = WM_APP + 43;
 constexpr UINT WM_UPDATE_PROBE_DONE = WM_APP + 44;
 // 内置更新的下载进度/结果回到 UI 线程用。
 constexpr UINT WM_UPDATE_DOWNLOAD_STATE = WM_APP + 45;
+// 关机请求被拦下之后，回到 UI 线程再去弹提示（WM_QUERYENDSESSION 里不能慢）。
+// 47 而不是 46：WM_APP+46 被 UpdaterIpc.h 的下载进度占了。
+constexpr UINT WM_MY_SHUTDOWN_BLOCKED = WM_APP + 47;
+// 反馈上传线程收工后回到 UI 线程。
+constexpr UINT WM_MY_FEEDBACK_DONE = WM_APP + 48;
 
 struct UpdateDownloadContext {
 	HWND window = nullptr;
@@ -279,6 +284,17 @@ constexpr int kProcessPickerRefresh = 124;
 constexpr int kProcessPickerSelectAll = 125;
 // 搜索框的控件 ID。它不是自绘的按钮，只用来收 IDC 和 WM_CTLCOLOR 分支。
 constexpr int kProcessPickerSearch = 126;
+// 「防护状态」信息面板只有一颗关闭按钮，占 hoverProgress 的最后一格。
+constexpr int kProtectDialogClose = 127;
+// 「意见反馈」的两颗按钮，以及三个原生 EDIT 的控件 ID。EDIT 只用来收
+// WM_CTLCOLOR 和键盘消息，不参与布局 —— 位置由 PositionFeedbackEdits 摆。
+constexpr int kFeedbackCancel = 128;
+constexpr int kFeedbackSubmit = 129;
+// 关于页「意见反馈」那颗按钮。它不进弹窗，但要有 id 才能吃悬停态和 Tab 焦点。
+constexpr int kAboutFeedback = 130;
+constexpr int kFeedbackDescEdit = 47001;
+constexpr int kFeedbackReproEdit = 47002;
+constexpr int kFeedbackContactEdit = 47003;
 constexpr int kProcessPickerMaxRows = 14;
 
 std::wstring FormatByteSize(unsigned long long bytes)
@@ -757,7 +773,6 @@ constexpr int IDC_AV_PROCESS_LIST = 45101;
 constexpr int IDC_AV_PROCESS_REFRESH = 45102;
 constexpr int IDC_AV_PROCESS_OK = 45103;
 constexpr int IDC_AV_PROCESS_CANCEL = 45104;
-constexpr int IDC_EXIT_CONFIRM_EDIT = 46001;
 constexpr int IDC_EXIT_CONFIRM_OK = 46002;
 constexpr int IDC_EXIT_CONFIRM_CANCEL = 46003;
 
@@ -1364,41 +1379,22 @@ constexpr wchar_t kExitConfirmClass[] = L"DzjsTrainerExitConfirm";
 
 // 退出确认面板的布局。绘制（PaintExitConfirm）和原生控件（WM_CREATE）共用这一组
 // 常量 —— 原来两边各写一套坐标，改一处必然错位。
-// 几何沿用原来的 520x350 / 内边距 34，只把散落的字面量收拢，不动观感。
+// 面板里只剩标题、一行说明和两个按钮，所以要不了原来 350 的高度。
 constexpr int kExitPanelWidth = 520;
-constexpr int kExitPanelHeight = 350;
+constexpr int kExitPanelHeight = 220;
 constexpr int kExitPadX = 34;
 constexpr int kExitContentWidth = kExitPanelWidth - kExitPadX * 2;   // 452
 
 constexpr int kExitTitleY = 30;
-constexpr int kExitSubtitleY = 76;
-constexpr int kExitCodeY = 116;
-constexpr int kExitCodeHeight = 38;
-constexpr int kExitHintY = 170;
-constexpr int kExitErrorY = 196;       // 贴着提示行，只留 4px
-constexpr int kExitEditY = 234;
-constexpr int kExitEditHeight = 36;
-constexpr int kExitButtonY = 286;
+constexpr int kExitSubtitleY = 74;
+constexpr int kExitHintY = 102;
+constexpr int kExitButtonY = 152;
 constexpr int kExitButtonWidth = 100;
-constexpr int kExitButtonHeight = 34;
+constexpr int kExitButtonHeight = 36;
 constexpr int kExitButtonGap = 10;
 
 // 面板圆角：和主界面卡片同一档。
 constexpr float kExitPanelRadius = 12.0f;
-// 输入框外框圆角。原来 EDIT 带 WS_EX_CLIENTEDGE，系统会画 3D 凹陷直角边，
-// 这是整个界面上唯一一处非圆角的控件边框；改成自绘细边之后用 10。
-constexpr float kExitEditRadius = 10.0f;
-
-// 验证码有效期。到点就换一组新的、并清空已输入的内容 —— 屏幕上摆着的数字
-// 只有 30 秒可用，被人拍照或者事后回头抄都来不及。
-constexpr UINT kExitCodeRefreshSeconds = 30;
-constexpr UINT_PTR kExitRefreshTimer = 1;
-// 倒计时每 200ms 校一次。不按 1000ms 走是因为 WM_TIMER 会被输入抢占、
-// 每次最多迟到一两百毫秒，累加之后显示会明显偏慢；这里按绝对时间算剩余，
-// 只在「秒数变了」的时候重画那一小块。
-constexpr UINT kExitRefreshTickMs = 200;
-// 倒计时文字占的宽度，右端对齐内容区右边界。
-constexpr int kExitCountdownWidth = 88;
 
 // 后备缓冲。整帧先在内存里画完，再**一次性** BitBlt 上屏。
 //
@@ -1477,21 +1473,14 @@ struct ExitConfirmContext {
 	int panelX = 0;      // 逻辑坐标，绘制前统一 ScaleTransform
 	int panelY = 0;
 	float scale = 1.0f;
-	HWND edit = nullptr;
 	HFONT font = nullptr;
-	HBRUSH editBrush = nullptr;
-	WNDPROC originalEditProc = nullptr;
+	// owner-draw 按钮在 WM_DRAWITEM 之前要先擦一遍底，这个刷子就是面板色。
+	HBRUSH surfaceBrush = nullptr;
 	bool rawInputRegistered = false;
-	std::wstring challenge;
-	std::wstring value;
-	ULONGLONG refreshDeadline = 0;   // GetTickCount64 口径的绝对时间
-	int shownSeconds = -1;           // 当前画在屏幕上的剩余秒数，-1 表示还没画过
+	// 只有真实硬件输入才置位；PostMessage 投来的点击、SendInput 造的按键都过不去。
+	bool hardwareConfirm = false;
 	bool darkMode = false;
 	bool accepted = false;
-	bool sawPhysicalKeyboard = false;
-	bool injectedInput = false;
-	bool invalidInput = false;
-	bool updatingEdit = false;
 };
 
 std::unique_ptr<Bitmap> BuildExitWallpaper(LPCWSTR path)
@@ -1602,12 +1591,18 @@ DWORD WINAPI ExitConfirmDesktopThreadProc(LPVOID parameter)
 		SetEvent(context->readyEvent);
 		return context->desktopFailure;
 	}
-	RAWINPUTDEVICE keyboardDevice{};
-	keyboardDevice.usUsagePage = 0x01;
-	keyboardDevice.usUsage = 0x06;
-	keyboardDevice.dwFlags = RIDEV_INPUTSINK;
-	keyboardDevice.hwndTarget = context->window;
-	context->rawInputRegistered = RegisterRawInputDevices(&keyboardDevice, 1, sizeof(keyboardDevice)) != FALSE;
+	// 键盘和鼠标一起注册：确认只认真实硬件输入，两者都挡注入。
+	// （SendInput 造出来的 WM_INPUT 事件没有设备句柄，见下面两个处理函数。）
+	RAWINPUTDEVICE devices[2]{};
+	devices[0].usUsagePage = 0x01;
+	devices[0].usUsage = 0x06;   // keyboard
+	devices[0].dwFlags = RIDEV_INPUTSINK;
+	devices[0].hwndTarget = context->window;
+	devices[1].usUsagePage = 0x01;
+	devices[1].usUsage = 0x02;   // mouse
+	devices[1].dwFlags = RIDEV_INPUTSINK;
+	devices[1].hwndTarget = context->window;
+	context->rawInputRegistered = RegisterRawInputDevices(devices, 2, sizeof(devices[0])) != FALSE;
 	ShowWindow(context->window, SW_SHOW);
 	UpdateWindow(context->window);
 	SetEvent(context->readyEvent);
@@ -1620,111 +1615,60 @@ DWORD WINAPI ExitConfirmDesktopThreadProc(LPVOID parameter)
 		}
 	}
 	if (context->rawInputRegistered) {
-		keyboardDevice.dwFlags = RIDEV_REMOVE;
-		keyboardDevice.hwndTarget = nullptr;
-		RegisterRawInputDevices(&keyboardDevice, 1, sizeof(keyboardDevice));
+		for (auto& device : devices) {
+			device.dwFlags = RIDEV_REMOVE;
+			device.hwndTarget = nullptr;
+		}
+		RegisterRawInputDevices(devices, 2, sizeof(devices[0]));
 		context->rawInputRegistered = false;
 	}
 	return ERROR_SUCCESS;
 }
 
-LRESULT CALLBACK ExitConfirmEditProc(HWND edit, UINT message, WPARAM wParam, LPARAM lParam)
+// 输入只认真货。SendInput 造出来的 RAWINPUT 事件 hDevice 是空句柄，用 PostMessage
+// 直接投的鼠标消息根本不会产生 WM_INPUT —— 两条注入路径都过不了下面这两关。
+bool IsHardwareInput(const RAWINPUT& raw)
 {
-	auto* context = reinterpret_cast<ExitConfirmContext*>(GetWindowLongPtrW(edit, GWLP_USERDATA));
-	if (context && !context->updatingEdit &&
-		(message == WM_CHAR || message == WM_UNICHAR || message == WM_SYSCHAR ||
-			message == WM_KEYDOWN || message == WM_KEYUP ||
-			message == WM_SYSKEYDOWN || message == WM_SYSKEYUP ||
-			message == WM_IME_CHAR || message == WM_IME_COMPOSITION ||
-			message == WM_PASTE || message == WM_CUT || message == WM_CLEAR || message == WM_UNDO ||
-			message == WM_SETTEXT || message == EM_REPLACESEL)) {
-		// Physical key presses also produce legacy key messages after WM_INPUT.
-		// Drop those duplicates silently; only WM_INPUT is allowed to update text.
-		return 0;
+	return raw.header.hDevice != nullptr;
+}
+
+void HandleExitConfirmKeyboard(HWND window, ExitConfirmContext* context, const RAWINPUT& raw)
+{
+	const RAWKEYBOARD& keyboard = raw.data.keyboard;
+	if (!context || (keyboard.Flags & RI_KEY_BREAK) != 0) return;
+	// 只剩两个键有意义：回车确认，Esc 取消。走 RawInput 是为了不受焦点影响 ——
+	// 弹窗刚出来时焦点还没落稳，靠 WM_KEYDOWN 会漏掉第一下。
+	if (keyboard.VKey == VK_RETURN) {
+		if (!IsHardwareInput(raw)) return;
+		context->hardwareConfirm = true;
+		PostMessageW(window, WM_COMMAND, MAKEWPARAM(IDC_EXIT_CONFIRM_OK, BN_CLICKED), 0);
+		return;
 	}
-	return context && context->originalEditProc
-		? CallWindowProcW(context->originalEditProc, edit, message, wParam, lParam)
-		: DefWindowProcW(edit, message, wParam, lParam);
+	// 取消不设门槛：模拟出来的 Esc 最多少退一次，不值得为它挡掉真键盘。
+	if (keyboard.VKey == VK_ESCAPE)
+		PostMessageW(window, WM_COMMAND, MAKEWPARAM(IDC_EXIT_CONFIRM_CANCEL, BN_CLICKED), 0);
 }
 
-std::wstring MakeExitChallenge()
-{
-	static constexpr wchar_t digits[] = L"0123456789";
-	std::mt19937 generator(static_cast<unsigned int>(GetTickCount64() ^ (static_cast<ULONGLONG>(GetCurrentProcessId()) << 16)));
-	std::uniform_int_distribution<int> distribution(0, 9);
-	std::wstring result;
-	result.reserve(6);
-	for (int index = 0; index < 6; ++index) result.push_back(digits[distribution(generator)]);
-	return result;
-}
-
-void SetExitConfirmEditText(ExitConfirmContext* context, const std::wstring& value, size_t caret)
-{
-	if (!context || !context->edit) return;
-	context->updatingEdit = true;
-	SetWindowTextW(context->edit, value.c_str());
-	context->updatingEdit = false;
-	const LONG position = static_cast<LONG>((std::min)(caret, value.size()));
-	SendMessageW(context->edit, EM_SETSEL, position, position);
-}
-
-// 换一组新验证码。必须同时清空已输入的内容和错误态：
-// 旧数字对新码必然不匹配，留着只会让用户以为是自己打错了。
-void RefreshExitChallenge(ExitConfirmContext* context)
+void HandleExitConfirmMouse(HWND window, ExitConfirmContext* context, const RAWINPUT& raw)
 {
 	if (!context) return;
-	context->challenge = MakeExitChallenge();
-	context->value.clear();
-	context->invalidInput = false;
-	SetExitConfirmEditText(context, std::wstring(), 0);
-}
-
-void HandleExitConfirmKeyboard(HWND window, ExitConfirmContext* context, const RAWKEYBOARD& keyboard)
-{
-	if (!context || !context->edit || (keyboard.Flags & RI_KEY_BREAK) != 0) return;
-	context->sawPhysicalKeyboard = true;
-	if (keyboard.VKey == VK_RETURN) {
-		SendMessageW(window, WM_COMMAND, MAKEWPARAM(IDC_EXIT_CONFIRM_OK, BN_CLICKED), 0);
-		return;
-	}
-	if (keyboard.VKey == VK_ESCAPE) {
-		SendMessageW(window, WM_COMMAND, MAKEWPARAM(IDC_EXIT_CONFIRM_CANCEL, BN_CLICKED), 0);
-		return;
-	}
-
-	wchar_t digit = L'\0';
-	if (keyboard.VKey >= '0' && keyboard.VKey <= '9') {
-		if ((GetAsyncKeyState(VK_SHIFT) & 0x8000) == 0)
-			digit = static_cast<wchar_t>(keyboard.VKey);
-	}
-	else if (keyboard.VKey >= VK_NUMPAD0 && keyboard.VKey <= VK_NUMPAD9) {
-		digit = static_cast<wchar_t>(L'0' + (keyboard.VKey - VK_NUMPAD0));
-	}
-	if (digit == L'\0' && keyboard.VKey != VK_BACK) return;
-
-	wchar_t buffer[64]{};
-	GetWindowTextW(context->edit, buffer, _countof(buffer));
-	std::wstring value = buffer;
-	DWORD selectionStart = 0;
-	DWORD selectionEnd = 0;
-	SendMessageW(context->edit, EM_GETSEL, reinterpret_cast<WPARAM>(&selectionStart),
-		reinterpret_cast<LPARAM>(&selectionEnd));
-	const size_t start = (std::min)(static_cast<size_t>(selectionStart), value.size());
-	const size_t end = (std::min)(static_cast<size_t>(selectionEnd), value.size());
-	if (digit != L'\0') {
-		if (value.size() - (end - start) >= context->challenge.size()) return;
-		value.replace(start, end - start, 1, digit);
-		SetExitConfirmEditText(context, value, start + 1);
-		return;
-	}
-	if (start != end) {
-		value.erase(start, end - start);
-		SetExitConfirmEditText(context, value, start);
-	}
-	else if (start > 0) {
-		value.erase(start - 1, 1);
-		SetExitConfirmEditText(context, value, start - 1);
-	}
+	if ((raw.data.mouse.usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN) == 0) return;
+	if (!IsHardwareInput(raw)) return;
+	POINT cursor{};
+	if (!GetCursorPos(&cursor)) return;
+	// 「取消」自己有按钮窗口，点在它身上不算确认。
+	HWND cancel = GetDlgItem(window, IDC_EXIT_CONFIRM_CANCEL);
+	RECT cancelRect{};
+	if (cancel && GetWindowRect(cancel, &cancelRect) && PtInRect(&cancelRect, cursor)) return;
+	// 窗口是铺满整屏的 WS_POPUP，客户区原点和屏幕原点重合，所以光标位置
+	// 除以缩放比就是面板用的逻辑坐标。
+	const float scale = context->scale > 0.0f ? context->scale : 1.0f;
+	const float logicalX = static_cast<float>(cursor.x) / scale;
+	const float logicalY = static_cast<float>(cursor.y) / scale;
+	if (logicalX < context->panelX || logicalX > context->panelX + kExitPanelWidth) return;
+	if (logicalY < context->panelY || logicalY > context->panelY + kExitPanelHeight) return;
+	context->hardwareConfirm = true;
+	PostMessageW(window, WM_COMMAND, MAKEWPARAM(IDC_EXIT_CONFIRM_OK, BN_CLICKED), 0);
 }
 
 void PaintExitConfirm(HWND window, ExitConfirmContext* context)
@@ -1777,47 +1721,17 @@ void PaintExitConfirm(HWND window, ExitConfirmContext* context)
 		static_cast<float>(kExitPanelWidth), static_cast<float>(kExitPanelHeight));
 	FillRound(graphics, panel, kExitPanelRadius, C(d, 255, 255, 255, 38, 45, 42));
 
-	Text(graphics, L"确认退出 Dzjs Trainer", panelX + kExitPadX, panelY + kExitTitleY,
+	Text(graphics, L"退出 Dzjs Trainer？", panelX + kExitPadX, panelY + kExitTitleY,
 		static_cast<float>(kExitContentWidth), 30, 19, FontStyleBold,
 		C(d, 30, 36, 33, 225, 233, 229));
-	Text(graphics, L"为确认是本人操作，请在下方原样输入这组数字：",
+	Text(graphics, L"退出后训练器停止拦截，教室软件可以重新接管这台电脑。",
 		panelX + kExitPadX, panelY + kExitSubtitleY,
-		static_cast<float>(kExitContentWidth), 24, 11, FontStyleRegular,
+		static_cast<float>(kExitContentWidth), 22, 11, FontStyleRegular,
 		C(d, 81, 91, 86, 171, 183, 177));
-	Text(graphics, context->challenge.c_str(), panelX + kExitPadX, panelY + kExitCodeY,
-		static_cast<float>(kExitContentWidth), static_cast<float>(kExitCodeHeight), 25, FontStyleBold,
-		C(d, 0, 107, 95, 130, 213, 199), StringAlignmentCenter);
-	// 刷新倒计时：压在验证码同一行的右端，11px 小字，不占新行、不动任何几何。
-	// 不给它加底色或边框 —— 那会变成徽章，属于多余装饰。
-	if (context->shownSeconds >= 0) {
-		wchar_t countdown[16]{};
-		swprintf_s(countdown, L"%d 秒后刷新", context->shownSeconds);
-		Text(graphics, countdown,
-			panelX + kExitPadX + kExitContentWidth - kExitCountdownWidth,
-			panelY + kExitCodeY + 13,
-			static_cast<float>(kExitCountdownWidth), 20, 11, FontStyleRegular,
-			C(d, 150, 160, 155, 120, 132, 126), StringAlignmentFar);
-	}
-	Text(graphics, L"仅接受真实键盘按键，粘贴或程序模拟输入不会通过验证。",
+	Text(graphics, L"点一下面板任意处即退出，Esc 取消；只认真实鼠标，模拟输入无效。",
 		panelX + kExitPadX, panelY + kExitHintY,
 		static_cast<float>(kExitContentWidth), 22, 11, FontStyleRegular,
 		C(d, 91, 70, 20, 232, 211, 162), StringAlignmentCenter);
-	if (context->invalidInput) {
-		Text(graphics, L"输入不匹配或不是直接键盘输入，请重试。",
-			panelX + kExitPadX, panelY + kExitErrorY,
-			static_cast<float>(kExitContentWidth), 22, 11, FontStyleBold,
-			C(d, 155, 45, 36, 244, 178, 165), StringAlignmentCenter);
-	}
-
-	// 输入框外框。原来 EDIT 带 WS_EX_CLIENTEDGE，系统画 3D 凹陷直角边，
-	// 是整个界面上唯一一处非圆角控件边框；改成自绘一圈 1px 细边，
-	// 填充色与面板同色，所以观感上只是「一个描边圆角框」。
-	const RectF editFrame(panelX + kExitPadX, panelY + kExitEditY,
-		static_cast<float>(kExitContentWidth), static_cast<float>(kExitEditHeight));
-	FillRound(graphics, editFrame, kExitEditRadius, C(d, 255, 255, 255, 38, 45, 42));
-	StrokeRound(graphics, editFrame, kExitEditRadius,
-		context->invalidInput ? C(d, 226, 150, 140, 150, 60, 52)
-			: C(d, 205, 213, 209, 60, 70, 65));
 
 	// 内存里已经画完整了，这里一次性搬上屏 —— 窗口只收到这一次写操作，
 	// 不会出现「只画了底色」或「壁纸还没盖上面板」的中间帧。
@@ -1853,58 +1767,43 @@ LRESULT CALLBACK ExitConfirmProc(HWND window, UINT message, WPARAM wParam, LPARA
 		}
 		context->font = CreateFontW(AuxPx(window, 16), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
 			OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
-		// 与面板同色：外框填充也是这个色，所以输入框看起来只是「面板上的一个描边框」。
-		context->editBrush = CreateSolidBrush(ExitPanelColor(context->darkMode));
-		// 去掉 WS_EX_CLIENTEDGE（3D 凹陷直角边），缩进自绘圆角框里，四周各留 6px。
-		context->edit = CreateWindowExW(0, L"EDIT", L"",
-			WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_CENTER | ES_AUTOHSCROLL | ES_NUMBER,
-			AuxPx(window, context->panelX + kExitPadX + 11), AuxPx(window, context->panelY + kExitEditY + 6),
-			AuxPx(window, kExitContentWidth - 22), AuxPx(window, kExitEditHeight - 12), window,
-			reinterpret_cast<HMENU>(IDC_EXIT_CONFIRM_EDIT), GetModuleHandleW(nullptr), nullptr);
-		if (context->font) SendMessageW(context->edit, WM_SETFONT, reinterpret_cast<WPARAM>(context->font), TRUE);
-		SetWindowLongPtrW(context->edit, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(context));
-		context->originalEditProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(context->edit, GWLP_WNDPROC,
-			reinterpret_cast<LONG_PTR>(ExitConfirmEditProc)));
+		// owner-draw 按钮擦底用，和面板同色，四角才不会露出系统灰。
+		context->surfaceBrush = CreateSolidBrush(ExitPanelColor(context->darkMode));
 		const int buttonY = context->panelY + kExitButtonY;
 		const int cancelX = context->panelX + kExitPadX + kExitContentWidth - kExitButtonWidth;
 		const int okX = cancelX - kExitButtonGap - kExitButtonWidth;
-		HWND okButton = CreateWindowExW(0, L"BUTTON", L"确认退出",
+		HWND okButton = CreateWindowExW(0, L"BUTTON", L"退出程序",
 			WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-			okX, buttonY, kExitButtonWidth, kExitButtonHeight, window,
+			AuxPx(window, okX), AuxPx(window, buttonY),
+			AuxPx(window, kExitButtonWidth), AuxPx(window, kExitButtonHeight), window,
 			reinterpret_cast<HMENU>(IDC_EXIT_CONFIRM_OK), GetModuleHandleW(nullptr), nullptr);
 		HWND cancelButton = CreateWindowExW(0, L"BUTTON", L"取消",
 			WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-			cancelX, buttonY, kExitButtonWidth, kExitButtonHeight, window,
+			AuxPx(window, cancelX), AuxPx(window, buttonY),
+			AuxPx(window, kExitButtonWidth), AuxPx(window, kExitButtonHeight), window,
 			reinterpret_cast<HMENU>(IDC_EXIT_CONFIRM_CANCEL), GetModuleHandleW(nullptr), nullptr);
-		// 原来没注册悬停，这两个按钮是全界面唯一不响应鼠标的控件。
 		EnableNativeButtonHover(okButton);
 		EnableNativeButtonHover(cancelButton);
-		context->refreshDeadline = GetTickCount64() + kExitCodeRefreshSeconds * 1000ULL;
-		context->shownSeconds = static_cast<int>(kExitCodeRefreshSeconds);
-		SetTimer(window, kExitRefreshTimer, kExitRefreshTickMs, nullptr);
-		SetFocus(context->edit);
+		if (context->font) {
+			SendMessageW(okButton, WM_SETFONT, reinterpret_cast<WPARAM>(context->font), TRUE);
+			SendMessageW(cancelButton, WM_SETFONT, reinterpret_cast<WPARAM>(context->font), TRUE);
+		}
+		SetFocus(okButton);
 		return 0;
 	}
-	case WM_TIMER: {
-		if (wParam != kExitRefreshTimer) break;
-		const ULONGLONG now = GetTickCount64();
-		if (now >= context->refreshDeadline) {
-			RefreshExitChallenge(context);
-			context->refreshDeadline = now + kExitCodeRefreshSeconds * 1000ULL;
-			context->shownSeconds = static_cast<int>(kExitCodeRefreshSeconds);
-			InvalidateRect(window, nullptr, FALSE);
-			return 0;
+	case WM_LBUTTONDOWN: {
+		// 真点击已经在 WM_INPUT 里判过设备句柄，这条消息谁都能 Post，不当真。
+		// 只有 RawInput 没注册上的机器（极少数）才退回这里点哪算哪。
+		if (context->rawInputRegistered) return 0;
+		const int x = GET_X_LPARAM(lParam);
+		const int y = GET_Y_LPARAM(lParam);
+		const float scale = context->scale > 0.0f ? context->scale : 1.0f;
+		const float logicalX = static_cast<float>(x) / scale;
+		const float logicalY = static_cast<float>(y) / scale;
+		if (logicalX >= context->panelX && logicalX <= context->panelX + kExitPanelWidth &&
+			logicalY >= context->panelY && logicalY <= context->panelY + kExitPanelHeight) {
+			SendMessageW(window, WM_COMMAND, MAKEWPARAM(IDC_EXIT_CONFIRM_OK, BN_CLICKED), 0);
 		}
-		const int remaining = static_cast<int>((context->refreshDeadline - now + 999) / 1000);
-		if (remaining == context->shownSeconds) return 0;
-		context->shownSeconds = remaining;
-		// 只重画倒计时那一小块，不要每秒整窗重绘一遍。
-		RECT dirty{};
-		dirty.left = context->panelX + kExitPadX + kExitContentWidth - kExitCountdownWidth - 4;
-		dirty.top = context->panelY + kExitCodeY;
-		dirty.right = context->panelX + kExitPadX + kExitContentWidth;
-		dirty.bottom = context->panelY + kExitCodeY + kExitCodeHeight;
-		InvalidateRect(window, &dirty, FALSE);
 		return 0;
 	}
 	case WM_PAINT:
@@ -1928,36 +1827,28 @@ LRESULT CALLBACK ExitConfirmProc(HWND window, UINT message, WPARAM wParam, LPARA
 		return 0;
 	}
 	case WM_INPUT: {
-		UINT size = 0;
-		if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, nullptr, &size,
-			sizeof(RAWINPUTHEADER)) != static_cast<UINT>(-1) && size >= sizeof(RAWINPUTHEADER)) {
-			std::vector<BYTE> rawData(size);
-			if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, rawData.data(), &size,
-				sizeof(RAWINPUTHEADER)) == size) {
-				const auto* raw = reinterpret_cast<const RAWINPUT*>(rawData.data());
-				if (raw->header.dwType == RIM_TYPEKEYBOARD)
-					HandleExitConfirmKeyboard(window, context, raw->data.keyboard);
-			}
+		// 鼠标注册成 INPUTSINK 之后这条消息是高频的（每次移动都来一次），
+		// 用栈上的 RAWINPUT 接，别每次 new 一块 buffer。
+		RAWINPUT raw{};
+		UINT size = static_cast<UINT>(sizeof(raw));
+		const UINT copied = GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, &raw, &size,
+			sizeof(RAWINPUTHEADER));
+		if (copied != static_cast<UINT>(-1) && copied == size) {
+			if (raw.header.dwType == RIM_TYPEKEYBOARD)
+				HandleExitConfirmKeyboard(window, context, raw);
+			else if (raw.header.dwType == RIM_TYPEMOUSE)
+				HandleExitConfirmMouse(window, context, raw);
 		}
 		return 0;
 	}
-	case WM_PASTE:
-		context->invalidInput = true;
-		return 0;
 	case WM_COMMAND:
 		if (LOWORD(wParam) == IDC_EXIT_CONFIRM_OK) {
-			wchar_t buffer[64]{};
-			GetWindowTextW(context->edit, buffer, _countof(buffer));
-			context->value = buffer;
-			context->accepted = context->sawPhysicalKeyboard && !context->injectedInput &&
-				context->value == context->challenge;
-			if (context->accepted) DestroyWindow(window);
-			else {
-				context->invalidInput = true;
-				SetFocus(context->edit);
-				SendMessageW(context->edit, EM_SETSEL, 0, -1);
-				InvalidateRect(window, nullptr, FALSE);
-			}
+			// 按钮的 BN_CLICKED 分不出来源，所以门槛放在这里：没有真实输入打过招呼，
+			// 就算把 WM_COMMAND 直接投进来也不退。RawInput 没注册上的机器退回旧行为。
+			if (context->rawInputRegistered && !context->hardwareConfirm) return 0;
+			if (context->accepted) return 0;
+			context->accepted = true;
+			DestroyWindow(window);
 			return 0;
 		}
 		if (LOWORD(wParam) == IDC_EXIT_CONFIRM_CANCEL) {
@@ -1969,24 +1860,15 @@ LRESULT CALLBACK ExitConfirmProc(HWND window, UINT message, WPARAM wParam, LPARA
 		DestroyWindow(window);
 		return 0;
 	case WM_DESTROY:
-		// 定时器属于这个窗口，销毁前必须停掉，否则消息会投给一个正在拆的窗口。
-		KillTimer(window, kExitRefreshTimer);
 		PostQuitMessage(0);
 		return 0;
-	case WM_CTLCOLORSTATIC: {
-		HDC dc = reinterpret_cast<HDC>(wParam);
-		SetTextColor(dc, context->darkMode ? RGB(222, 230, 226) : RGB(35, 42, 39));
-		SetBkMode(dc, TRANSPARENT);
-		return reinterpret_cast<LRESULT>(GetStockObject(NULL_BRUSH));
-	}
-	case WM_CTLCOLOREDIT:
 	case WM_CTLCOLORBTN: {
 		// BTN 也要接管：owner-draw 按钮在 WM_DRAWITEM 之前会先用这个画刷擦一遍底，
 		// 不接管就是系统灰 RGB(240,240,240)，深色面板上一眼就看见。
 		HDC dc = reinterpret_cast<HDC>(wParam);
 		SetTextColor(dc, context->darkMode ? RGB(222, 230, 226) : RGB(35, 42, 39));
 		SetBkColor(dc, ExitPanelColor(context->darkMode));
-		return reinterpret_cast<LRESULT>(context->editBrush);
+		return reinterpret_cast<LRESULT>(context->surfaceBrush);
 	}
 	case WM_DRAWITEM: {
 		const auto* item = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
@@ -2000,16 +1882,9 @@ LRESULT CALLBACK ExitConfirmProc(HWND window, UINT message, WPARAM wParam, LPARA
 		break;
 	}
 	case WM_NCDESTROY:
-		if (context->edit && context->originalEditProc && IsWindow(context->edit)) {
-			SetWindowLongPtrW(context->edit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(context->originalEditProc));
-			context->originalEditProc = nullptr;
-		}
-		else {
-			context->originalEditProc = nullptr;
-		}
-		if (context->editBrush) {
-			DeleteObject(context->editBrush);
-			context->editBrush = nullptr;
+		if (context->surfaceBrush) {
+			DeleteObject(context->surfaceBrush);
+			context->surfaceBrush = nullptr;
 		}
 		if (context->font) {
 			DeleteObject(context->font);
@@ -2038,7 +1913,6 @@ bool ConfirmExit(HWND owner, bool darkMode)
 	ExitConfirmContext context;
 	context.owner = owner;
 	context.darkMode = darkMode;
-	context.challenge = MakeExitChallenge();
 	wchar_t wallpaperPath[MAX_PATH] = {};
 	if (SystemParametersInfoW(SPI_GETDESKWALLPAPER, _countof(wallpaperPath), wallpaperPath, 0))
 		context.wallpaperPath = wallpaperPath;
@@ -3729,6 +3603,8 @@ void MainWindow::ApplyTheme(bool dark, bool fromSystem)
 	advancedFieldBrush = CreateSolidBrush(dark ? RGB(26, 33, 30) : RGB(255, 255, 255));
 	if (processPickerFieldBrush) DeleteObject(processPickerFieldBrush);
 	processPickerFieldBrush = CreateSolidBrush(dark ? RGB(26, 33, 30) : RGB(255, 255, 255));
+	if (feedbackFieldBrush) DeleteObject(feedbackFieldBrush);
+	feedbackFieldBrush = CreateSolidBrush(dark ? RGB(38, 45, 42) : RGB(243, 247, 245));
 	for (HWND control : networkControls) if (control) InvalidateRect(control, nullptr, TRUE);
 	for (HWND control : advancedControls) if (control) InvalidateRect(control, nullptr, TRUE);
 	if (processPickerSearchEdit) InvalidateRect(processPickerSearchEdit, nullptr, TRUE);
@@ -3750,6 +3626,7 @@ MainWindow::~MainWindow()
 	if (controlSurfaceBrush) DeleteObject(controlSurfaceBrush);
 	if (advancedFieldBrush) DeleteObject(advancedFieldBrush);
 	if (processPickerFieldBrush) DeleteObject(processPickerFieldBrush);
+	if (feedbackFieldBrush) DeleteObject(feedbackFieldBrush);
 	if (controlFont) DeleteObject(controlFont);
 	ReleaseBackBuffer();
 	// Member destructors run AFTER this body, so every object holding a GDI+ type
@@ -4011,6 +3888,7 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 		self->LayoutEmbeddedWindows();
 		// 搜索框是原生子窗口，几何跟着卡片走，缩放时要跟着挪。
 		self->PositionProcessPickerSearchEdit();
+		self->PositionFeedbackEdits();
 		InvalidateRect(hwnd, nullptr, FALSE);
 		return 0;
 	}
@@ -4108,6 +3986,22 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 			}
 			return 0;
 		}
+		if (self->FeedbackDialogVisible()) {
+			self->pressTarget = self->HitFeedbackDialogAt(point);
+			if (self->pressTarget >= 0) {
+				self->EnsureAnimationTimer();
+				InvalidateRect(hwnd, nullptr, FALSE);
+			}
+			return 0;
+		}
+		if (self->ProtectDialogVisible()) {
+			self->pressTarget = self->HitProtectDialogAt(point);
+			if (self->pressTarget >= 0) {
+				self->EnsureAnimationTimer();
+				InvalidateRect(hwnd, nullptr, FALSE);
+			}
+			return 0;
+		}
 		if (self->UpdateDialogVisible()) {
 			self->pressTarget = self->HitUpdateDialogAt(point);
 			if (self->pressTarget >= 0) {
@@ -4143,6 +4037,38 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 				return 0;
 			}
 			self->HandleProcessPickerKey(message, wParam);
+			return 0;
+		}
+		// 反馈弹窗里焦点一般在 EDIT 上，那边自己处理 Esc；这条是焦点
+		// 停在按钮上时的兜底。
+		if (self->FeedbackDialogVisible()) {
+			if (wParam == VK_ESCAPE) {
+				self->CloseFeedbackDialog();
+				return 0;
+			}
+			if (wParam == VK_TAB) {
+				// 焦点落在主窗口上，说明停在按钮那两站；站号接在输入框后面。
+				const int from = self->focusTarget == kFeedbackSubmit ? 3 : 4;
+				self->CycleFeedbackFocus(from, (GetKeyState(VK_SHIFT) & 0x8000) ? -1 : 1);
+				return 0;
+			}
+			if (wParam == VK_RETURN || wParam == VK_SPACE) {
+				if (self->focusTarget == kFeedbackSubmit) self->SubmitFeedback();
+				else if (self->focusTarget == kFeedbackCancel) self->CloseFeedbackDialog();
+				return 0;
+			}
+			return 0;
+		}
+		// 防护信息面板只有一个「关闭」，Esc 和回车都当关掉。
+		if (self->ProtectDialogVisible()) {
+			if (wParam == VK_ESCAPE || wParam == VK_RETURN || wParam == VK_SPACE) {
+				self->CloseProtectDialog();
+				return 0;
+			}
+			if (wParam == VK_TAB) {
+				self->MoveFocus((GetKeyState(VK_SHIFT) & 0x8000) != 0);
+				return 0;
+			}
 			return 0;
 		}
 		// 录制快捷键时，主键先归这里，别让 DefWindowProc 抢去（Alt 会拉系统菜单）。
@@ -4211,6 +4137,13 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 		HDC controlDc = reinterpret_cast<HDC>(wParam);
 		// 高级配置页的输入框要跟自绘的圆角框同色，否则控件那块方底色会顶出来。
 		const int controlId = GetDlgCtrlID(reinterpret_cast<HWND>(lParam));
+		if (controlId == kFeedbackDescEdit || controlId == kFeedbackReproEdit ||
+			controlId == kFeedbackContactEdit) {
+			SetTextColor(controlDc, self->darkMode ? RGB(232, 238, 235) : RGB(26, 30, 28));
+			SetBkColor(controlDc, self->darkMode ? RGB(38, 45, 42) : RGB(243, 247, 245));
+			if (!self->feedbackFieldBrush) break;
+			return reinterpret_cast<LRESULT>(self->feedbackFieldBrush);
+		}
 		if (controlId == kProcessPickerSearch) {
 			// 搜索框的方底色必须和自绘的圆角填充一模一样，否则圆角里会露出一个白/灰方块。
 			SetTextColor(controlDc, self->darkMode ? RGB(232, 238, 235) : RGB(26, 30, 28));
@@ -4296,6 +4229,45 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 		return 0;
 	}
 	case WM_MY_SCAN_IP_FINISH: self->AppendNetworkResult(L"\u5c40\u57df\u7f51\u626b\u63cf\u5b8c\u6210"); return 0;
+	case WM_QUERYENDSESSION: {
+		// 只要不是电源菜单发起的关机，一律投否决票 —— 极域远程关机、别的程序
+		// 调 ExitWindowsEx 都会走到这里。返回 FALSE 之后系统会撤掉这次关机，
+		// 并在关机界面上显示下面这句原因。ENDSESSION_CRITICAL 是系统自己
+		// 要关（更新重启之类），拦也拦不住，别白拦。
+		//
+		// 这一层只能挡住**没带 EWX_FORCE** 的关机。教师端的关机基本都带 force，
+		// 那时系统照样结束进程、照样关 —— 2026-11-21 那次「拦截没成功」就是这个
+		// 原因：日志里有 Blocked，机器还是关了。真正拦住的是 Hooks 里在
+		// ExitWindowsEx / InitiateSystemShutdownEx 上做的那组（blockShutdown）。
+		// 这里保留，是因为开始菜单、计划任务这些走的是正常协商路径。
+		if (self->allowShutdown || (lParam & ENDSESSION_CRITICAL) != 0) return TRUE;
+		ShutdownBlockReasonCreate(hwnd, L"Dzjs Trainer \u5df2\u62e6\u622a\u672c\u6b21\u5173\u673a\u8bf7\u6c42");
+		// InitiateSystemShutdownEx 起的关机可以用 AbortSystemShutdown 撤掉；
+		// 对普通 ExitWindowsEx 会报「没有正在进行的关机」，无害。
+		AbortSystemShutdownW(nullptr);
+		PostMessageW(hwnd, WM_MY_SHUTDOWN_BLOCKED, (lParam & ENDSESSION_LOGOFF) ? 1 : 0, 0);
+		return FALSE;
+	}
+	case WM_ENDSESSION:
+		// wParam 为 FALSE 表示关机被取消了，原因文本要跟着撤掉，否则下次
+		// 关机屏幕上会挂一句过期的话。
+		if (!wParam) ShutdownBlockReasonDestroy(hwnd);
+		return 0;
+	case WM_MY_FEEDBACK_DONE:
+		self->OnFeedbackSubmitted();
+		return 0;
+	case WM_MY_SHUTDOWN_BLOCKED: {
+		const bool logoff = wParam != 0;
+		if (self->currentLogger) {
+			self->currentLogger->LogWarn(logoff ? L"Blocked a logoff request from another process"
+				: L"Blocked a shutdown/restart request from another process");
+		}
+		if (!IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_SHOW);
+		SetForegroundWindow(hwnd);
+		self->ShowFastTip(logoff ? L"\u5df2\u62e6\u622a\u6ce8\u9500\u8bf7\u6c42\uff1b\u8981\u6ce8\u9500\u8bf7\u5148\u9000\u51fa Dzjs Trainer"
+			: L"\u5df2\u62e6\u622a\u5173\u673a\u8bf7\u6c42\uff1b\u8981\u5173\u673a\u8bf7\u7528 \u7535\u6e90\u63a7\u5236");
+		return 0;
+	}
 	case WM_CLOSE:
 		if (!self->closeButtonClickPending) return 0;
 		self->closeButtonClickPending = false;
@@ -4430,6 +4402,8 @@ void MainWindow::Paint()
 	PaintToast(g, width, height);
 	// 弹窗画在最后：提示条、页面内容、焦点环都得在它下面。
 	PaintUpdateDialog(g, width, height);
+	PaintProtectDialog(g, width, height);
+	PaintFeedbackDialog(g, width, height);
 	PaintProcessPicker(g, width, height);
 	// 直接 BitBlt 到窗口 DC：比 Graphics::DrawImage 快约 45 倍。
 	// BeginPaint 拿到的 DC 已经按更新区裁剪，被子控件挡住的部分不会覆盖。
@@ -6929,6 +6903,11 @@ void MainWindow::PaintAbout(Graphics& g, int width, int height, int offsetY)
 	Text(g, L"\u4f7f\u7528\u63d0\u793a", x + 64, y + 468, 120, 22, 12, FontStyleBold, C(darkMode, 91, 66, 0, 255, 220, 141));
 	Text(g, L"\u8bf7\u4ec5\u5728\u5408\u6cd5\u3001\u6388\u6743\u7684\u73af\u5883\u4e2d\u4f7f\u7528\uff0c\u64cd\u4f5c\u524d\u8bf7\u9605\u8bfb\u5e2e\u52a9\u548c\u5f53\u524d\u65e5\u5fd7\u3002", x + 64, y + 500, w - 128, 22, 11, FontStyleRegular, C(darkMode, 91, 70, 20, 232, 211, 162));
 
+	// 「检查更新」旁边再放一个次要动作。反馈是低频操作，用 Ghost 描边，
+	// 不和那个实心按钮抢注意力。
+	aboutFeedbackRect = { static_cast<LONG>(x + 366), static_cast<LONG>(y + 153),
+		static_cast<LONG>(x + 516), static_cast<LONG>(y + 193) };
+	PaintButton(g, RectF(x + 366, y + 153, 150, 40), L"意见反馈", kAboutFeedback, ButtonStyle::Ghost, 20, 3);
 	aboutExitRect = { static_cast<LONG>(x + w - 184), static_cast<LONG>(y + h - 56), static_cast<LONG>(x + w - 42), static_cast<LONG>(y + h - 14) };
 	PaintButton(g, RectF(x + w - 184, y + h - 56, 142, 42), L"\u9000\u51fa\u8f6f\u4ef6", 73, ButtonStyle::Danger, 21, 5);
 }
@@ -7148,6 +7127,1153 @@ void MainWindow::PaintUpdateDialog(Graphics& g, int width, int height)
 				fade(primary), 2.0f);
 		}
 	}
+}
+
+// 「防护状态」快捷卡点开的信息面板。概览页那张卡只放得下一个结论，
+// 用户想知道这个结论是怎么来的时没地方可点 —— 这里把运行时快照摊开。
+// 全部只读，没有开关：要改设置去「防护策略」页，这里不抢那份活。
+void MainWindow::PaintProtectDialog(Graphics& g, int width, int height)
+{
+	if (!protectDialogVisible) return;
+	const bool d = darkMode;
+	const float appear = (std::max)(0.0f, (std::min)(1.0f, protectDialogAppear));
+	auto fade = [appear](const Color& color) {
+		return Color(static_cast<BYTE>(color.GetA() * appear), color.GetR(), color.GetG(), color.GetB());
+	};
+	const Color onSurface = C(d, 26, 30, 28, 232, 238, 235);
+	const Color onSurfaceVariant = C(d, 96, 104, 100, 168, 179, 174);
+	const Color outline = C(d, 130, 139, 134, 138, 149, 144);
+	const Color primary = C(d, 0, 107, 95, 130, 213, 199);
+	const Color container = C(d, 243, 247, 245, 38, 45, 42);
+
+	// 和更新弹窗同一层 scrim，底下那页按住不动。
+	{
+		SolidBrush veil(Color(static_cast<BYTE>((d ? 115.0f : 82.0f) * appear), 0, 0, 0));
+		g.FillRectangle(&veil, 0, 0, width, height);
+	}
+
+	const float rowHeight = 34.0f;
+	const float tableTop = 100.0f;
+	const float cardW = (std::max)(420.0f, (std::min)(560.0f, static_cast<float>(width) - 96.0f));
+	const float rowsHeight = rowHeight * static_cast<float>(protectRows.size());
+	const float cardH = tableTop + rowsHeight + 16.0f + 40.0f + 24.0f;
+	const float cardX = (static_cast<float>(width) - cardW) / 2.0f;
+	const float cardY = (static_cast<float>(height) - cardH) / 2.0f + (1.0f - appear) * 10.0f;
+
+	SoftShadow(g, RectF(cardX, cardY, cardW, cardH), 28.0f, d, 1.6f * appear);
+	FillRound(g, RectF(cardX, cardY, cardW, cardH), 28.0f, fade(container));
+
+	DrawIcon(g, 1, cardX + 24.0f, cardY + 26.0f, fade(primary), 24);
+	Text(g, protectHeadline.c_str(), cardX + 58.0f, cardY + 24.0f, cardW - 82.0f, 26.0f, 20,
+		FontStyleBold, fade(onSurface));
+	TextSingleLine(g, protectSummary.c_str(), cardX + 24.0f, cardY + 56.0f, cardW - 48.0f, 18.0f, 12,
+		FontStyleRegular, fade(onSurfaceVariant));
+	{
+		Pen pen(fade(outline), 1.0f);
+		g.DrawLine(&pen, cardX + 24.0f, cardY + 88.0f, cardX + cardW - 24.0f, cardY + 88.0f);
+	}
+
+	// 左标签右值。值里可能带服务名或产品名，用单行省略号收尾，别折行顶到下一行。
+	const float labelWidth = 104.0f;
+	const float valueX = cardX + 24.0f + labelWidth + 12.0f;
+	const float valueW = cardW - 48.0f - labelWidth - 12.0f;
+	for (size_t i = 0; i < protectRows.size(); ++i) {
+		const float rowY = cardY + tableTop + rowHeight * static_cast<float>(i);
+		TextSingleLine(g, protectRows[i].label.c_str(), cardX + 24.0f, rowY + 8.0f, labelWidth, 18.0f,
+			11, FontStyleRegular, fade(onSurfaceVariant));
+		TextSingleLine(g, protectRows[i].value.c_str(), valueX, rowY + 7.0f, valueW, 20.0f,
+			12, FontStyleBold, fade(onSurface));
+	}
+
+	const float buttonW = 88.0f;
+	const float buttonH = 40.0f;
+	const RectF closeRect(cardX + cardW - 24.0f - buttonW, cardY + cardH - 24.0f - buttonH,
+		buttonW, buttonH);
+	PaintButton(g, closeRect, L"\u5173\u95ed", kProtectDialogClose, ButtonStyle::Ghost, 20.0f);
+	protectDialogCloseRect = { static_cast<LONG>(closeRect.X), static_cast<LONG>(closeRect.Y),
+		static_cast<LONG>(closeRect.X + closeRect.Width), static_cast<LONG>(closeRect.Y + closeRect.Height) };
+
+	if (focusTarget == kProtectDialogClose) {
+		StrokeRound(g, RectF(closeRect.X - 3.0f, closeRect.Y - 3.0f, closeRect.Width + 6.0f,
+			closeRect.Height + 6.0f), 23.0f, fade(primary), 2.0f);
+	}
+}
+
+void MainWindow::OpenProtectDialog()
+{
+	// 先问驱动状态：它要碰 SCM，别把它关在状态锁里。
+	// 这里用 CurrentDriverStatus() 而不是 XDriverLoaded() —— 后者只看本进程有没有
+	// 设备句柄，驱动被别的实例加载时会误报成没装。
+	const DriverStatusInfo& driver = CurrentDriverStatus();
+	std::wstring driverText;
+	if (driver.handleOpen) {
+		driverText = driver.serviceName.empty() ? L"\u5df2\u52a0\u8f7d"
+			: (L"\u5df2\u52a0\u8f7d \u00b7 " + driver.serviceName);
+	}
+	else if (driver.serviceRunning) {
+		driverText = driver.serviceName.empty() ? L"\u670d\u52a1\u5728\u8fd0\u884c\uff0c\u672c\u8fdb\u7a0b\u672a\u8fde\u63a5"
+			: (L"\u670d\u52a1 " + driver.serviceName + L" \u5728\u8fd0\u884c\uff0c\u672c\u8fdb\u7a0b\u672a\u8fde\u63a5");
+	}
+	else if (driver.serviceExists) {
+		driverText = driver.serviceName.empty() ? L"\u670d\u52a1\u5df2\u5b89\u88c5\uff0c\u672a\u8fd0\u884c"
+			: (L"\u670d\u52a1 " + driver.serviceName + L" \u5df2\u5b89\u88c5\uff0c\u672a\u8fd0\u884c");
+	}
+	else {
+		driverText = L"\u672a\u5b89\u88c5";
+	}
+
+	// 快照这段要在状态锁里读，和 PaintOverview 一个口径。抓完立刻放锁：
+	// 下面 SetForegroundWindow / SetFocus 会同步回调窗口过程，那些路径也走
+	// stateMutex，持着锁进去就是自己等自己。
+	{
+		std::lock_guard<std::mutex> guard(stateMutex);
+		protectRows.clear();
+		auto addRow = [this](const wchar_t* label, const std::wstring& value) {
+			if (value.empty()) return;
+			ProtectInfoRow row;
+			row.label = label;
+			row.value = value;
+			protectRows.push_back(std::move(row));
+		};
+
+		std::wstring hostText;
+		if (studentRunning) {
+			wchar_t buffer[64] = {};
+			swprintf_s(buffer, L"StudentMain.exe \u00b7 PID %lu", static_cast<unsigned long>(studentPid));
+			hostText = buffer;
+		}
+		else if (eduHostCount > 0) {
+			hostText = L"\u5176\u4ed6\u6559\u5ba4 " + std::to_wstring(eduHostCount) + L" \u4e2a";
+		}
+		else if (!eduHostSummary.empty()) {
+			hostText = L"\u5f85\u63a5\u7ba1\uff08\u8fdb\u7a0b\u5728\u8fd0\u884c\uff09";
+		}
+		else {
+			hostText = L"\u672a\u8fd0\u884c";
+		}
+
+		// 五个阻止类开关里开了几个。这里不做成一行一项：它只回答
+		// 我上次关掉的那个是不是还关着，逐项明细在「防护策略」页。
+		int blocked = 0;
+		if (setProhibitKillProcess) ++blocked;
+		if (setProhibitCloseWindow) ++blocked;
+		if (setBandAllRunOp) ++blocked;
+		if (setBlockWindowOps) ++blocked;
+		if (setBlockDriverAccess) ++blocked;
+		wchar_t blockText[32] = {};
+		swprintf_s(blockText, L"%d / 5 \u9879", blocked);
+
+		std::wstring version = DisplayVersion(ReadOwnFileVersion());
+		addRow(L"\u603b\u4f53\u72b6\u6001", currentControlled ? L"\u5b8c\u6574\u9632\u62a4" : L"\u6b63\u5728\u76d1\u63a7");
+		addRow(L"\u53d7\u63a7\u5bbf\u4e3b", hostText);
+		if (!eduHostSummary.empty()) addRow(L"\u5df2\u63a5\u7ba1\u6559\u5ba4", eduHostSummary);
+		addRow(L"\u4e3b\u9a71\u52a8", driverText);
+		addRow(L"\u81ea\u6211\u4fdd\u62a4", advSelfProtect ? L"\u5df2\u5f00\u542f" : L"\u5df2\u5173\u95ed");
+		addRow(L"\u62e6\u622a\u7b56\u7565", blockText);
+		addRow(L"\u7248\u672c", version.empty() ? L"\u672a\u77e5" : version);
+		addRow(L"\u6784\u5efa\u65f6\u95f4", JTBuildDateWide());
+
+		protectSummary = currentControlled
+			? L"\u94a9\u5b50\u4e0e\u5185\u6838\u4fdd\u62a4\u90fd\u5728\u5de5\u4f5c\uff0c\u7ed3\u675f\u8fdb\u7a0b\u3001\u5173\u673a\u548c\u6293\u5c4f\u8bf7\u6c42\u4f1a\u88ab\u62e6\u4e0b"
+			: L"\u9632\u62a4\u670d\u52a1\u6b63\u5728\u76d1\u63a7\uff0c\u90e8\u5206\u80fd\u529b\u8981\u7b49\u4e3b\u9a71\u52a8\u52a0\u8f7d\u540e\u624d\u751f\u6548";
+	}
+
+	protectHeadline = L"\u9632\u62a4\u72b6\u6001";
+	protectDialogVisible = true;
+	protectDialogAppear = 0.0f;
+	protectDialogCloseRect = {};
+	focusTarget = -1;
+	hoverTarget = -1;
+	pressTarget = -1;
+	ApplyDialogOcclusion();
+	SetForegroundWindow(_hWnd);
+	SetFocus(_hWnd);
+	EnsureAnimationTimer();
+	InvalidateRect(_hWnd, nullptr, FALSE);
+}
+
+void MainWindow::CloseProtectDialog()
+{
+	protectDialogVisible = false;
+	protectDialogAppear = 0.0f;
+	protectDialogCloseRect = {};
+	focusTarget = -1;
+	hoverTarget = -1;
+	pressTarget = -1;
+	ApplyDialogOcclusion();
+	InvalidateRect(_hWnd, nullptr, FALSE);
+}
+
+int MainWindow::HitProtectDialogAt(POINT point) const
+{
+	if (!protectDialogVisible) return -1;
+	if (!IsRectEmpty(&protectDialogCloseRect) && Hit(protectDialogCloseRect, point))
+		return kProtectDialogClose;
+	return -1;
+}
+
+bool MainWindow::HandleProtectDialogClick(POINT point)
+{
+	if (!protectDialogVisible) return false;
+	// 卡片外点一下也关：这面板没有别的操作，留在屏幕上只会挡住概览。
+	// 所以命中的是关闭按钮还是空白，结果一样。
+	CloseProtectDialog();
+	(void)point;
+	return true;
+}
+
+// ---------------------------------------------------------------- feedback
+//
+// 「意见反馈」：自绘卡片 + 三个原生 EDIT。输入必须是真控件 —— 中文输入法的
+// 组合串、光标、选区、右键菜单、剪贴板只有真控件才走系统那套（进程选择器当年
+// 就是自绘输入框，在中文输入法下等于死的，见 EnsureProcessPickerSearchEdit）。
+//
+// 打包和上传都放在后台线程：日志可能几 MB，压缩几百毫秒，上传还得看网络。
+// 这一整套压在主线程上，窗口会直接白掉。
+
+namespace
+{
+	// 一个待打包的文件：source 是磁盘上的实际路径，zipName 是包内名字。
+	// zipName 保持纯 ASCII —— 包里没必要出现中文，出问题时要靠肉眼读、
+	// 靠脚本查，名字越简单越好。
+	struct FeedbackBundleEntry {
+		std::wstring source;
+		std::wstring zipName;
+	};
+
+	// 一次提交作业。UI 线程填好字段，工作线程只读；结果在最后用 mutex 交接。
+	struct FeedbackJob {
+		HWND window = nullptr;
+		std::wstring tempDir;
+		std::wstring bundlePath;
+		std::wstring metaJson;
+		std::wstring systemText;
+		std::wstring feedbackText;
+		std::vector<FeedbackBundleEntry> entries;
+		std::mutex mutex;
+		bool ok = false;
+		std::wstring message;
+	};
+
+	std::shared_ptr<FeedbackJob> g_feedbackJob;
+
+	struct FeedbackGeometry {
+		RectF card;
+		RectF descLabel;
+		RectF descBox;
+		RectF reproLabel;
+		RectF reproBox;
+		RectF contactLabel;
+		RectF contactBox;
+	};
+
+	// 卡片几何两处共用：PaintFeedbackDialog 画框，PositionFeedbackEdits 把
+	// EDIT 摆进框里。分开算的话改一个数字就要同步两处，迟早错位。
+	FeedbackGeometry ComputeFeedbackGeometry(int width, int height)
+	{
+		FeedbackGeometry geo;
+		float cardW = 600.0f;
+		if (static_cast<float>(width) - 96.0f < cardW) cardW = static_cast<float>(width) - 96.0f;
+		if (cardW < 420.0f) cardW = 420.0f;
+		const float cardH = 588.0f;
+		geo.card = RectF((static_cast<float>(width) - cardW) / 2.0f,
+			(static_cast<float>(height) - cardH) / 2.0f, cardW, cardH);
+		const float x = geo.card.X + 24.0f;
+		const float y = geo.card.Y;
+		const float w = cardW - 48.0f;
+		geo.descLabel = RectF(x, y + 116.0f, w, 18.0f);
+		geo.descBox = RectF(x, y + 138.0f, w, 92.0f);
+		geo.reproLabel = RectF(x, y + 240.0f, w, 18.0f);
+		geo.reproBox = RectF(x, y + 262.0f, w, 104.0f);
+		geo.contactLabel = RectF(x, y + 376.0f, w, 18.0f);
+		geo.contactBox = RectF(x, y + 398.0f, w, 36.0f);
+		return geo;
+	}
+
+	RECT ToRect(const RectF& rect)
+	{
+		RECT out{};
+		out.left = static_cast<LONG>(rect.X);
+		out.top = static_cast<LONG>(rect.Y);
+		out.right = static_cast<LONG>(rect.X + rect.Width);
+		out.bottom = static_cast<LONG>(rect.Y + rect.Height);
+		return out;
+	}
+
+	std::wstring JsonEscape(const std::wstring& text)
+	{
+		std::wstring out;
+		out.reserve(text.size() + 32);
+		for (wchar_t ch : text) {
+			switch (ch) {
+			case L'"': out += L"\\\""; break;
+			case L'\\': out += L"\\\\"; break;
+			case L'\n': out += L"\\n"; break;
+			case L'\r': out += L"\\r"; break;
+			case L'\t': out += L"\\t"; break;
+			default:
+				if (ch < 0x20 || ch == 0x7F) {
+					wchar_t buffer[8] = {};
+					swprintf_s(buffer, L"\\u%04X", static_cast<unsigned>(ch));
+					out += buffer;
+				}
+				else {
+					out.push_back(ch);
+				}
+				break;
+			}
+		}
+		return out;
+	}
+
+	std::wstring ReadControlText(HWND edit)
+	{
+		if (!edit) return std::wstring();
+		const int length = GetWindowTextLengthW(edit);
+		if (length <= 0) return std::wstring();
+		std::vector<wchar_t> buffer(static_cast<size_t>(length) + 1, L'\0');
+		GetWindowTextW(edit, buffer.data(), length + 1);
+		return std::wstring(buffer.data(), static_cast<size_t>(length));
+	}
+
+	// 去掉首尾空白，统一换行成 \n，再按上限截断。后面要塞进 JSON，
+	// 两套换行混着只会让服务端多一层判断。
+	std::wstring NormalizeMultiline(const std::wstring& text, size_t limit)
+	{
+		std::wstring out;
+		out.reserve(text.size());
+		for (wchar_t ch : text) {
+			if (ch == L'\r') continue;
+			out.push_back(ch);
+		}
+		const size_t begin = out.find_first_not_of(L" \t\n");
+		if (begin == std::wstring::npos) return std::wstring();
+		const size_t end = out.find_last_not_of(L" \t\n");
+		out = out.substr(begin, end - begin + 1);
+		if (out.size() > limit) {
+			out.resize(limit);
+			out += L"…";
+		}
+		return out;
+	}
+
+	bool WriteUtf8File(const std::wstring& path, const std::wstring& text)
+	{
+		std::string bytes;
+		if (!text.empty()) {
+			const int count = WideCharToMultiByte(CP_UTF8, 0, text.c_str(),
+				static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+			if (count <= 0) return false;
+			bytes.resize(static_cast<size_t>(count));
+			WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()),
+				&bytes[0], count, nullptr, nullptr);
+		}
+		HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+			FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (file == INVALID_HANDLE_VALUE) return false;
+		DWORD written = 0;
+		const bool ok = bytes.empty() ||
+			(WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) &&
+				written == bytes.size());
+		CloseHandle(file);
+		return ok;
+	}
+
+	// 日志超过 limit 时只取尾部。崩溃、注入失败这些要查的东西都在最后几屏，
+	// 前面是几小时的正常运行记录；整包带上去只是给服务器添个几十 MB 的包袱。
+	bool AddLogEntry(std::vector<FeedbackBundleEntry>& entries, const std::wstring& source,
+		const std::wstring& zipName, const std::wstring& tempDir, unsigned long long limit,
+		unsigned int serial)
+	{
+		WIN32_FILE_ATTRIBUTE_DATA info{};
+		if (!GetFileAttributesExW(source.c_str(), GetFileExInfoStandard, &info)) return false;
+		const unsigned long long size = (static_cast<unsigned long long>(info.nFileSizeHigh) << 32) |
+			info.nFileSizeLow;
+		if (size <= limit) {
+			entries.push_back({ source, zipName });
+			return true;
+		}
+
+		HANDLE file = CreateFileW(source.c_str(), GENERIC_READ,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+			FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (file == INVALID_HANDLE_VALUE) return false;
+		LARGE_INTEGER offset{};
+		offset.QuadPart = static_cast<LONGLONG>(size - limit);
+		std::string tail;
+		if (SetFilePointerEx(file, offset, nullptr, FILE_BEGIN)) {
+			tail.resize(static_cast<size_t>(limit));
+			DWORD read = 0;
+			if (ReadFile(file, &tail[0], static_cast<DWORD>(tail.size()), &read, nullptr))
+				tail.resize(read);
+			else
+				tail.clear();
+		}
+		CloseHandle(file);
+		if (tail.empty()) return false;
+
+		wchar_t name[64] = {};
+		swprintf_s(name, L"tail-%u.log", serial);
+		const std::wstring tempPath = tempDir + L"\\" + name;
+		HANDLE out = CreateFileW(tempPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+			FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (out == INVALID_HANDLE_VALUE) return false;
+		DWORD written = 0;
+		const bool ok = WriteFile(out, tail.data(), static_cast<DWORD>(tail.size()), &written,
+			nullptr) && written == tail.size();
+		CloseHandle(out);
+		if (!ok) return false;
+		entries.push_back({ tempPath, zipName });
+		return true;
+	}
+
+	// 自己写一个 store-only 的 zip。仓库里的 XZip 没编进工程，而它那套
+	// info-zip 派生的代码只为「加几个文件」引进来不划算；这边只用到四种结构：
+	// 本地文件头、中央目录项、目录结束记录，外加一个 CRC-32。
+	//
+	// 不压缩是权衡后的选择：当天日志限到 1.5 MB，压不压都在 2 MB 上下，
+	// 换来的是不引依赖、包内名字完全可控（纯 ASCII，不会在别的工具里乱码）。
+	void AppendLe16(std::string& out, unsigned value)
+	{
+		out.push_back(static_cast<char>(value & 0xFF));
+		out.push_back(static_cast<char>((value >> 8) & 0xFF));
+	}
+
+	void AppendLe32(std::string& out, unsigned value)
+	{
+		AppendLe16(out, value & 0xFFFF);
+		AppendLe16(out, (value >> 16) & 0xFFFF);
+	}
+
+	unsigned Crc32(const unsigned char* data, size_t size)
+	{
+		static unsigned table[256] = {};
+		static bool ready = false;
+		// 只在反馈打包线程里调用，静态初始化不存在并发问题。
+		if (!ready) {
+			for (unsigned i = 0; i < 256; ++i) {
+				unsigned value = i;
+				for (int bit = 0; bit < 8; ++bit)
+					value = (value & 1) ? (0xEDB88320u ^ (value >> 1)) : (value >> 1);
+				table[i] = value;
+			}
+			ready = true;
+		}
+		unsigned crc = 0xFFFFFFFFu;
+		for (size_t i = 0; i < size; ++i)
+			crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+		return crc ^ 0xFFFFFFFFu;
+	}
+
+	std::string Utf8Of(const std::wstring& text)
+	{
+		if (text.empty()) return std::string();
+		const int count = WideCharToMultiByte(CP_UTF8, 0, text.c_str(),
+			static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+		if (count <= 0) return std::string();
+		std::string out(static_cast<size_t>(count), '\0');
+		WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()),
+			&out[0], count, nullptr, nullptr);
+		return out;
+	}
+
+	bool ReadFileBytes(const std::wstring& path, size_t limit, std::string& out)
+	{
+		out.clear();
+		HANDLE file = CreateFileW(path.c_str(), GENERIC_READ,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+			FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (file == INVALID_HANDLE_VALUE) return false;
+		LARGE_INTEGER size{};
+		if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 ||
+			static_cast<unsigned long long>(size.QuadPart) > limit) {
+			CloseHandle(file);
+			return false;
+		}
+		out.resize(static_cast<size_t>(size.QuadPart));
+		DWORD read = 0;
+		const bool ok = ReadFile(file, &out[0], static_cast<DWORD>(out.size()), &read, nullptr) &&
+			read == out.size();
+		CloseHandle(file);
+		if (!ok) out.clear();
+		return ok;
+	}
+
+	bool WriteStoredZip(const std::wstring& zipPath,
+		const std::vector<FeedbackBundleEntry>& entries)
+	{
+		HANDLE out = CreateFileW(zipPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+			FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (out == INVALID_HANDLE_VALUE) return false;
+
+		SYSTEMTIME now{};
+		GetLocalTime(&now);
+		const unsigned dosTime = (now.wHour << 11) | (now.wMinute << 5) | (now.wSecond / 2);
+		const unsigned dosDate = ((now.wYear - 1980) << 9) | (now.wMonth << 5) | now.wDay;
+
+		unsigned offset = 0;
+		auto write = [out](const void* data, size_t size) {
+			DWORD written = 0;
+			return WriteFile(out, data, static_cast<DWORD>(size), &written, nullptr) != FALSE &&
+				written == size;
+		};
+
+		struct CentralEntry {
+			std::string name;
+			unsigned crc = 0;
+			unsigned size = 0;
+			unsigned offset = 0;
+		};
+		std::vector<CentralEntry> central;
+		bool ok = true;
+		for (const FeedbackBundleEntry& entry : entries) {
+			std::string bytes;
+			if (!ReadFileBytes(entry.source, 4u << 20, bytes)) continue;
+			const std::string name = Utf8Of(entry.zipName);
+			if (name.empty() || name.size() > 200) continue;
+			const unsigned crc = Crc32(reinterpret_cast<const unsigned char*>(bytes.data()),
+				bytes.size());
+
+			std::string head;
+			AppendLe32(head, 0x04034B50u);
+			AppendLe16(head, 20);              // version needed
+			AppendLe16(head, 0x0800);          // flags：名字是 UTF-8
+			AppendLe16(head, 0);               // method：store
+			AppendLe16(head, dosTime);
+			AppendLe16(head, dosDate);
+			AppendLe32(head, crc);
+			AppendLe32(head, static_cast<unsigned>(bytes.size()));
+			AppendLe32(head, static_cast<unsigned>(bytes.size()));
+			AppendLe16(head, static_cast<unsigned>(name.size()));
+			AppendLe16(head, 0);
+			ok = write(head.data(), head.size()) && write(name.data(), name.size()) &&
+				write(bytes.data(), bytes.size());
+			if (!ok) break;
+			central.push_back({ name, crc, static_cast<unsigned>(bytes.size()), offset });
+			offset += static_cast<unsigned>(head.size() + name.size() + bytes.size());
+		}
+
+		const unsigned centralStart = offset;
+		for (const CentralEntry& entry : central) {
+			if (!ok) break;
+			std::string head;
+			AppendLe32(head, 0x02014B50u);
+			AppendLe16(head, 20);              // version made by
+			AppendLe16(head, 20);              // version needed
+			AppendLe16(head, 0x0800);
+			AppendLe16(head, 0);
+			AppendLe16(head, dosTime);
+			AppendLe16(head, dosDate);
+			AppendLe32(head, entry.crc);
+			AppendLe32(head, entry.size);
+			AppendLe32(head, entry.size);
+			AppendLe16(head, static_cast<unsigned>(entry.name.size()));
+			AppendLe16(head, 0);
+			AppendLe16(head, 0);
+			AppendLe16(head, 0);
+			AppendLe16(head, 0);
+			AppendLe32(head, 0);
+			AppendLe32(head, entry.offset);
+			ok = write(head.data(), head.size()) && write(entry.name.data(), entry.name.size());
+			offset += static_cast<unsigned>(head.size() + entry.name.size());
+		}
+
+		if (ok) {
+			std::string end;
+			AppendLe32(end, 0x06054B50u);
+			AppendLe16(end, 0);
+			AppendLe16(end, 0);
+			AppendLe16(end, static_cast<unsigned>(central.size()));
+			AppendLe16(end, static_cast<unsigned>(central.size()));
+			AppendLe32(end, offset - centralStart);
+			AppendLe32(end, centralStart);
+			AppendLe16(end, 0);
+			ok = write(end.data(), end.size());
+		}
+		CloseHandle(out);
+		if (!ok || central.empty()) {
+			DeleteFileW(zipPath.c_str());
+			return false;
+		}
+		return true;
+	}
+
+	DWORD WINAPI FeedbackUploadThreadProc(LPVOID parameter)
+	{
+		std::unique_ptr<std::shared_ptr<FeedbackJob>> holder(
+			static_cast<std::shared_ptr<FeedbackJob>*>(parameter));
+		const std::shared_ptr<FeedbackJob> job = holder ? *holder : nullptr;
+		if (!job) return 1;
+
+		CreateDirectoryW(job->tempDir.c_str(), nullptr);
+		bool ok = false;
+		std::wstring message;
+
+		const std::wstring systemPath = job->tempDir + L"\\system.txt";
+		const std::wstring feedbackPath = job->tempDir + L"\\feedback.txt";
+		if (!WriteUtf8File(systemPath, job->systemText)) {
+			message = L"无法写入系统信息";
+		}
+		else if (!WriteUtf8File(feedbackPath, job->feedbackText)) {
+			message = L"无法写入反馈内容";
+		}
+		else {
+			std::vector<FeedbackBundleEntry> entries = job->entries;
+			entries.insert(entries.begin(), { feedbackPath, L"feedback.txt" });
+			entries.insert(entries.begin(), { systemPath, L"system.txt" });
+			if (!WriteStoredZip(job->bundlePath, entries)) {
+				message = L"无法生成反馈包";
+			}
+			else {
+				wchar_t error[512] = {};
+				ok = JUpdater_SubmitFeedback(job->bundlePath.c_str(), job->metaJson.c_str(),
+					error, _countof(error), 120000) != FALSE;
+				if (!ok) message = error[0] ? error : L"上传失败";
+			}
+		}
+
+		DeleteFileW(job->bundlePath.c_str());
+		DeleteFileW(systemPath.c_str());
+		DeleteFileW(feedbackPath.c_str());
+		for (const FeedbackBundleEntry& entry : job->entries) {
+			// 只有截断出来的临时文件在 tempDir 里，原始日志一个字节都不能动。
+			if (entry.source.compare(0, job->tempDir.size(), job->tempDir) == 0)
+				DeleteFileW(entry.source.c_str());
+		}
+		RemoveDirectoryW(job->tempDir.c_str());
+
+		{
+			std::lock_guard<std::mutex> guard(job->mutex);
+			job->ok = ok;
+			job->message = ok ? L"反馈已提交" : (message.empty() ? L"提交失败" : message);
+		}
+		if (job->window) PostMessageW(job->window, WM_MY_FEEDBACK_DONE, 0, 0);
+		return ok ? 0 : 1;
+	}
+
+	std::wstring QueryCpuName()
+	{
+		HKEY key = nullptr;
+		if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+			L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", 0, KEY_QUERY_VALUE,
+			&key) != ERROR_SUCCESS) {
+			return std::wstring();
+		}
+		wchar_t buffer[256] = {};
+		DWORD size = sizeof(buffer);
+		DWORD type = 0;
+		const LONG status = RegQueryValueExW(key, L"ProcessorNameString", nullptr, &type,
+			reinterpret_cast<LPBYTE>(buffer), &size);
+		RegCloseKey(key);
+		if (status != ERROR_SUCCESS || type != REG_SZ) return std::wstring();
+		std::wstring name(buffer);
+		while (!name.empty() && name.back() == L' ') name.pop_back();
+		return name;
+	}
+}
+
+void MainWindow::PaintFeedbackDialog(Graphics& g, int width, int height)
+{
+	if (!feedbackDialogVisible) return;
+	const bool d = darkMode;
+	const float appear = (std::max)(0.0f, (std::min)(1.0f, feedbackDialogAppear));
+	auto fade = [appear](const Color& color) {
+		return Color(static_cast<BYTE>(color.GetA() * appear), color.GetR(), color.GetG(), color.GetB());
+	};
+	const Color onSurface = C(d, 26, 30, 28, 232, 238, 235);
+	const Color onSurfaceVariant = C(d, 96, 104, 100, 168, 179, 174);
+	const Color outline = C(d, 130, 139, 134, 138, 149, 144);
+	const Color primary = C(d, 0, 107, 95, 130, 213, 199);
+	const Color container = C(d, 243, 247, 245, 38, 45, 42);
+	const Color errorColor = C(d, 155, 45, 36, 244, 178, 165);
+
+	{
+		SolidBrush veil(Color(static_cast<BYTE>((d ? 115.0f : 82.0f) * appear), 0, 0, 0));
+		g.FillRectangle(&veil, 0, 0, width, height);
+	}
+
+	const FeedbackGeometry geo = ComputeFeedbackGeometry(width, height);
+	const float cardX = geo.card.X;
+	const float cardY = geo.card.Y;
+	const float cardW = geo.card.Width;
+	const float cardH = geo.card.Height;
+
+	SoftShadow(g, geo.card, 28.0f, d, 1.6f * appear);
+	FillRound(g, geo.card, 28.0f, fade(container));
+
+	DrawIcon(g, 2, cardX + 24.0f, cardY + 26.0f, fade(primary), 24);
+	Text(g, L"意见反馈", cardX + 58.0f, cardY + 24.0f, cardW - 82.0f, 28.0f, 20, FontStyleBold,
+		fade(onSurface));
+	TextSingleLine(g, L"写清问题和复现步骤，当天的日志与系统信息会一并附上",
+		cardX + 24.0f, cardY + 58.0f, cardW - 48.0f, 18.0f, 12, FontStyleRegular,
+		fade(onSurfaceVariant));
+	{
+		Pen pen(fade(outline), 1.0f);
+		g.DrawLine(&pen, cardX + 24.0f, cardY + 90.0f, cardX + cardW - 24.0f, cardY + 90.0f);
+	}
+
+	auto label = [&](const RectF& rect, const wchar_t* text, bool required) {
+		TextSingleLine(g, text, rect.X, rect.Y, rect.Width - 56.0f, rect.Height, 11,
+			FontStyleBold, fade(onSurfaceVariant));
+		if (required) {
+			TextSingleLine(g, L"必填", rect.X + rect.Width - 52.0f, rect.Y, 52.0f, rect.Height, 10,
+				FontStyleRegular, fade(primary));
+		}
+	};
+	label(geo.descLabel, L"问题描述", true);
+	label(geo.reproLabel, L"复现步骤", true);
+	label(geo.contactLabel, L"联系方式（可选）", false);
+
+	// 输入框：EDIT 盖在中间，这里只画圆角底和一圈描边。填充色必须和
+	// feedbackFieldBrush 完全一致，否则圆角里会露出一个色差方块。
+	auto field = [&](const RectF& box, bool focused) {
+		FillRound(g, box, 12.0f, fade(C(d, 243, 247, 245, 38, 45, 42)));
+		StrokeRound(g, box, 12.0f, focused ? fade(primary) : fade(outline), focused ? 1.6f : 1.0f);
+	};
+	field(geo.descBox, GetFocus() == feedbackDescEdit);
+	field(geo.reproBox, GetFocus() == feedbackReproEdit);
+	field(geo.contactBox, GetFocus() == feedbackContactEdit);
+
+	// 写清"会上传什么"，比一句"我们重视你的隐私"有用。
+	TextSingleLine(g, L"附带内容：当天运行日志、系统版本与硬件信息、当前防护状态。不含个人文件。",
+		cardX + 24.0f, cardY + 446.0f, cardW - 48.0f, 18.0f, 10, FontStyleRegular,
+		fade(onSurfaceVariant));
+
+	if (!feedbackStatus.empty()) {
+		Text(g, feedbackStatus.c_str(), cardX + 24.0f, cardY + 470.0f, cardW - 48.0f, 38.0f, 11,
+			feedbackSubmitFailed ? FontStyleBold : FontStyleRegular,
+			feedbackSubmitFailed ? fade(errorColor) : fade(onSurfaceVariant));
+	}
+
+	const float buttonY = cardY + cardH - 24.0f - 40.0f;
+	const float submitW = 120.0f;
+	const float cancelW = 88.0f;
+	const float gap = 10.0f;
+	const float submitX = cardX + cardW - 24.0f - submitW;
+	const float cancelX = submitX - gap - cancelW;
+	feedbackSubmitRect = ToRect(RectF(submitX, buttonY, submitW, 40.0f));
+	feedbackCancelRect = ToRect(RectF(cancelX, buttonY, cancelW, 40.0f));
+	PaintButton(g, RectF(submitX, buttonY, submitW, 40.0f),
+		feedbackSubmitting ? L"提交中…" : L"提交反馈", kFeedbackSubmit,
+		ButtonStyle::Primary, 20.0f, -1, !feedbackSubmitting);
+	PaintButton(g, RectF(cancelX, buttonY, cancelW, 40.0f), L"取消", kFeedbackCancel,
+		ButtonStyle::Ghost, 20.0f, -1, !feedbackSubmitting);
+
+	// 弹窗期间通用的焦点环被 ModalDialogVisible() 关掉了，这里自己画一圈。
+	if (focusTarget == kFeedbackSubmit || focusTarget == kFeedbackCancel) {
+		const RECT& source = focusTarget == kFeedbackSubmit ? feedbackSubmitRect : feedbackCancelRect;
+		if (!IsRectEmpty(&source)) {
+			StrokeRound(g, RectF(static_cast<REAL>(source.left) - 3.0f, static_cast<REAL>(source.top) - 3.0f,
+				static_cast<REAL>(source.right - source.left) + 6.0f,
+				static_cast<REAL>(source.bottom - source.top) + 6.0f), 23.0f,
+				fade(primary), 2.0f);
+		}
+	}
+}
+
+void MainWindow::OpenFeedbackDialog()
+{
+	feedbackDialogVisible = true;
+	feedbackDialogAppear = 0.0f;
+	feedbackSubmitting = false;
+	feedbackSubmitFailed = false;
+	feedbackStatus.clear();
+	focusTarget = -1;
+	hoverTarget = -1;
+	pressTarget = -1;
+
+	EnsureFeedbackEdits();
+	if (feedbackDescEdit) SetWindowTextW(feedbackDescEdit, L"");
+	if (feedbackReproEdit) SetWindowTextW(feedbackReproEdit, L"");
+	if (feedbackContactEdit) SetWindowTextW(feedbackContactEdit, L"");
+
+	ApplyDialogOcclusion();
+	SetForegroundWindow(_hWnd);
+	SetFocus(_hWnd);
+	PositionFeedbackEdits();
+	if (feedbackDescEdit) SetFocus(feedbackDescEdit);
+	EnsureAnimationTimer();
+	InvalidateRect(_hWnd, nullptr, FALSE);
+}
+
+void MainWindow::CloseFeedbackDialog()
+{
+	// 上传中途不给关：关了也看不到结果，而那一轮请求还在服务器那边跑。
+	if (feedbackSubmitting) return;
+	feedbackDialogVisible = false;
+	feedbackStatus.clear();
+	feedbackSubmitFailed = false;
+	for (HWND edit : { feedbackDescEdit, feedbackReproEdit, feedbackContactEdit }) {
+		if (edit) ShowWindow(edit, SW_HIDE);
+	}
+	if (GetFocus() == feedbackDescEdit || GetFocus() == feedbackReproEdit ||
+		GetFocus() == feedbackContactEdit) {
+		SetFocus(_hWnd);
+	}
+	focusTarget = -1;
+	hoverTarget = -1;
+	pressTarget = -1;
+	// 关掉之后这两块矩形要清空：它们只在 Paint 里赋值，留着会让
+	// TargetRect(kFeedbackSubmit) 继续命中一个已经不存在的按钮。
+	feedbackSubmitRect = {};
+	feedbackCancelRect = {};
+	ApplyDialogOcclusion();
+	InvalidateRect(_hWnd, nullptr, FALSE);
+}
+
+// 三个 EDIT 建一次就够，之后只挪位置。多行框要 ES_WANTRETURN，否则回车会被
+// 当成"默认按钮"吞掉；滚动条只在内容超出时才有事可做。
+void MainWindow::EnsureFeedbackEdits()
+{
+	auto ensure = [this](HWND& edit, int id, DWORD style) {
+		if (edit) return;
+		edit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_TABSTOP | style,
+			0, 0, 10, 10, _hWnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+			JTAppGetInstanceDirect(), nullptr);
+		if (!edit) return;
+		if (controlFont) SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(controlFont), TRUE);
+	};
+	ensure(feedbackDescEdit, kFeedbackDescEdit,
+		ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | ES_NOHIDESEL | WS_VSCROLL);
+	ensure(feedbackReproEdit, kFeedbackReproEdit,
+		ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | ES_NOHIDESEL | WS_VSCROLL);
+	ensure(feedbackContactEdit, kFeedbackContactEdit, ES_AUTOHSCROLL);
+
+	if (feedbackDescEdit) SendMessageW(feedbackDescEdit, EM_SETLIMITTEXT, 1600, 0);
+	if (feedbackReproEdit) SendMessageW(feedbackReproEdit, EM_SETLIMITTEXT, 3200, 0);
+	if (feedbackContactEdit) SendMessageW(feedbackContactEdit, EM_SETLIMITTEXT, 120, 0);
+
+	if (feedbackEditProc) return;
+	for (HWND edit : { feedbackDescEdit, feedbackReproEdit, feedbackContactEdit }) {
+		if (!edit) continue;
+		feedbackEditProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(edit, GWLP_WNDPROC,
+			reinterpret_cast<LONG_PTR>(FeedbackEditProc)));
+	}
+}
+
+void MainWindow::PositionFeedbackEdits()
+{
+	if (!feedbackDialogVisible) return;
+	RECT client{};
+	GetClientRect(_hWnd, &client);
+	const FeedbackGeometry geo = ComputeFeedbackGeometry(ToLogical(client.right),
+		ToLogical(client.bottom));
+	const bool revealed = feedbackDialogAppear > 0.35f;
+
+	auto place = [&](HWND edit, const RectF& box) {
+		if (!edit) return;
+		// 圆角画在父窗口上，EDIT 是方的：四周各让 10 / 6 像素，贴边会削掉圆角。
+		RECT target{};
+		target.left = ToPhysical(static_cast<int>(box.X) + 10);
+		target.top = ToPhysical(static_cast<int>(box.Y) + 6);
+		target.right = ToPhysical(static_cast<int>(box.X + box.Width) - 10);
+		target.bottom = ToPhysical(static_cast<int>(box.Y + box.Height) - 6);
+		RECT current{};
+		GetWindowRect(edit, &current);
+		MapWindowPoints(HWND_DESKTOP, _hWnd, reinterpret_cast<POINT*>(&current), 2);
+		if (!EqualRect(&current, &target)) {
+			SetWindowPos(edit, HWND_TOP, target.left, target.top, target.right - target.left,
+				target.bottom - target.top, SWP_NOACTIVATE);
+		}
+		// 卡片是淡入的，原生控件没法跟着淡：等底色铺开再露头，免得出现
+		// "白框浮在空地上"的一帧。
+		if (revealed) {
+			if (!IsWindowVisible(edit)) ShowWindow(edit, SW_SHOW);
+		}
+		else if (IsWindowVisible(edit)) {
+			ShowWindow(edit, SW_HIDE);
+		}
+	};
+	place(feedbackDescEdit, geo.descBox);
+	place(feedbackReproEdit, geo.reproBox);
+	place(feedbackContactEdit, geo.contactBox);
+}
+
+void MainWindow::SubmitFeedback()
+{
+	if (feedbackSubmitting) return;
+
+	const std::wstring description = NormalizeMultiline(ReadControlText(feedbackDescEdit), 1500);
+	const std::wstring repro = NormalizeMultiline(ReadControlText(feedbackReproEdit), 3000);
+	const std::wstring contact = NormalizeMultiline(ReadControlText(feedbackContactEdit), 120);
+	if (description.empty()) {
+		feedbackStatus = L"请先写一下遇到了什么问题。";
+		feedbackSubmitFailed = true;
+		if (feedbackDescEdit) SetFocus(feedbackDescEdit);
+		InvalidateRect(_hWnd, nullptr, FALSE);
+		return;
+	}
+	if (repro.empty()) {
+		feedbackStatus = L"请补充复现步骤 —— 在哪一步出的问题，越具体越好。";
+		feedbackSubmitFailed = true;
+		if (feedbackReproEdit) SetFocus(feedbackReproEdit);
+		InvalidateRect(_hWnd, nullptr, FALSE);
+		return;
+	}
+
+	feedbackSubmitting = true;
+	feedbackSubmitFailed = false;
+	feedbackStatus = L"正在打包日志并上传，请稍候…";
+	InvalidateRect(_hWnd, nullptr, FALSE);
+
+	const std::wstring currentDir = JTAppGetCurrentDirDirect() ? JTAppGetCurrentDirDirect() : L"";
+	const std::wstring logDir = currentDir + L"\\logs";
+	SYSTEMTIME now{};
+	GetLocalTime(&now);
+	wchar_t logName[64] = {};
+	swprintf_s(logName, L"DzjsTrainer-%04d-%02d-%02d.log", now.wYear, now.wMonth, now.wDay);
+
+	auto job = std::make_shared<FeedbackJob>();
+	job->window = _hWnd;
+
+	WCHAR tempRoot[MAX_PATH] = {};
+	if (!GetTempPathW(_countof(tempRoot), tempRoot)) tempRoot[0] = L'\0';
+	wchar_t folder[80] = {};
+	swprintf_s(folder, L"DzjsTrainer-feedback-%lu-%llu",
+		static_cast<unsigned long>(GetCurrentProcessId()),
+		static_cast<unsigned long long>(GetTickCount64()));
+	job->tempDir = (tempRoot[0] ? std::wstring(tempRoot) : std::wstring()) + folder;
+	job->bundlePath = job->tempDir + L"\\bundle.zip";
+
+	// 主日志超过 1.5 MB 只带尾部。全天的正常记录没有排查价值，传上去只是
+	// 让上传更容易卡在超时上。
+	AddLogEntry(job->entries, logDir + L"\\" + logName, std::wstring(L"logs/") + logName,
+		job->tempDir, 1536ull * 1024, 1);
+	// 注入端的调试日志不在 logs 下，和 exe 同目录。
+	AddLogEntry(job->entries, currentDir + L"\\DzjsTrainerHooks-debug.log",
+		L"logs/DzjsTrainerHooks-debug.log", job->tempDir, 384ull * 1024, 2);
+
+	std::wstring fileList;
+	for (const FeedbackBundleEntry& entry : job->entries) {
+		WIN32_FILE_ATTRIBUTE_DATA info{};
+		if (!GetFileAttributesExW(entry.source.c_str(), GetFileExInfoStandard, &info)) continue;
+		const unsigned long long size = (static_cast<unsigned long long>(info.nFileSizeHigh) << 32) |
+			info.nFileSizeLow;
+		if (!fileList.empty()) fileList += L", ";
+		fileList += entry.zipName + L" (" + std::to_wstring((size + 1023) / 1024) + L" KB)";
+	}
+
+	wchar_t stamp[64] = {};
+	swprintf_s(stamp, L"%04d-%02d-%02d %02d:%02d:%02d", now.wYear, now.wMonth, now.wDay,
+		now.wHour, now.wMinute, now.wSecond);
+
+	job->systemText = BuildFeedbackSystemInfo();
+	job->feedbackText = L"Dzjs Trainer 用户反馈\r\n提交时间：" + std::wstring(stamp) +
+		L"\r\n\r\n【问题描述】\r\n" + description +
+		L"\r\n\r\n【复现步骤】\r\n" + repro +
+		(contact.empty() ? L"" : L"\r\n\r\n【联系方式】\r\n" + contact) + L"\r\n";
+
+	auto jsonField = [](const wchar_t* name, const std::wstring& value, bool comma) {
+		std::wstring out = L"  \"";
+		out += name;
+		out += L"\": \"";
+		out += JsonEscape(value);
+		out += L"\"";
+		out += comma ? L",\r\n" : L"\r\n";
+		return out;
+	};
+	job->metaJson =
+		L"{\r\n" +
+		jsonField(L"client", L"DzjsTrainer", true) +
+		jsonField(L"version", DisplayVersion(ReadOwnFileVersion()), true) +
+		jsonField(L"build", JTBuildDateWide(), true) +
+		jsonField(L"environment", JTRunEnvDetail(), true) +
+		jsonField(L"description", description, true) +
+		jsonField(L"repro", repro, true) +
+		jsonField(L"contact", contact, true) +
+		jsonField(L"system", job->systemText, true) +
+		jsonField(L"files", fileList, true) +
+		jsonField(L"submitted_at", stamp, false) +
+		L"}\r\n";
+
+	g_feedbackJob = job;
+	auto* holder = new std::shared_ptr<FeedbackJob>(job);
+	HANDLE thread = CreateThread(nullptr, 0, FeedbackUploadThreadProc, holder, 0, nullptr);
+	if (thread) {
+		CloseHandle(thread);
+	}
+	else {
+		delete holder;
+		g_feedbackJob.reset();
+		feedbackSubmitting = false;
+		feedbackSubmitFailed = true;
+		feedbackStatus = L"无法启动上传线程。";
+		InvalidateRect(_hWnd, nullptr, FALSE);
+	}
+}
+
+void MainWindow::OnFeedbackSubmitted()
+{
+	std::shared_ptr<FeedbackJob> job = g_feedbackJob;
+	g_feedbackJob.reset();
+	if (!job) return;
+	bool ok = false;
+	std::wstring message;
+	{
+		std::lock_guard<std::mutex> guard(job->mutex);
+		ok = job->ok;
+		message = job->message;
+	}
+	feedbackSubmitting = false;
+	feedbackSubmitFailed = !ok;
+	feedbackStatus = message;
+	if (ok) {
+		CloseFeedbackDialog();
+		ShowFastTip(L"反馈已提交，谢谢");
+		return;
+	}
+	InvalidateRect(_hWnd, nullptr, FALSE);
+}
+
+int MainWindow::HitFeedbackDialogAt(POINT point) const
+{
+	if (!feedbackDialogVisible) return -1;
+	if (Hit(feedbackSubmitRect, point)) return kFeedbackSubmit;
+	if (Hit(feedbackCancelRect, point)) return kFeedbackCancel;
+	return -1;
+}
+
+bool MainWindow::HandleFeedbackDialogClick(POINT point)
+{
+	if (!feedbackDialogVisible) return false;
+	const int target = HitFeedbackDialogAt(point);
+	if (target == kFeedbackSubmit) SubmitFeedback();
+	else if (target == kFeedbackCancel) CloseFeedbackDialog();
+	// 点在卡片外面什么也不做：这里装着用户刚敲进去的几百字，
+	// 误点一下就把内容丢掉，比"关不掉"更难受。
+	return true;
+}
+
+// 反馈弹窗的焦点环：0/1/2 是三个输入框，3 是提交、4 是取消。输入框有原生焦点
+// 和光标，按钮的焦点环画在主窗口上，所以这里要来回换 SetFocus 的目标 ——
+// 两边各管一段，但必须是同一个环，否则从按钮回不到输入框，键盘用户就卡在环里。
+void MainWindow::CycleFeedbackFocus(int from, int step)
+{
+	HWND fields[3] = { feedbackDescEdit, feedbackReproEdit, feedbackContactEdit };
+	int next = ((from + step) % 5 + 5) % 5;
+	// 输入框没建出来时跳过那一站，不要停在空处。
+	for (int guard = 0; guard < 5 && next < 3 && !fields[next]; ++guard) {
+		next = ((next + step) % 5 + 5) % 5;
+	}
+	if (next < 3 && fields[next]) {
+		focusTarget = -1;
+		SetFocus(fields[next]);
+		// 输入框那圈高亮是按 GetFocus() 现算的，焦点一换就得重画。
+		InvalidateRect(_hWnd, nullptr, FALSE);
+		return;
+	}
+	focusTarget = next == 3 ? kFeedbackSubmit : kFeedbackCancel;
+	SetFocus(_hWnd);
+	InvalidateRect(_hWnd, nullptr, FALSE);
+}
+
+LRESULT CALLBACK MainWindow::FeedbackEditProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+	MainWindow* self = currentMainWindow;
+	if (self && message == WM_KEYDOWN) {
+		if (wParam == VK_ESCAPE) {
+			self->CloseFeedbackDialog();
+			return 0;
+		}
+		if (wParam == VK_RETURN && (GetKeyState(VK_CONTROL) & 0x8000) != 0) {
+			self->SubmitFeedback();
+			return 0;
+		}
+		if (wParam == VK_TAB) {
+			// 多行 EDIT 默认把 Tab 当制表符，这里改成在三个框和两颗按钮之间转圈。
+			HWND order[3] = { self->feedbackDescEdit, self->feedbackReproEdit, self->feedbackContactEdit };
+			int current = 0;
+			for (int i = 0; i < 3; ++i) if (order[i] == hwnd) current = i;
+			self->CycleFeedbackFocus(current, (GetKeyState(VK_SHIFT) & 0x8000) ? -1 : 1);
+			return 0;
+		}
+	}
+	if (self && self->feedbackEditProc)
+		return CallWindowProcW(self->feedbackEditProc, hwnd, message, wParam, lParam);
+	return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+// 系统信息采一份纯文本快照。写进包里是给人看的 —— 用户在反馈里说"注入失败"，
+// 这里能立刻看出是 Win11 还是 Win7、是不是 32 位进程、驱动到底加载没有。
+std::wstring MainWindow::BuildFeedbackSystemInfo()
+{
+	std::wstring text;
+	auto add = [&text](const wchar_t* label, const std::wstring& value) {
+		if (value.empty()) return;
+		text += label;
+		text += L"\t";
+		text += value;
+		text += L"\r\n";
+	};
+
+	add(L"程序版本", DisplayVersion(ReadOwnFileVersion()));
+	add(L"构建时间", JTBuildDateWide());
+	add(L"运行环境", JTRunEnvDetail());
+
+	wchar_t buffer[160] = {};
+	const UINT dpi = QueryWindowDpi(_hWnd);
+	swprintf_s(buffer, L"%u (%u%%)", dpi, dpi * 100 / 96);
+	add(L"窗口 DPI", buffer);
+	swprintf_s(buffer, L"%d x %d", GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+	add(L"屏幕分辨率", buffer);
+	add(L"CPU", QueryCpuName());
+
+	MEMORYSTATUSEX memory{};
+	memory.dwLength = sizeof(memory);
+	if (GlobalMemoryStatusEx(&memory)) {
+		swprintf_s(buffer, L"%.1f GB", memory.ullTotalPhys / (1024.0 * 1024.0 * 1024.0));
+		add(L"物理内存", buffer);
+	}
+
+	// 驱动状态用 CurrentDriverStatus()：XDriverLoaded() 只看本进程有没有设备句柄，
+	// 驱动被别的实例加载时会误报"没装"。
+	const DriverStatusInfo& driver = CurrentDriverStatus();
+	std::wstring driverText;
+	if (driver.handleOpen) {
+		driverText = driver.serviceName.empty() ? L"已加载" : (L"已加载 · " + driver.serviceName);
+	}
+	else if (driver.serviceRunning) {
+		driverText = driver.serviceName.empty() ? L"服务在运行，本进程未连接"
+			: (L"服务 " + driver.serviceName + L" 在运行，本进程未连接");
+	}
+	else if (driver.serviceExists) {
+		driverText = driver.serviceName.empty() ? L"服务已安装，未运行"
+			: (L"服务 " + driver.serviceName + L" 已安装，未运行");
+	}
+	else {
+		driverText = L"未安装";
+	}
+	add(L"主驱动", driverText);
+	add(L"自我保护", advSelfProtect ? L"已开启" : L"已关闭");
+
+	int blocked = 0;
+	if (setProhibitKillProcess) ++blocked;
+	if (setProhibitCloseWindow) ++blocked;
+	if (setBandAllRunOp) ++blocked;
+	if (setBlockWindowOps) ++blocked;
+	if (setBlockDriverAccess) ++blocked;
+	swprintf_s(buffer, L"%d / 5 项", blocked);
+	add(L"拦截策略", buffer);
+
+	std::wstring hostText;
+	if (studentRunning) {
+		swprintf_s(buffer, L"StudentMain.exe · PID %lu", static_cast<unsigned long>(studentPid));
+		hostText = buffer;
+	}
+	else if (eduHostCount > 0) {
+		hostText = L"其他教室 " + std::to_wstring(eduHostCount) + L" 个";
+	}
+	else if (!eduHostSummary.empty()) {
+		hostText = L"待接管（进程在运行）";
+	}
+	else {
+		hostText = L"未运行";
+	}
+	add(L"教室接管", hostText);
+
+	add(L"日志目录", std::wstring(JTAppGetCurrentDirDirect() ? JTAppGetCurrentDirDirect() : L"")
+		+ L"\\logs");
+	return text;
 }
 
 // 进程选择器：和更新弹窗同一套模态骨架（scrim / 28 圆角 / 24 内边距），
@@ -7766,6 +8892,7 @@ int MainWindow::HitTargetAt(POINT point)
 	if (page == Page::Network && Hit(networkProjectRect, point)) target = 72;
 	if (page == Page::About) {
 		if (Hit(aboutUpdateRect, point)) target = 74;
+		if (Hit(aboutFeedbackRect, point)) target = kAboutFeedback;
 		if (Hit(aboutExitRect, point)) target = 73;
 	}
 	if (page == Page::Diagnostics) {
@@ -7791,6 +8918,11 @@ bool MainWindow::TargetRect(int target, RECT* rect) const
 	case kProcessPickerSecondary: found = processPickerSecondaryRect; break;
 	case kProcessPickerRefresh: found = processPickerRefreshRect; break;
 	case kProcessPickerSelectAll: found = processPickerSelectAllRect; break;
+	// 面板上的按钮：Tab 转过去之后 ActivateFocus() 也是靠这里取矩形再仿一次点击，
+	// 漏一个就等于那颗按钮只能鼠标点。
+	case kProtectDialogClose: found = protectDialogCloseRect; break;
+	case kFeedbackCancel: found = feedbackCancelRect; break;
+	case kFeedbackSubmit: found = feedbackSubmitRect; break;
 	case 0: case 1: case 2: case 3: case 4:
 	case 5: case 6: case 7: case 8: case 9:
 		found = navRects[target];
@@ -7828,6 +8960,7 @@ bool MainWindow::TargetRect(int target, RECT* rect) const
 	case 72: found = networkProjectRect; break;
 	case 73: found = aboutExitRect; break;
 	case 74: found = aboutUpdateRect; break;
+	case kAboutFeedback: found = aboutFeedbackRect; break;
 	case 75: found = temporaryVideoEnableRect; break;
 	case 76: found = temporaryVideoImageModeRect; break;
 	case 77: found = temporaryVideoFileModeRect; break;
@@ -7859,6 +8992,17 @@ std::vector<int> MainWindow::FocusableTargets() const
 		if (TargetRect(kProcessPickerSecondary, nullptr)) list.push_back(kProcessPickerSecondary);
 		if (TargetRect(kProcessPickerSelectAll, nullptr)) list.push_back(kProcessPickerSelectAll);
 		if (TargetRect(kProcessPickerRefresh, nullptr)) list.push_back(kProcessPickerRefresh);
+		return list;
+	}
+	if (FeedbackDialogVisible()) {
+		// 输入框不在这个列表里：Tab 由 EDIT 自己的子类化处理，转给它们反而会
+		// 把焦点环画到按钮上、和输入光标打架。
+		if (!IsRectEmpty(&feedbackSubmitRect)) list.push_back(kFeedbackSubmit);
+		if (!IsRectEmpty(&feedbackCancelRect)) list.push_back(kFeedbackCancel);
+		return list;
+	}
+	if (ProtectDialogVisible()) {
+		if (!IsRectEmpty(&protectDialogCloseRect)) list.push_back(kProtectDialogClose);
 		return list;
 	}
 	if (UpdateDialogVisible()) {
@@ -7917,7 +9061,7 @@ std::vector<int> MainWindow::FocusableTargets() const
 		push(40);
 		break;
 	case Page::About:
-		push(74); push(73);
+		push(74); push(kAboutFeedback); push(73);
 		break;
 	case Page::Injection:
 		for (int i = 0; i < 3; ++i) push(110 + i);
@@ -7979,6 +9123,26 @@ void MainWindow::UpdateHover(POINT point)
 		UpdateProcessPickerHover(point);
 		return;
 	}
+	if (FeedbackDialogVisible()) {
+		const int dialogTarget = HitFeedbackDialogAt(point);
+		SetCursor(LoadCursorW(nullptr, dialogTarget >= 0 ? IDC_HAND : IDC_ARROW));
+		if (dialogTarget != hoverTarget) {
+			hoverTarget = dialogTarget;
+			EnsureAnimationTimer();
+			InvalidateRect(_hWnd, nullptr, FALSE);
+		}
+		return;
+	}
+	if (ProtectDialogVisible()) {
+		const int dialogTarget = HitProtectDialogAt(point);
+		SetCursor(LoadCursorW(nullptr, dialogTarget >= 0 ? IDC_HAND : IDC_ARROW));
+		if (dialogTarget != hoverTarget) {
+			hoverTarget = dialogTarget;
+			EnsureAnimationTimer();
+			InvalidateRect(_hWnd, nullptr, FALSE);
+		}
+		return;
+	}
 	if (UpdateDialogVisible()) {
 		const int dialogTarget = HitUpdateDialogAt(point);
 		SetCursor(LoadCursorW(nullptr, dialogTarget >= 0 ? IDC_HAND : IDC_ARROW));
@@ -8006,6 +9170,14 @@ void MainWindow::HandleClick(POINT point)
 	// 模态弹窗吃掉所有点击，连空白处也不往下传。
 	if (ProcessPickerVisible()) {
 		HandleProcessPickerClick(point);
+		return;
+	}
+	if (FeedbackDialogVisible()) {
+		HandleFeedbackDialogClick(point);
+		return;
+	}
+	if (ProtectDialogVisible()) {
+		HandleProtectDialogClick(point);
 		return;
 	}
 	if (UpdateDialogVisible()) {
@@ -8051,6 +9223,10 @@ void MainWindow::HandleClick(POINT point)
 		CheckForUpdate(true);
 		return;
 	}
+	if (page == Page::About && Hit(aboutFeedbackRect, point)) {
+		OpenFeedbackDialog();
+		return;
+	}
 	if (page == Page::About && Hit(aboutExitRect, point)) {
 		OnWmCommand(CMD_POWER_EXIT);
 		return;
@@ -8058,7 +9234,7 @@ void MainWindow::HandleClick(POINT point)
 	if (page == Page::Overview) {
 		for (int i = 0; i < 5; ++i) if (Hit(actionRects[i], point)) {
 			switch (i) {
-			case 0: ShowFastTip(currentControlled ? L"\u5f53\u524d\u5df2\u542f\u7528\u5b8c\u6574\u9632\u62a4\u3002" : L"\u9632\u62a4\u670d\u52a1\u6b63\u5728\u76d1\u63a7\u3002"); break;
+			case 0: OpenProtectDialog(); break;
 			case 1: RequestSuperTopmost(); break;
 			// 「电子教室操作」弹选择框：机器上可能同时接着极域、红蜘蛛、伽卡他卡，
 			// 直接全停容易误伤，交给用户挑。结束和启动都在这一个菜单里。
@@ -9471,8 +10647,12 @@ struct Md3MenuState {
 	bool finished = false;
 };
 
-int Md3ItemAt(const Md3MenuState& state, int logicalY)
+// 命中判定要看 x，不能只看 y。菜单自己拿着鼠标捕获（SetCapture），光标从左右
+// 两侧移出去之后消息还在往这个窗口送，只看 y 的话那一行会一直亮着；同样的原因，
+// 在外面点一下也会被判成点中某一行，那就是误执行。
+int Md3ItemAt(const Md3MenuState& state, int logicalX, int logicalY)
 {
+	if (logicalX < kMd3MenuPad || logicalX >= state.widthLogical - kMd3MenuPad) return -1;
 	for (size_t i = 0; i < state.items.size(); ++i) {
 		const int top = state.tops[i];
 		const int height = state.items[i].separator ? kMd3SeparatorHeight : kMd3ItemHeight;
@@ -9587,8 +10767,9 @@ LRESULT CALLBACK Md3MenuProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
 
 	switch (message) {
 	case WM_MOUSEMOVE: {
+		const int x = static_cast<int>(static_cast<short>(LOWORD(lParam)) / state->scale);
 		const int y = static_cast<int>(static_cast<short>(HIWORD(lParam)) / state->scale);
-		const int index = Md3ItemAt(*state, y);
+		const int index = Md3ItemAt(*state, x, y);
 		if (index != state->hover) {
 			state->hover = index;
 			Md3Render(*state);
@@ -9603,13 +10784,15 @@ LRESULT CALLBACK Md3MenuProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
 		}
 		return 0;
 	case WM_LBUTTONDOWN: {
+		const int x = static_cast<int>(static_cast<short>(LOWORD(lParam)) / state->scale);
 		const int y = static_cast<int>(static_cast<short>(HIWORD(lParam)) / state->scale);
-		state->pressed = Md3ItemAt(*state, y);
+		state->pressed = Md3ItemAt(*state, x, y);
 		if (state->pressed >= 0) Md3Render(*state);
 		return 0; }
 	case WM_LBUTTONUP: {
+		const int x = static_cast<int>(static_cast<short>(LOWORD(lParam)) / state->scale);
 		const int y = static_cast<int>(static_cast<short>(HIWORD(lParam)) / state->scale);
-		const int index = Md3ItemAt(*state, y);
+		const int index = Md3ItemAt(*state, x, y);
 		const int pressed = state->pressed;
 		state->pressed = -1;
 		if (index >= 0 && index == pressed)
@@ -10099,6 +11282,19 @@ void MainWindow::OnSimpleMessageCallback(LPCWSTR text) { ShowFastTip(text); }
 void MainWindow::OnAllowGbTop() { setAllowGbTop = true; SaveSettings(); }
 void MainWindow::OnShowHelp() { ShowHelp(); }
 
+void MainWindow::OnShutdownBlocked(LPCWSTR api)
+{
+	(void)api;   // 具体拦在哪个函数上已经进日志了，界面上不区分子类名
+	// 这条来自注入的教室进程（Hooks 里 blockShutdown 那一组）。窗口缩在托盘时
+	// 先露出来 —— 否则提示画在一个看不见的窗口上，等于没提示。已经在屏幕上
+	// 就不抢焦点：用户可能正开着别的窗口，被弹一下已经很打扰了。
+	if (!IsWindowVisible(_hWnd)) {
+		ShowWindow(_hWnd, SW_SHOW);
+		SetForegroundWindow(_hWnd);
+	}
+	ShowFastTip(L"\u5df2\u62e6\u622a\u7535\u5b50\u6559\u5ba4\u7684\u5173\u673a / \u91cd\u542f\u8bf7\u6c42\uff1b\u8981\u5173\u673a\u8bf7\u7528 \u7535\u6e90\u63a7\u5236");
+}
+
 void MainWindow::LoadSettings()
 {
 	auto settings = JTAppGetSettingsDirect();
@@ -10281,12 +11477,23 @@ void MainWindow::OnWmCommand(WPARAM wParam)
 		DestroyWindow(_hWnd);
 		break; }
 	case CMD_POWER_SHUTDOWN:
-		if (MessageBoxW(_hWnd, L"\u786e\u5b9a\u5173\u95ed\u8ba1\u7b97\u673a\uff1f", L"Dzjs Trainer", MB_YESNO | MB_ICONWARNING) == IDYES)
-			ExitWindowsEx(EWX_SHUTDOWN | EWX_FORCE, 0);
+		if (MessageBoxW(_hWnd, L"\u786e\u5b9a\u5173\u95ed\u8ba1\u7b97\u673a\uff1f", L"Dzjs Trainer", MB_YESNO | MB_ICONWARNING) == IDYES) {
+			// 拦的是"别人发起的关机"，自己点菜单当然要放行。
+			allowShutdown = true;
+			if (!ExitWindowsEx(EWX_SHUTDOWN | EWX_FORCE, 0)) {
+				allowShutdown = false;
+				ShowFastTip(L"\u5173\u673a\u8bf7\u6c42\u6ca1\u53d1\u51fa\u53bb\uff0c\u53ef\u80fd\u6ca1\u6709\u6743\u9650");
+			}
+		}
 		break;
 	case CMD_POWER_RESTART:
-		if (MessageBoxW(_hWnd, L"\u786e\u5b9a\u91cd\u65b0\u542f\u52a8\u8ba1\u7b97\u673a\uff1f", L"Dzjs Trainer", MB_YESNO | MB_ICONWARNING) == IDYES)
-			ExitWindowsEx(EWX_REBOOT | EWX_FORCE, 0);
+		if (MessageBoxW(_hWnd, L"\u786e\u5b9a\u91cd\u65b0\u542f\u52a8\u8ba1\u7b97\u673a\uff1f", L"Dzjs Trainer", MB_YESNO | MB_ICONWARNING) == IDYES) {
+			allowShutdown = true;
+			if (!ExitWindowsEx(EWX_REBOOT | EWX_FORCE, 0)) {
+				allowShutdown = false;
+				ShowFastTip(L"\u91cd\u542f\u8bf7\u6c42\u6ca1\u53d1\u51fa\u53bb\uff0c\u53ef\u80fd\u6ca1\u6709\u6743\u9650");
+			}
+		}
 		break;
 	case CMD_END_JIYU:
 		if (currentWorker) {
@@ -10401,6 +11608,13 @@ void MainWindow::OnWmTimer(WPARAM timer)
 
 		// 进程选择器：只有入场淡入，没有持续动画。
 		if (ProcessPickerVisible() && approach(processPicker.appear, 1.0f, 0.06)) needsPaint = true;
+		if (ProtectDialogVisible() && approach(protectDialogAppear, 1.0f, 0.06)) needsPaint = true;
+		if (FeedbackDialogVisible() && approach(feedbackDialogAppear, 1.0f, 0.06)) {
+			needsPaint = true;
+			// 原生 EDIT 不能跟着淡入：底色铺到三成才露头，顺带把位置再校一次
+			// （动画期间窗口可能被拖动或被系统改尺寸）。
+			PositionFeedbackEdits();
+		}
 
 		const bool toastAlive = !toastText.empty() && now <= toastUntil;
 		if (!toastText.empty() && !toastAlive) {

@@ -2,6 +2,34 @@
 
 All notable changes to Dzjs Trainer are documented in this file.
 
+## [1.0.6] - 2026-11-21
+
+### Added
+
+- The about page has a feedback card: what went wrong, how to reproduce it, and an optional way to
+  reach you. Submitting it packs the day's log and a system snapshot and uploads them, signed, so
+  the server only accepts requests that came from a real client.
+- Several classroom products can be handled at the same time. JiYu, Red Spider and Gaga Card are
+  tracked on their own, and the overview card names every product that was adopted.
+- Ending a classroom asks which product to end, or all of them, and removes the parent service and
+  the install folder on the way out.
+- The protection status on the overview page opens a read-only panel: overall state, controlled
+  hosts, adopted classrooms, driver, self-protection, blocked items, version and build time.
+- Shutdown, restart and logoff requests coming from a classroom are blocked, in the sending process
+  as well as in the trainer. `BlockShutdown=FALSE` in the ini turns it off.
+
+### Changed
+
+- Logs are written one file per day under `logs/`.
+
+### Fixed
+
+- A classroom that is still running is no longer reported as dead, and the status lines no longer
+  overlap.
+- The classroom menu is drawn by the trainer instead of being requested from the system.
+- The build time on the about page is read from the PE header, so it shows the minute the file was
+  linked even on an incremental build.
+
 ## [1.0.5.3] - 2026-11-21
 
 ### Added

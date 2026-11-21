@@ -22,6 +22,19 @@ ticket-sign.pub.pem
 # 示例材料是故意跟踪的，别被上面的规则或通配误伤。
 !ticket-sign.pem.example
 
+# 反馈上行签名的密钥对。私钥在客户端里，公钥在服务端；两者都不进版本库。
+# 私钥那条只是为了防止构建机上的文件被误提交 —— 换钥脚本在 tools/ 下。
+feedback-client.pem
+feedback-client.der
+feedback-client.pub.der
+feedback-client.pub.pem
+feedback-pub.php
+
+# 示例材料同上，故意跟踪。
+!feedback-client.pem.example
+!feedback-client.pub.pem.example
+!feedback-pub.php.example
+
 # 更新后台的管理口令（admin.php 在 UPDATE_ADMIN_PASSWORD 缺失时读它）。
 # 它等价于"能上传更新包并改写清单"的权限，与服务端私钥同一个级别，不进版本库。
 admin-password.php

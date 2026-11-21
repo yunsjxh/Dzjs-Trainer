@@ -108,6 +108,12 @@ extern bool allowMonitor, allowControl, allowGbTop, fakeFull, gbFullManual;
 // 其余行为复用已有开关：allowAllRunOp（远程运行）、ProhibitKillProcess（结束进程/关机）、
 // ProhibitCloseWindow（关闭窗口）、allowControl（远程控制/输入注入）、allowMonitor（查看屏幕）。
 extern bool blockWindowOps, blockDriverAccess;
+// 关机拦截（2026-11-21）。与 ProhibitKillProcess 分开是刻意的：那个开关默认关，
+// 而且只管「结束进程」。关机/重启/注销单独一根开关，默认**开** —— 学生机上
+// 被教师端关掉一次就得重来，代价比误拦一次大得多。ini 里写 BlockShutdown=FALSE 可关。
+extern bool blockShutdown;
+// 告诉主程序「刚刚挡下了一次关机」。内部会起线程走 WM_COPYDATA，不阻塞调用方。
+void VNotifyShutdownBlocked(const wchar_t* api);
 // 只记录模式下的动作记录：按总量采样，避免热路径刷爆日志文件。
 void VRecordHook(const wchar_t* name, const wchar_t* fmt, ...);
 // 视频流替换是否开启（g_VideoProps 定义在 DzjsTrainerHooks.cpp，guard 模块看不到它）。
@@ -149,6 +155,14 @@ extern fnSetWindowLongA faSetWindowLongA;
 extern fnSetWindowLongW faSetWindowLongW;
 extern fnShowWindow faShowWindow;
 extern fnExitWindowsEx faExitWindowsEx;
+// 关机拦截的另外七条路（advapi32 / ntdll）。解析失败时对应钩子不装。
+extern fnInitiateSystemShutdownExW faInitiateSystemShutdownExW;
+extern fnInitiateSystemShutdownExA faInitiateSystemShutdownExA;
+extern fnInitiateSystemShutdownW faInitiateSystemShutdownW;
+extern fnInitiateSystemShutdownA faInitiateSystemShutdownA;
+extern fnNtShutdownSystem faNtShutdownSystem;
+extern fnNtSetSystemPowerState faNtSetSystemPowerState;
+extern fnNtInitiatePowerAction faNtInitiatePowerAction;
 extern fnShellExecuteW faShellExecuteW;
 extern fnShellExecuteExW faShellExecuteExW;
 extern fnCreateProcessA faCreateProcessA;
@@ -195,6 +209,8 @@ extern BOOL hk31, hk32, hk33, hk34, hk35, hk36, hk37, hk38, hk39, hk40;
 extern BOOL hk41;
 // hk42..hk45 从 R3ShieldCore 移植：截屏另外三条路 + SetWindowsHookExW。
 extern BOOL hk42, hk43, hk44, hk45;
+// hk46..hk52：关机拦截。
+extern BOOL hk46, hk47, hk48, hk49, hk50, hk51, hk52;
 
 extern volatile LONG inputHookLogCount;
 extern volatile LONG captureHelperProcessLogCount;

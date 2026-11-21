@@ -154,6 +154,16 @@ typedef BOOL (WINAPI *fnShowWindow)(
 typedef BOOL (WINAPI *fnExitWindowsEx)(
 	__in UINT uFlags,
 	__in DWORD dwReason);
+// 关机的另外几条路。ExitWindowsEx 只是外壳：advapi32 的 InitiateSystemShutdown*
+// 和不经 advapi32 的 ntdll 原生调用都能绕过去，所以三个 DLL 一起看。
+// NTSTATUS 用 LONG 顶替，避免为了几个函数把 ntdef 的头文件拖进来。
+typedef BOOL (WINAPI *fnInitiateSystemShutdownExW)(LPWSTR, LPWSTR, DWORD, BOOL, BOOL, DWORD);
+typedef BOOL (WINAPI *fnInitiateSystemShutdownExA)(LPSTR, LPSTR, DWORD, BOOL, BOOL, DWORD);
+typedef BOOL (WINAPI *fnInitiateSystemShutdownW)(LPWSTR, LPWSTR, DWORD, BOOL, BOOL);
+typedef BOOL (WINAPI *fnInitiateSystemShutdownA)(LPSTR, LPSTR, DWORD, BOOL, BOOL);
+typedef LONG (NTAPI *fnNtShutdownSystem)(ULONG);
+typedef LONG (NTAPI *fnNtSetSystemPowerState)(ULONG, ULONG, ULONG);
+typedef LONG (NTAPI *fnNtInitiatePowerAction)(ULONG, ULONG, ULONG, BOOLEAN);
 typedef HINSTANCE (WINAPI* fnShellExecuteW)(__in_opt HWND hwnd, __in_opt LPCWSTR lpOperation, __in LPCWSTR lpFile, __in_opt LPCWSTR lpParameters,
 	__in_opt LPCWSTR lpDirectory, __in INT nShowCmd);
 typedef BOOL (WINAPI* fnShellExecuteExW)(__inout SHELLEXECUTEINFOW *pExecInfo);

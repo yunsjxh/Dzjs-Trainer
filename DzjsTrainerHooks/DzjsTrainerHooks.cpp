@@ -161,6 +161,9 @@ bool allowMonitor = false, allowControl = false, allowGbTop = false, fakeFull = 
 doNotShowVirusWindow = true, forceDisableWatchDog = false;
 // 「是否动手」开关，默认全 0 = 只记录（见 HooksCommon.h 的说明）。
 bool blockWindowOps = false, blockDriverAccess = false;
+// 关机拦截默认开。理由见 HooksCommon.h —— 它不是「防护策略」里的可选项，
+// 而是「机器别被教师端关掉」这条底线，所以 ini 缺键时按 TRUE 处理。
+bool blockShutdown = true;
 bool whitePreviewOnly = false;
 // 「进程注入」功能：主程序把本 DLL 注入到用户指定的非极域进程时，
 // VLoad() 走通用宿主分支。通用宿主不等待 LibTDMaster、不改教师端设置，
@@ -210,6 +213,13 @@ fnSetWindowLongA faSetWindowLongA = NULL;
 fnSetWindowLongW faSetWindowLongW = NULL;
 fnShowWindow faShowWindow = NULL;
 fnExitWindowsEx faExitWindowsEx = NULL;
+fnInitiateSystemShutdownExW faInitiateSystemShutdownExW = NULL;
+fnInitiateSystemShutdownExA faInitiateSystemShutdownExA = NULL;
+fnInitiateSystemShutdownW faInitiateSystemShutdownW = NULL;
+fnInitiateSystemShutdownA faInitiateSystemShutdownA = NULL;
+fnNtShutdownSystem faNtShutdownSystem = NULL;
+fnNtSetSystemPowerState faNtSetSystemPowerState = NULL;
+fnNtInitiatePowerAction faNtInitiatePowerAction = NULL;
 fnShellExecuteW faShellExecuteW = NULL;
 fnShellExecuteExW faShellExecuteExW = NULL;
 fnCreateProcessA faCreateProcessA = NULL;
@@ -390,6 +400,8 @@ hk33 = 0, hk34 = 0, hk35 = 0, hk36 = 0,
 hk37 = 0, hk38 = 0, hk39 = 0, hk40 = 0,
 hk41 = 0;
 BOOL hk42 = 0, hk43 = 0, hk44 = 0, hk45 = 0;
+// hk46..hk52：关机拦截（ExitWindowsEx 是 hk19，老的，跟着 ProhibitKillProcess 走）。
+BOOL hk46 = 0, hk47 = 0, hk48 = 0, hk49 = 0, hk50 = 0, hk51 = 0, hk52 = 0;
 
 volatile LONG jpegHookAttempted = 0;
 volatile LONG jpegHookLogPending = 0;
@@ -880,6 +892,10 @@ void VInitSettings()
 	GetPrivateProfileString(L"JTSettings", L"BlockDriverAccess", L"FALSE", w, 32, mainIniPath);
 	if (StrEqual(w, L"TRUE") || StrEqual(w, L"true") || StrEqual(w, L"1")) blockDriverAccess = true;
 	else blockDriverAccess = false;
+	// 关机拦截：唯一一个缺键时按**开**处理的开关，理由见 HooksCommon.h。
+	GetPrivateProfileString(L"JTSettings", L"BlockShutdown", L"TRUE", w, 32, mainIniPath);
+	if (StrEqual(w, L"FALSE") || StrEqual(w, L"false") || StrEqual(w, L"0")) blockShutdown = false;
+	else blockShutdown = true;
 	
 	GetPrivateProfileString(L"JTSettings", L"DoNotShowVirusWindow", L"TRUE", w, 32, mainIniPath);
 	if (!StrEqual(w, L"TRUE") && !StrEqual(w, L"true") && !StrEqual(w, L"1")) doNotShowVirusWindow = false;
@@ -1371,6 +1387,61 @@ void VSendMessageBack(LPCWSTR buff, HWND hDlg) {
 		}
 	}
 }
+// ---- 关机拦截的通知 ----------------------------------------------------------
+// 拦截本身在 GuardProcess 的 detour 里完成，这里只负责把「刚挡下一次关机」
+// 告诉主程序。走的是和 hkb: 状态回传同一条 WM_COPYDATA 通道，但**不能**复用
+// VSendMessageBack：那个函数在通用宿主（g_customHost）下直接丢弃回传，而
+// 红蜘蛛、伽卡他卡这些宿主恰恰也是通用宿主，挡下关机后主程序就什么都不知道了。
+struct ShutdownNotice
+{
+	std::wstring api;
+};
+
+static DWORD WINAPI VShutdownNoticeThread(LPVOID param)
+{
+	ShutdownNotice* notice = static_cast<ShutdownNotice*>(param);
+	if (!notice) return 0;
+
+	HWND receiver = FindControlWindow();
+	if (receiver) {
+		std::wstring message = L"hkb:shutdown:";
+		message += notice->api;
+		COPYDATASTRUCT copyData = { 0 };
+		copyData.lpData = const_cast<wchar_t*>(message.c_str());
+		copyData.cbData = static_cast<DWORD>(sizeof(WCHAR) * (message.length() + 1));
+		DWORD_PTR response = 0;
+		ULONGLONG started = GetTickCount64();
+		LRESULT result = SendMessageTimeoutW(receiver, WM_COPYDATA, 0,
+			reinterpret_cast<LPARAM>(&copyData), SMTO_ABORTIFHUNG | SMTO_BLOCK, 500, &response);
+		VDebugLog(L"shutdown notice complete api=%s target=%p result=%lld error=%lu elapsedMs=%llu",
+			notice->api.c_str(), receiver, static_cast<long long>(result), GetLastError(),
+			GetTickCount64() - started);
+	}
+	else {
+		VDebugLog(L"shutdown notice dropped api=%s reason=receiver-not-found", notice->api.c_str());
+	}
+	delete notice;
+	return 0;
+}
+
+void VNotifyShutdownBlocked(const wchar_t* api)
+{
+	// 一次关机尝试常常连着走好几层（ExitWindowsEx → InitiateSystemShutdownEx →
+	// NtSetSystemPowerState），每个 detour 都弹一条提示会刷屏。2 秒内只报第一条。
+	static volatile LONG lastTick = 0;
+	const LONG now = static_cast<LONG>(GetTickCount64());
+	const LONG previous = lastTick;
+	if (previous != 0 && (now - previous) < 2000) return;
+	InterlockedExchange(&lastTick, now);
+
+	ShutdownNotice* notice = new (std::nothrow) ShutdownNotice();
+	if (!notice) return;
+	notice->api = api ? api : L"unknown";
+	HANDLE thread = CreateThread(NULL, 0, VShutdownNoticeThread, notice, 0, NULL);
+	if (thread) CloseHandle(thread);
+	else delete notice;
+}
+
 void VManualQuit()
 {
 	VCloseFuckDrivers();
@@ -2591,6 +2662,23 @@ void VInstallHooks(VirusMode mode) {
 	faWinExec = (fnWinExec)GetProcAddress(hKernel32, "WinExec");
 
 	faExitWindowsEx = (fnExitWindowsEx)GetProcAddress(hUser32, "ExitWindowsEx");
+
+	// 关机拦截的其余入口。advapi32 的四个必有；ntdll 的三个按导出情况装
+	// （NtShutdownSystem 在部分版本上是空实现，能拿到地址就装，挡不到也无害）。
+	HMODULE hAdvApi32 = GetModuleHandleW(L"advapi32.dll");
+	if (!hAdvApi32) hAdvApi32 = LoadLibraryW(L"advapi32.dll");
+	if (hAdvApi32) {
+		faInitiateSystemShutdownExW = (fnInitiateSystemShutdownExW)GetProcAddress(hAdvApi32, "InitiateSystemShutdownExW");
+		faInitiateSystemShutdownExA = (fnInitiateSystemShutdownExA)GetProcAddress(hAdvApi32, "InitiateSystemShutdownExA");
+		faInitiateSystemShutdownW = (fnInitiateSystemShutdownW)GetProcAddress(hAdvApi32, "InitiateSystemShutdownW");
+		faInitiateSystemShutdownA = (fnInitiateSystemShutdownA)GetProcAddress(hAdvApi32, "InitiateSystemShutdownA");
+	}
+	HMODULE hNtDll = GetModuleHandleW(L"ntdll.dll");
+	if (hNtDll) {
+		faNtShutdownSystem = (fnNtShutdownSystem)GetProcAddress(hNtDll, "NtShutdownSystem");
+		faNtSetSystemPowerState = (fnNtSetSystemPowerState)GetProcAddress(hNtDll, "NtSetSystemPowerState");
+		faNtInitiatePowerAction = (fnNtInitiatePowerAction)GetProcAddress(hNtDll, "NtInitiatePowerAction");
+	}
 	//faShellExecuteW = (fnShellExecuteW)GetProcAddress(hShell32, "ShellExecuteW");
 	//faShellExecuteExW = (fnShellExecuteExW)GetProcAddress(hShell32, "ShellExecuteExW");
 

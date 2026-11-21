@@ -4,15 +4,16 @@
 
 namespace {
 
-// "YYYY-MM-DD" 10 个字符 + 结尾 0，留两位余量。
-constexpr int kStampChars = 12;
+// "YYYY-MM-DD HH:MM" 16 个字符 + 结尾 0，留几位余量。
+constexpr int kStampChars = 20;
 
 struct Stamp {
 	char utf8[kStampChars];
 	wchar_t wide[kStampChars];
 };
 
-// __DATE__ 形如 "Nov 15 2026"，日不足两位时带前导空格（"Nov  5 2026"）。
+// __DATE__ 形如 "Nov 15 2026"，日不足两位时带前导空格（"Nov  5 2026"）；
+// __TIME__ 形如 "16:21:07"。两者拼出 "2026-11-15 16:21"。
 void FromCompileDate(char out[kStampChars])
 {
 	static const char* const kMonths[12] = {
@@ -30,7 +31,9 @@ void FromCompileDate(char out[kStampChars])
 	const int day = (raw[4] == ' ' ? 0 : (raw[4] - '0') * 10) + (raw[5] - '0');
 	const int year = (raw[7] - '0') * 1000 + (raw[8] - '0') * 100 +
 		(raw[9] - '0') * 10 + (raw[10] - '0');
-	sprintf_s(out, kStampChars, "%04d-%02d-%02d", year, month, day);
+	const int hour = (__TIME__[0] - '0') * 10 + (__TIME__[1] - '0');
+	const int minute = (__TIME__[3] - '0') * 10 + (__TIME__[4] - '0');
+	sprintf_s(out, kStampChars, "%04d-%02d-%02d %02d:%02d", year, month, day, hour, minute);
 }
 
 // PE 头里的 TimeDateStamp 是链接时刻（自 1970 起的秒数，不是 FILETIME）。
@@ -57,7 +60,8 @@ bool FromLinkerStamp(char out[kStampChars])
 	SYSTEMTIME parts{};
 	if (!FileTimeToLocalFileTime(&utc, &local)) return false;
 	if (!FileTimeToSystemTime(&local, &parts)) return false;
-	sprintf_s(out, kStampChars, "%04u-%02u-%02u", parts.wYear, parts.wMonth, parts.wDay);
+	sprintf_s(out, kStampChars, "%04u-%02u-%02u %02u:%02u",
+		parts.wYear, parts.wMonth, parts.wDay, parts.wHour, parts.wMinute);
 	return true;
 }
 

@@ -1,6 +1,6 @@
 # Dzjs Trainer
 
-当前版本：`v1.0.5.3`
+当前版本：`v1.0.6`
 
 Dzjs Trainer 是 JiYu Trainer 的翻新版本，面向经授权的教学机房、设备维护与兼容性研究场景。
 

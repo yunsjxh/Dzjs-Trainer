@@ -188,7 +188,6 @@
   <ItemGroup>
     <ClInclude Include="DllInjector\DllInjector.h" />
     <ClInclude Include="AppPublic.h" />
-    <ClInclude Include="ActiveDefenseDemo.h" />
     <ClInclude Include="CAutoLock.h" />
     <ClInclude Include="DriverLoader.h" />
     <ClInclude Include="DriverGuard.h" />
@@ -226,7 +225,6 @@
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="CAutoLock.cpp" />
-    <ClCompile Include="ActiveDefenseDemo.cpp" />
     <ClCompile Include="DriverLoader.cpp" />
     <ClCompile Include="DriverGuard.cpp" />
     <ClCompile Include="DriverSignaturePolicy.cpp" />

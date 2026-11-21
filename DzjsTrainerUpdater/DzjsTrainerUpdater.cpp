@@ -659,6 +659,158 @@ UPEXPORT_CFUNC(BOOL) JUpdater_LaunchApply(LPCWSTR packagePath, LPCWSTR sha256Hex
 	return TRUE;
 }
 
+// ---------------------------------------------------------------- feedback
+
+// 与更新那条链路一样：网络抓取全部交给独立进程。区别是这里不再验票据 ——
+// 票据保护的是"服务器下发的包是真的"，而反馈是往上送，服务器身份由 TLS 负责。
+namespace
+{
+	std::string Utf8FromWideText(const std::wstring& text)
+	{
+		if (text.empty()) return std::string();
+		const int count = WideCharToMultiByte(CP_UTF8, 0, text.c_str(),
+			static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+		if (count <= 0) return std::string();
+		std::string out(static_cast<size_t>(count), '\0');
+		WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()),
+			&out[0], count, nullptr, nullptr);
+		return out;
+	}
+
+	std::wstring WideFromUtf8Text(const std::string& text)
+	{
+		if (text.empty()) return std::wstring();
+		const int count = MultiByteToWideChar(CP_UTF8, 0, text.c_str(),
+			static_cast<int>(text.size()), nullptr, 0);
+		if (count <= 0) return std::wstring();
+		std::wstring out(static_cast<size_t>(count), L'\0');
+		MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()),
+			&out[0], count);
+		return out;
+	}
+
+	bool WriteWholeFile(const std::wstring& path, const std::string& bytes)
+	{
+		HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+			FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (file == INVALID_HANDLE_VALUE) return false;
+		DWORD written = 0;
+		const bool ok = WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()),
+			&written, nullptr) && written == bytes.size();
+		CloseHandle(file);
+		return ok;
+	}
+
+	bool ReadWholeFile(const std::wstring& path, std::string& bytes)
+	{
+		bytes.clear();
+		HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+			OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (file == INVALID_HANDLE_VALUE) return false;
+		char buffer[1024];
+		DWORD read = 0;
+		while (ReadFile(file, buffer, sizeof(buffer), &read, nullptr) && read) {
+			bytes.append(buffer, read);
+			if (bytes.size() > 8192) break;
+		}
+		CloseHandle(file);
+		return true;
+	}
+}
+
+UPEXPORT_CFUNC(BOOL) JUpdater_SubmitFeedback(LPCWSTR bundlePath, LPCWSTR metaJson,
+	LPWSTR errorText, size_t errorChars, DWORD timeoutMs)
+{
+	if (errorText && errorChars) errorText[0] = L'\0';
+	auto fail = [&](const std::wstring& reason) {
+		if (errorText && errorChars) wcsncpy_s(errorText, errorChars, reason.c_str(), _TRUNCATE);
+		return FALSE;
+	};
+	if (!bundlePath || bundlePath[0] == L'\0') return fail(L"没有可提交的反馈包");
+
+	Logger* logger = JTAppGetLoggerDirect();
+	std::wstring updaterPath;
+	if (!ExtractBundledUpdater(JTAppGetCurrentDirDirect(), updaterPath)) {
+		if (logger) logger->LogError(L"释放独立更新程序失败（提交反馈）");
+		return fail(L"无法准备上传程序");
+	}
+
+	WCHAR tempDir[MAX_PATH] = {};
+	if (!GetTempPathW(_countof(tempDir), tempDir)) return fail(L"无法定位临时目录");
+	WCHAR metaPath[MAX_PATH] = {};
+	WCHAR resultPath[MAX_PATH] = {};
+	swprintf_s(metaPath, L"%sDzjsTrainer-feedback-%lu.json", tempDir,
+		static_cast<unsigned long>(GetCurrentProcessId()));
+	swprintf_s(resultPath, L"%sDzjsTrainer-feedback-%lu.result", tempDir,
+		static_cast<unsigned long>(GetCurrentProcessId()));
+	DeleteFileW(resultPath);
+
+	const std::string meta = Utf8FromWideText(metaJson ? metaJson : L"{}");
+	if (!WriteWholeFile(metaPath, meta)) return fail(L"无法写入反馈信息");
+
+	// 命令行里的路径都要带引号。本文件不想掺转义字符，用字符码拼。
+	const WCHAR quote = static_cast<WCHAR>(34);
+	std::wstring command;
+	command.push_back(quote);
+	command += updaterPath;
+	command.push_back(quote);
+	command += L" --feedback ";
+	command.push_back(quote);
+	command += bundlePath;
+	command.push_back(quote);
+	command += L" --meta ";
+	command.push_back(quote);
+	command += metaPath;
+	command.push_back(quote);
+	command += L" --result ";
+	command.push_back(quote);
+	command += resultPath;
+	command.push_back(quote);
+	command += L" --no-elevate";
+
+	std::vector<WCHAR> mutableCommand(command.begin(), command.end());
+	mutableCommand.push_back(static_cast<WCHAR>(0));
+
+	STARTUPINFOW startup{};
+	startup.cb = sizeof(startup);
+	PROCESS_INFORMATION process{};
+	if (!CreateProcessW(updaterPath.c_str(), mutableCommand.data(), nullptr, nullptr, FALSE,
+		CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
+		if (logger) logger->LogError(L"启动反馈上传进程失败：%s (%d) %s",
+			PRINT_LAST_ERROR_STR, updaterPath.c_str());
+		DeleteFileW(metaPath);
+		return fail(L"无法启动上传程序");
+	}
+	const DWORD waited = WaitForSingleObject(process.hProcess, timeoutMs ? timeoutMs : 90000);
+	DWORD exitCode = 1;
+	GetExitCodeProcess(process.hProcess, &exitCode);
+	CloseHandle(process.hThread);
+	CloseHandle(process.hProcess);
+
+	std::string result;
+	const bool hasResult = ReadWholeFile(resultPath, result);
+	DeleteFileW(metaPath);
+	DeleteFileW(resultPath);
+
+	std::wstring detail = hasResult ? WideFromUtf8Text(result) : std::wstring();
+	// 结果文件第一行是 ok / fail，第二行起是服务端原话或失败原因。
+	const size_t newline = detail.find(L'\n');
+	const std::wstring verdict = newline == std::wstring::npos ? detail : detail.substr(0, newline);
+	std::wstring body = newline == std::wstring::npos ? std::wstring() : detail.substr(newline + 1);
+	while (!body.empty() && (body.back() == L'\r' || body.back() == L'\n')) body.pop_back();
+	if (verdict == L"ok") {
+		if (logger) logger->LogInfo(L"反馈已提交：%s", body.empty() ? L"服务器已接收" : body.c_str());
+		return TRUE;
+	}
+	if (body.empty()) {
+		body = waited == WAIT_OBJECT_0
+			? L"上传程序异常退出（退出码 " + std::to_wstring(exitCode) + L"）"
+			: L"上传超时";
+	}
+	if (logger) logger->LogError(L"反馈提交失败：%s", body.c_str());
+	return fail(body);
+}
+
 UPEXPORT_CFUNC(BOOL) JUpdater_LaunchUpdater()
 {
 	// Non-virtual accessors only; see the note at the top of this file.

@@ -195,6 +195,13 @@ void TrainerWorkerInternal::HandleMessageFromVirus(LPCWSTR buf)
 			else if (arr[1] == L"gbuntop") ManualTop(false);
 			else if (arr[1] == L"gbtop") ManualTop(true);
 			else if (arr[1] == L"showhelp" && _Callback) _Callback->OnShowHelp();
+			// 注入的宿主在 API 层挡下了一次关机。带上的第三个字段是拦在哪个
+			// 函数上，只进日志；界面统一显示一句「已拦截关机请求」。
+			else if (arr[1] == L"shutdown") {
+				LPCWSTR api = arr.size() >= 3 ? arr[2].c_str() : L"unknown";
+				currentLogger->LogWarn(L"Blocked a shutdown request in the host process api=%s", api);
+				if (_Callback) _Callback->OnShutdownBlocked(api);
+			}
 			else if (arr[1] == L"wtf") {
 				//插入了错误的目标，现在重置状态
 				DWORD pid = _wtol(arr[2].c_str());

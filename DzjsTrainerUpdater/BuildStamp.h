@@ -1,6 +1,6 @@
 #pragma once
 
-// 构建日期，格式 YYYY-MM-DD。
+// 构建时间，格式 YYYY-MM-DD HH:MM。
 //
 // 取自身 PE 头里的链接时间戳（FileHeader.TimeDateStamp）：它由链接器写入，
 // 增量构建也能反映这一次的真实构建时刻。打包器把时间戳清零时，退回编译期

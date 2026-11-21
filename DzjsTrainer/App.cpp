@@ -15,7 +15,6 @@
 #include "RepositoryCleanup.h"
 #include "RegHlp.h"
 #include "TxtUtils.h"
-#include "ActiveDefenseDemo.h"
 #include "AvIntegrated.h"
 #include "../WindowCaptureProtection.h"
 
@@ -867,8 +866,6 @@ int JTAppInternal::RunInternal()
 			appCustomInjectTarget.c_str(), appCustomInjectUnload, customOk, customStatus.c_str());
 	}
 	appJyUdpAttack = new JyUdpAttack();
-	if (!ActiveDefenseDemoStart())
-		appLogger->LogWarn(L"[DEFENSE-DEMO] audit monitor failed to start");
 	guardTerminatorStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 	if (guardTerminatorStopEvent) {
 		guardTerminatorThread = CreateThread(NULL, 0, [](LPVOID parameter) -> DWORD {
@@ -1069,9 +1066,6 @@ void JTAppInternal::ExitClear()
 		CloseHandle(guardTerminatorStopEvent);
 		guardTerminatorStopEvent = nullptr;
 	}
-	if (appLogger) appLogger->LogInfo(L"ExitClear: stopping active defense monitor");
-	ActiveDefenseDemoStop();
-	if (appLogger) appLogger->LogInfo(L"ExitClear: active defense monitor stopped");
 	if (XDriverLoaded()) {
 		if (appLogger) appLogger->LogInfo(L"ExitClear: closing primary driver handle and child workers");
 		XCloseDriverHandle();

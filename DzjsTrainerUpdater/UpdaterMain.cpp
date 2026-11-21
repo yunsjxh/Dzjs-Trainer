@@ -27,6 +27,8 @@
 #include "UpdaterIpc.h"
 #include "UpdaterTrust.h"
 #include "UpdaterTicket.h"
+// 反馈上行签名：客户端签、服务器验，方向与上面的票据相反。
+#include "FeedbackSign.h"
 #include <bcrypt.h>
 #include <io.h>
 #include <fcntl.h>
@@ -889,6 +891,11 @@ struct Options {
 	std::wstring downloadUrl;
 	// --notify <hwnd>：下载时把进度 PostMessage 到这个窗口（主程序界面）。
 	HWND notifyWindow = nullptr;
+	// --feedback <zip> + --meta <文件> + --result <文件>：把用户反馈连同日志包
+	// 发给 feedback.php。同样借这个子进程做 —— 主程序进程里 TLS 起不来。
+	std::wstring feedbackZip;
+	std::wstring feedbackMeta;
+	std::wstring feedbackResult;
 	bool force = false;
 	bool repl = false;
 	bool status = false;
@@ -1254,6 +1261,368 @@ bool IsProcessRunning(const std::wstring& imageName)
 	return running;
 }
 
+// ---------------------------------------------------------------- feedback
+//
+// 反馈上传走独立的子进程，理由和下载完全一样：主程序进程里 Schannel 的凭据
+// 拿不到（SEC_E_SECPKG_NOT_FOUND），同一个库在控制台进程里正常。
+//
+// 与更新不同，这里不验时效票据。票据证明的是"服务器给的包是真的"，它保护的是
+// 客户端下载；而反馈是客户端往上传，服务器身份由 TLS 证书负责。再加一道取清单
+// 的门，只会让网络不稳的机器连反馈都发不出去。
+const wchar_t* const kFeedbackHostSuffix =
+	L".dzjstrainer.xn--9kq396ceqaq4si9m.cn/update-server/feedback.php";
+const char* const kFeedbackBoundary = "----DzjsTrainerFeedback20261121";
+
+std::vector<std::wstring> FeedbackEndpoints()
+{
+	std::vector<std::wstring> endpoints;
+	endpoints.push_back(std::wstring(L"https://") + (kFeedbackHostSuffix + 1));
+	endpoints.push_back(std::wstring(L"https://") + RandomPrefix() + kFeedbackHostSuffix);
+	return endpoints;
+}
+
+bool ReadWholeFile(const std::wstring& path, std::vector<char>& out, size_t limit, std::wstring& error)
+{
+	out.clear();
+	HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+		OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (file == INVALID_HANDLE_VALUE) {
+		error = L"无法读取 " + path;
+		return false;
+	}
+	LARGE_INTEGER size{};
+	if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0) {
+		CloseHandle(file);
+		error = L"文件为空：" + path;
+		return false;
+	}
+	if (static_cast<unsigned long long>(size.QuadPart) > limit) {
+		CloseHandle(file);
+		error = L"文件超过 " + FormatBytes(limit) + L"，已取消：" + path;
+		return false;
+	}
+	out.resize(static_cast<size_t>(size.QuadPart));
+	DWORD read = 0;
+	const bool ok = ReadFile(file, out.data(), static_cast<DWORD>(out.size()), &read, nullptr) &&
+		read == out.size();
+	CloseHandle(file);
+	if (!ok) {
+		error = L"读取失败：" + path;
+		out.clear();
+	}
+	return ok;
+}
+
+void WriteFeedbackResult(const std::wstring& path, const std::wstring& text)
+{
+	if (path.empty()) return;
+	const std::string utf8 = Utf8FromWide(text);
+	HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+		FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (file == INVALID_HANDLE_VALUE) return;
+	DWORD written = 0;
+	WriteFile(file, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr);
+	CloseHandle(file);
+}
+
+struct WinHttpPostSession {
+	HINTERNET session = nullptr;
+	HINTERNET connection = nullptr;
+	HINTERNET request = nullptr;
+	~WinHttpPostSession()
+	{
+		if (request) WinHttpCloseHandle(request);
+		if (connection) WinHttpCloseHandle(connection);
+		if (session) WinHttpCloseHandle(session);
+	}
+};
+
+// 服务端回复的签名头。与上行签名是两把不同的钥匙：
+//   上行（客户端签）证明"这条请求来自官方构建"；
+//   下行（服务端签）证明"这段回复确实是我们服务器说的"。
+// 下行复用的是更新票据那把 priv 钥（ticket-sign），客户端内置的公钥能验 ——
+// 不为反馈单独再养一把，换钥成本也低。
+const wchar_t* const kFeedbackReplyHeader = L"X-Dzjs-Reply";
+const char* const kFeedbackReplyTag = "DZJS-FEEDBACK-REPLY/1";
+
+bool ReadFeedbackReply(HINTERNET request, std::string& value)
+{
+	value.clear();
+	if (!request) return false;
+	DWORD size = 0;
+	if (!WinHttpQueryHeaders(request, WINHTTP_QUERY_CUSTOM, kFeedbackReplyHeader,
+		WINHTTP_NO_OUTPUT_BUFFER, &size, WINHTTP_NO_HEADER_INDEX)) {
+		// 头不存在是 ERROR_WINHTTP_HEADER_NOT_FOUND，只有"缓冲区不够"值得再查一次。
+		if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) return false;
+	}
+	if (size < sizeof(wchar_t)) return false;
+	std::wstring buffer(size / sizeof(wchar_t) + 1, L'\0');
+	if (!WinHttpQueryHeaders(request, WINHTTP_QUERY_CUSTOM, kFeedbackReplyHeader,
+		&buffer[0], &size, WINHTTP_NO_HEADER_INDEX)) {
+		return false;
+	}
+	buffer.resize(size / sizeof(wchar_t));
+	value = jup_ticket::FromWideHeader(buffer);
+	return !value.empty();
+}
+
+// 拆分 "1|<ts>|<bodySha>|<sig>"。段数固定四段，任何一段为空都判废。
+std::vector<std::string> SplitFeedbackReply(const std::string& text)
+{
+	std::vector<std::string> parts;
+	size_t start = 0;
+	for (;;) {
+		const size_t bar = text.find('|', start);
+		if (bar == std::string::npos) {
+			parts.push_back(text.substr(start));
+			break;
+		}
+		parts.push_back(text.substr(start, bar - start));
+		start = bar + 1;
+	}
+	return parts;
+}
+
+// 校验回复。返回 false 时 error 给出能看懂的原因。
+//
+// 这一段的意义：即使 TLS 被某个企业代理拆开、或者请求被中间人转发到假服务器，
+// 伪造方也签不出 X-Dzjs-Reply。它与上行签名互为镜像，合起来才是"双向"。
+bool VerifyFeedbackReply(const std::string& header, const std::string& body, std::wstring& error)
+{
+	error.clear();
+	if (header.empty()) {
+		error = L"服务器没有签署回复";
+		return false;
+	}
+	const std::vector<std::string> parts = SplitFeedbackReply(header);
+	if (parts.size() != 4 || parts[0] != "1" || parts[1].empty() || parts[2].empty()
+		|| parts[3].empty()) {
+		error = L"服务器回复签名格式不对";
+		return false;
+	}
+
+	// 时间戳单调性不做，但窗口必须卡：一张签好的回复若能无限期复用，
+	// 中间人只要录一次成功响应，就能让任何失败都显示成"已提交"。
+	const unsigned long long stamp = std::strtoull(parts[1].c_str(), nullptr, 10);
+	const unsigned long long now = jup_ticket::UnixNow();
+	if (stamp == 0 || (now > stamp ? now - stamp : stamp - now) > jup_ticket::kClockSkewSeconds) {
+		error = L"服务器回复已过期";
+		return false;
+	}
+
+	// 正文哈希必须与实收字节一致，否则签名覆盖的就不是这段内容。
+	if (parts[2] != jup_ticket::Sha256Hex(body)) {
+		error = L"服务器回复正文与签名不符";
+		return false;
+	}
+
+	const std::string message = std::string(kFeedbackReplyTag) + "|" + parts[1] + "|" + parts[2];
+	if (!jup_ticket::VerifyRsaSignature(message, parts[3])) {
+		error = L"服务器回复签名验证失败";
+		return false;
+	}
+	return true;
+}
+
+// 一个 multipart/form-data 的 POST。两个 part：meta（JSON 文本）和 bundle（zip）。
+// 不使用 chunked：整包几百 KB，一次发完比分块省事，也让服务端的
+// post_max_size 判断更直接。
+bool PostFeedbackOnce(const std::wstring& endpoint, const std::string& meta,
+	const std::vector<char>& bundle, const std::string& signatureHeader,
+	std::wstring& error, std::wstring& response, bool& clientError)
+{
+	error.clear();
+	response.clear();
+	clientError = false;
+	if (!JupUrlAllowed(endpoint)) {
+		error = L"地址不被信任（只接受 https 和官方域名）";
+		return false;
+	}
+
+	URL_COMPONENTS parts{};
+	parts.dwStructSize = sizeof(parts);
+	WCHAR host[256] = {};
+	WCHAR path[2048] = {};
+	WCHAR extra[1024] = {};
+	parts.lpszHostName = host;
+	parts.dwHostNameLength = _countof(host);
+	parts.lpszUrlPath = path;
+	parts.dwUrlPathLength = _countof(path);
+	parts.lpszExtraInfo = extra;
+	parts.dwExtraInfoLength = _countof(extra);
+	if (!WinHttpCrackUrl(endpoint.c_str(), static_cast<DWORD>(endpoint.size()), 0, &parts)) {
+		error = L"地址格式错误";
+		return false;
+	}
+	std::wstring target = path;
+	if (parts.dwExtraInfoLength) target += extra;
+
+	std::string body;
+	body.reserve(meta.size() + bundle.size() + 1024);
+	auto partHead = [&body](const char* disposition) {
+		body += "--";
+		body += kFeedbackBoundary;
+		body += "\r\n";
+		body += disposition;
+		body += "\r\n";
+	};
+	partHead("Content-Disposition: form-data; name=\"meta\"");
+	body += "\r\n";
+	body += meta;
+	body += "\r\n";
+	partHead("Content-Disposition: form-data; name=\"bundle\"; filename=\"bundle.zip\"");
+	body += "Content-Type: application/zip\r\n\r\n";
+	body.append(bundle.data(), bundle.size());
+	body += "\r\n";
+	body += "--";
+	body += kFeedbackBoundary;
+	body += "--\r\n";
+
+	WinHttpPostSession http;
+	http.session = WinHttpOpen(L"DzjsTrainerUpdater/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+		WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+	if (!http.session) {
+		error = L"无法初始化网络会话";
+		return false;
+	}
+	WinHttpSetTimeouts(http.session, 15000, 15000, 30000, 60000);
+	http.connection = WinHttpConnect(http.session, host, parts.nPort, 0);
+	if (!http.connection) {
+		error = L"无法连接服务器（错误码 " + std::to_wstring(GetLastError()) + L"）";
+		return false;
+	}
+	http.request = WinHttpOpenRequest(http.connection, L"POST", target.c_str(), nullptr,
+		WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+	if (!http.request) {
+		error = L"无法建立请求（错误码 " + std::to_wstring(GetLastError()) + L"）";
+		return false;
+	}
+	std::wstring headers = L"Content-Type: multipart/form-data; boundary=";
+	headers += std::wstring(kFeedbackBoundary, kFeedbackBoundary + strlen(kFeedbackBoundary));
+	headers += L"\r\nX-Dzjs-Feedback-Sig: ";
+	headers += WideFromUtf8(signatureHeader);
+	// body 是二进制（zip 里有 0 字节），但 WinHTTP 只读不写，转掉 const 是安全的。
+	if (!WinHttpSendRequest(http.request, headers.c_str(), static_cast<DWORD>(-1),
+		const_cast<char*>(body.data()), static_cast<DWORD>(body.size()),
+		static_cast<DWORD>(body.size()), 0)) {
+		error = L"上传失败（错误码 " + std::to_wstring(GetLastError()) + L"）";
+		return false;
+	}
+	if (!WinHttpReceiveResponse(http.request, nullptr)) {
+		error = L"接收响应失败（错误码 " + std::to_wstring(GetLastError()) + L"）";
+		return false;
+	}
+
+	DWORD status = 0;
+	DWORD statusSize = sizeof(status);
+	if (!WinHttpQueryHeaders(http.request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+		WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize, WINHTTP_NO_HEADER_INDEX)) {
+		error = L"无法读取响应状态";
+		return false;
+	}
+
+	std::string text;
+	char buffer[1024];
+	for (;;) {
+		DWORD read = 0;
+		if (!WinHttpReadData(http.request, buffer, sizeof(buffer), &read) || read == 0) break;
+		text.append(buffer, read);
+		if (text.size() > 2048) break;
+	}
+	if (status < 200 || status >= 300) {
+		// 服务端在正文里可能只说一句状态码（429 就是这样），所以限流这一档
+		// 由这边翻译成人话 —— 卡片上要显示的是这句话。
+		const std::wstring detail = WideFromUtf8(text);
+		if (status == 429) error = L"提交太频繁，过一会儿再试";
+		else error = detail.empty() ? (L"服务器返回 HTTP " + std::to_wstring(status)) : detail;
+		// 4xx 是明确拒绝：换个域名也是同一台服务器、同一份限流记录，
+		// 重试只会再被拒一次，还白白多打一次接口。
+		clientError = status >= 400 && status < 500;
+		PrintUtf8(L"服务端拒绝（HTTP " + std::to_wstring(status) + L"）：" + error + L"\n");
+		return false;
+	}
+	// 2xx 只说明对端给了成功状态码，不说明那是我们的服务器 —— TLS 只能证明
+	// 连到了一个证书合法的对端，企业代理换张自签根证书就能伪造。签名对得上
+	// 才算数。验不过就换一个域名再试，所以这里不置 clientError。
+	std::string replyHeader;
+	if (!ReadFeedbackReply(http.request, replyHeader)
+		|| !VerifyFeedbackReply(replyHeader, text, error)) {
+		if (error.empty()) error = L"服务器没有签署回复";
+		PrintUtf8(L"回复验签失败：" + error + L"\n");
+		return false;
+	}
+	response = WideFromUtf8(text);
+	return true;
+}
+
+int RunFeedbackUpload(const Options& options)
+{
+	if (options.feedbackZip.empty() || options.feedbackMeta.empty()) {
+		PrintUtf8(L"--feedback 需要配合 --meta 与包路径\n");
+		return 2;
+	}
+
+	std::wstring error;
+	std::vector<char> bundle;
+	if (!ReadWholeFile(options.feedbackZip, bundle, 24ull * 1024 * 1024, error)) {
+		PrintUtf8(error + L"\n");
+		WriteFeedbackResult(options.feedbackResult, L"fail\n" + error);
+		return 21;
+	}
+	std::vector<char> metaBytes;
+	if (!ReadWholeFile(options.feedbackMeta, metaBytes, 64ull * 1024, error)) {
+		PrintUtf8(error + L"\n");
+		WriteFeedbackResult(options.feedbackResult, L"fail\n" + error);
+		return 21;
+	}
+	const std::string meta(metaBytes.begin(), metaBytes.end());
+
+	// 签名覆盖的是两个摘要，不是正文本身。这样不必把 8 MB 的包再拼一遍，
+	// 又把"服务端实收的字节"和"客户端签过的字节"钉死：中途改一个字节，
+	// 哈希就对不上，签名自然验不过。
+	unsigned char bundleDigest[32] = {};
+	jup_ticket::detail::Sha256(bundle.data(), bundle.size(), bundleDigest);
+	const std::string bundleHash = jup_ticket::ToHex(bundleDigest, sizeof(bundleDigest));
+	const std::string metaHash = jup_ticket::Sha256Hex(meta);
+
+	// nonce 一次性：服务端保留 10 分钟，同一个值第二次出现直接拒。
+	// 时间戳服务端只认 ±5 分钟，本机时间跑偏的机器会在那里被拦下。
+	unsigned char nonceBytes[16] = {};
+	jup_ticket::RandomBytes(nonceBytes, sizeof(nonceBytes));
+	const std::string nonce = jup_ticket::ToHex(nonceBytes, sizeof(nonceBytes));
+	const unsigned long long stamp = jup_ticket::UnixNow();
+
+	std::string signature;
+	if (!jup_feedback_sign::Sign(
+		jup_feedback_sign::Canonical(stamp, nonce, metaHash, bundleHash), signature, error)) {
+		PrintUtf8(error + L"\n");
+		WriteFeedbackResult(options.feedbackResult, L"fail\n" + error);
+		return 23;
+	}
+	// "1|<ts>|<nonce>|<metaSha>|<bundleSha>|<sig>"。服务端拿前五段重算
+	// canonical，所以这五段必须与签名时用的逐字一致。
+	const std::string signatureHeader = std::string("1|") + std::to_string(stamp) + "|"
+		+ nonce + "|" + metaHash + "|" + bundleHash + "|" + signature;
+
+	std::wstring response;
+	std::wstring lastError = L"没有可用的上传地址";
+	bool clientError = false;
+	for (const std::wstring& endpoint : FeedbackEndpoints()) {
+		if (PostFeedbackOnce(endpoint, meta, bundle, signatureHeader, error, response, clientError)) {
+			PrintUtf8(L"反馈已提交\n");
+			WriteFeedbackResult(options.feedbackResult, L"ok\n" + response);
+			return 0;
+		}
+		lastError = error;
+		if (clientError) break;
+		PrintUtf8(L"上传失败：" + error + L"，换一个地址重试...\n");
+		Sleep(400);
+	}
+	WriteFeedbackResult(options.feedbackResult, L"fail\n" + lastError);
+	PrintUtf8(L"反馈提交失败：" + lastError + L"\n");
+	return 22;
+}
+
 // 只做替换：下载、校验、确认都由主程序完成，这边等它退出再把包换上去。
 // ---------------------------------------------------------------- download only
 
@@ -1387,6 +1756,7 @@ void PrintUsage()
 		L"  --download <路径> 配合 --url 只下载安装包（需 --sha256，先验服务器身份）\n"
 		L"  --url <地址>    配合 --download 指定下载地址\n"
 		L"  --apply <包>    只替换：等主程序退出后换包并重启\n"
+		L"  --feedback <包> --meta <文件> --result <文件>  提交反馈包\n"
 		L"  --sha256 <hex>  下载与替换都必填：落盘前后各核一次\n"
 		L"  --status        只显示本地文件状态\n"
 		L"  --repl          进入交互命令模式\n"
@@ -1412,6 +1782,9 @@ Options ParseOptions(int argc, wchar_t** argv)
 		else if (arg == L"--sha256") value(options.expectedSha);
 		else if (arg == L"--download") value(options.downloadPath);
 		else if (arg == L"--url") value(options.downloadUrl);
+		else if (arg == L"--feedback") value(options.feedbackZip);
+		else if (arg == L"--meta") value(options.feedbackMeta);
+		else if (arg == L"--result") value(options.feedbackResult);
 		else if (arg == L"--notify") {
 			std::wstring text;
 			value(text);
@@ -1469,6 +1842,10 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
 		}
 		return 0;
 	}
+
+	// 反馈上传：只往外发一个包，不碰本地文件，也不需要管理员权限。
+	// 放在提权判断之前 —— 提示 UAC 只会让"点一下反馈"变成一道关卡。
+	if (!options.feedbackZip.empty()) return RunFeedbackUpload(options);
 
 	// The updater replaces files inside the install directory, so run elevated.
 	// The main program launches it without requesting elevation and this process
