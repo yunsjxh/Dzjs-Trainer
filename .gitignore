@@ -75,3 +75,6 @@ unlock-key-material/
 /Release-v*/
 /mtest.txt
 /.workbuddy/
+
+# Portable bundles produced by tools/Build-PortableBundle.ps1
+/dist/
