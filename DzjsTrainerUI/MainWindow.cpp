@@ -9421,17 +9421,393 @@ void MainWindow::HandleNetworkCommand(int command)
 	AppendNetworkResult(L"\u64cd\u4f5c\u5df2\u63d0\u4ea4");
 }
 
+// ============================================================================
+// 弹出菜单（Material 3）
+//
+// 原来这两处菜单都交给 TrackPopupMenu：方角、系统字体、灰底，跟整套圆角卡片
+// 摆在一起像从别的程序里借来的。这里自己画一份：色调表面、16 圆角、悬停与
+// 按下各压一层状态层，行高 42，键盘上下键 / 回车 / Esc 都能用。
+//
+// 窗口是分层的（UpdateLayeredWindow），圆角和投影才不会被方形窗口裁掉。
+// 绘制走 GDI+ 的 Bitmap 而不是 DIB 的 DC：往 DC 上画时 GDI+ 不保证写 alpha，
+// 分层窗口拿到的就是一块不透明的方块。画完 LockBits 拷进 DIB，顺便把颜色
+// 乘上 alpha 变成预乘 —— 不乘的话圆角边缘会挂一圈发白。
+// ============================================================================
+namespace {
+
+constexpr int kMd3MenuPad = 6;
+constexpr int kMd3ItemHeight = 42;
+constexpr int kMd3SeparatorHeight = 11;
+constexpr int kMd3Radius = 16;
+constexpr int kMd3TextInset = 16;
+constexpr float kMd3FontSize = 13.0f;
+constexpr wchar_t kMd3MenuClass[] = L"DzjsTrainerMd3Menu";
+
+struct Md3MenuItem {
+	std::wstring label;
+	UINT command = 0;
+	bool separator = false;
+	bool danger = false;
+};
+
+struct Md3MenuState {
+	HWND window = nullptr;
+	HWND owner = nullptr;
+	bool dark = false;
+	float scale = 1.0f;
+	std::vector<Md3MenuItem> items;
+	std::vector<int> tops;        // 每条目在逻辑坐标里的 y，分隔条也占一行
+	int widthLogical = 0;
+	int heightLogical = 0;
+	int widthPhysical = 0;
+	int heightPhysical = 0;
+	POINT origin{};               // 物理坐标
+	HBITMAP bitmap = nullptr;     // 提交给 UpdateLayeredWindow 的 DIB
+	HDC memoryDc = nullptr;
+	void* bits = nullptr;
+	int hover = -1;
+	int pressed = -1;
+	UINT result = 0;
+	bool finished = false;
+};
+
+int Md3ItemAt(const Md3MenuState& state, int logicalY)
+{
+	for (size_t i = 0; i < state.items.size(); ++i) {
+		const int top = state.tops[i];
+		const int height = state.items[i].separator ? kMd3SeparatorHeight : kMd3ItemHeight;
+		if (logicalY >= top && logicalY < top + height)
+			return state.items[i].separator ? -1 : static_cast<int>(i);
+	}
+	return -1;
+}
+
+// 键盘上下键用：跳过分隔条绕圈找下一个可选项。
+int Md3NextItem(const Md3MenuState& state, int from, int step)
+{
+	const int count = static_cast<int>(state.items.size());
+	if (count == 0) return -1;
+	for (int offset = 1; offset <= count; ++offset) {
+		const int index = ((from + step * offset) % count + count) % count;
+		if (!state.items[index].separator) return index;
+	}
+	return -1;
+}
+
+void Md3Render(Md3MenuState& state)
+{
+	if (state.memoryDc == nullptr) return;
+
+	Bitmap canvas(state.widthPhysical, state.heightPhysical, PixelFormat32bppARGB);
+	{
+		Graphics g(&canvas);
+		if (g.GetLastStatus() != Ok) return;
+		g.SetSmoothingMode(SmoothingModeAntiAlias);
+		g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+		g.Clear(Color(0, 0, 0, 0));
+		g.ScaleTransform(state.scale, state.scale);
+
+		const bool dark = state.dark;
+		const RectF container(0.5f, 0.5f, static_cast<REAL>(state.widthLogical) - 1.0f,
+			static_cast<REAL>(state.heightLogical) - 1.0f);
+		const Color surface = C(dark, 255, 255, 255, 30, 36, 34);
+		const Color outline = C(dark, 222, 228, 224, 58, 66, 62);
+		const Color onSurface = C(dark, 24, 30, 27, 226, 233, 229);
+		const Color dangerText = C(dark, 186, 26, 26, 255, 180, 171);
+		// 状态层按 MD3 的口径：悬停 8%，按下 12% 的主色。
+		const Color hoverLayer = dark ? Color(20, 130, 213, 199) : Color(18, 0, 107, 95);
+		const Color pressLayer = dark ? Color(32, 130, 213, 199) : Color(30, 0, 107, 95);
+
+		SoftShadow(g, container, static_cast<float>(kMd3Radius), dark, 1.3f);
+		FillRound(g, container, static_cast<float>(kMd3Radius), surface);
+		StrokeRound(g, container, static_cast<float>(kMd3Radius), outline);
+
+		for (size_t i = 0; i < state.items.size(); ++i) {
+			const Md3MenuItem& item = state.items[i];
+			const float top = static_cast<float>(state.tops[i]);
+			if (item.separator) {
+				const float y = top + kMd3SeparatorHeight / 2.0f;
+				Pen pen(outline, 1.0f);
+				g.DrawLine(&pen, 16.0f, y, static_cast<REAL>(state.widthLogical) - 16.0f, y);
+				continue;
+			}
+			const RectF row(static_cast<REAL>(kMd3MenuPad), top,
+				static_cast<REAL>(state.widthLogical - kMd3MenuPad * 2), static_cast<REAL>(kMd3ItemHeight));
+			if (static_cast<int>(i) == state.pressed) FillRound(g, row, 11.0f, pressLayer);
+			else if (static_cast<int>(i) == state.hover) FillRound(g, row, 11.0f, hoverLayer);
+			Text(g, item.label.c_str(), row.X + kMd3TextInset, top + 12.0f,
+				row.Width - kMd3TextInset * 2, 18.0f, kMd3FontSize, FontStyleRegular,
+				item.danger ? dangerText : onSurface);
+		}
+	}
+
+	BitmapData data{};
+	const Rect lockRect(0, 0, state.widthPhysical, state.heightPhysical);
+	if (canvas.LockBits(&lockRect, ImageLockModeRead, PixelFormat32bppARGB, &data) != Ok) return;
+	for (int y = 0; y < state.heightPhysical; ++y) {
+		const BYTE* source = static_cast<const BYTE*>(data.Scan0) + static_cast<ptrdiff_t>(y) * data.Stride;
+		BYTE* target = static_cast<BYTE*>(state.bits) + static_cast<ptrdiff_t>(y) * state.widthPhysical * 4;
+		for (int x = 0; x < state.widthPhysical; ++x) {
+			const BYTE alpha = source[x * 4 + 3];
+			// 预乘：分层窗口按 alpha 混合，颜色本身还得先乘一遍。
+			target[x * 4 + 0] = static_cast<BYTE>(source[x * 4 + 0] * alpha / 255);
+			target[x * 4 + 1] = static_cast<BYTE>(source[x * 4 + 1] * alpha / 255);
+			target[x * 4 + 2] = static_cast<BYTE>(source[x * 4 + 2] * alpha / 255);
+			target[x * 4 + 3] = alpha;
+		}
+	}
+	canvas.UnlockBits(&data);
+
+	BLENDFUNCTION blend{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+	SIZE size{ state.widthPhysical, state.heightPhysical };
+	POINT source{ 0, 0 };
+	// pptDst 传 nullptr：位置由 Md3RunMenu 用 SetWindowPos 定，这里只更新内容。
+	// 交给 UpdateLayeredWindow 去移动的话，窗口显示出之后的激活会把位置改掉。
+	UpdateLayeredWindow(state.window, nullptr, nullptr, &size, state.memoryDc, &source, 0, &blend, ULW_ALPHA);
+}
+
+void Md3Dismiss(Md3MenuState* state, UINT command)
+{
+	if (state == nullptr || state->finished) return;
+	state->result = command;
+	state->finished = true;
+	// 真销毁留给消息循环处理完这一条再做，避免在焦点 / 捕获回调里拆自己的窗口。
+	if (IsWindow(state->window)) PostMessageW(state->window, WM_CLOSE, 0, 0);
+}
+
+LRESULT CALLBACK Md3MenuProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
+{
+	Md3MenuState* state = reinterpret_cast<Md3MenuState*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+	if (message == WM_NCCREATE) {
+		const CREATESTRUCTW* create = reinterpret_cast<const CREATESTRUCTW*>(lParam);
+		state = static_cast<Md3MenuState*>(create->lpCreateParams);
+		SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+	}
+	if (state == nullptr) return DefWindowProcW(window, message, wParam, lParam);
+
+	switch (message) {
+	case WM_MOUSEMOVE: {
+		const int y = static_cast<int>(static_cast<short>(HIWORD(lParam)) / state->scale);
+		const int index = Md3ItemAt(*state, y);
+		if (index != state->hover) {
+			state->hover = index;
+			Md3Render(*state);
+		}
+		TRACKMOUSEEVENT track{ sizeof(track), TME_LEAVE, window, 0 };
+		TrackMouseEvent(&track);
+		return 0; }
+	case WM_MOUSELEAVE:
+		if (state->hover != -1) {
+			state->hover = -1;
+			Md3Render(*state);
+		}
+		return 0;
+	case WM_LBUTTONDOWN: {
+		const int y = static_cast<int>(static_cast<short>(HIWORD(lParam)) / state->scale);
+		state->pressed = Md3ItemAt(*state, y);
+		if (state->pressed >= 0) Md3Render(*state);
+		return 0; }
+	case WM_LBUTTONUP: {
+		const int y = static_cast<int>(static_cast<short>(HIWORD(lParam)) / state->scale);
+		const int index = Md3ItemAt(*state, y);
+		const int pressed = state->pressed;
+		state->pressed = -1;
+		if (index >= 0 && index == pressed)
+			Md3Dismiss(state, state->items[index].command);
+		else if (index < 0)
+			Md3Dismiss(state, 0);   // 点在投影或窗口外面：跟系统菜单一样关掉
+		else
+			Md3Render(*state);
+		return 0; }
+	case WM_RBUTTONDOWN:
+		Md3Dismiss(state, 0);
+		return 0;
+	case WM_KEYDOWN:
+		switch (wParam) {
+		case VK_ESCAPE:
+			Md3Dismiss(state, 0);
+			return 0;
+		case VK_RETURN:
+			if (state->hover >= 0) Md3Dismiss(state, state->items[state->hover].command);
+			return 0;
+		case VK_UP:
+		case VK_DOWN: {
+			const int start = state->hover;
+			const int next = Md3NextItem(*state, start < 0 ? (wParam == VK_UP ? 0 : -1) : start,
+				wParam == VK_UP ? -1 : 1);
+			if (next >= 0) {
+				state->hover = next;
+				Md3Render(*state);
+			}
+			return 0; }
+		default: break;
+		}
+		break;
+	case WM_KILLFOCUS:
+		Md3Dismiss(state, 0);
+		return 0;
+	case WM_CAPTURECHANGED:
+		if (reinterpret_cast<HWND>(lParam) != window) Md3Dismiss(state, 0);
+		return 0;
+	case WM_CLOSE:
+		DestroyWindow(window);
+		return 0;
+	case WM_DESTROY:
+		if (GetCapture() == window) ReleaseCapture();
+		state->window = nullptr;
+		return 0;
+	default: break;
+	}
+	return DefWindowProcW(window, message, wParam, lParam);
+}
+
+bool RegisterMd3MenuClass()
+{
+	static bool registered = false;
+	if (registered) return true;
+	WNDCLASSEXW cls{ sizeof(cls) };
+	cls.lpfnWndProc = Md3MenuProc;
+	cls.hInstance = GetModuleHandleW(nullptr);
+	cls.lpszClassName = kMd3MenuClass;
+	cls.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+	registered = RegisterClassExW(&cls) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+	return registered;
+}
+
+// anchor 是触发控件在屏幕上的物理矩形：菜单优先贴在它下面，放不下就翻到上面，
+// 横向夹在工作区里。
+UINT Md3RunMenu(HWND owner, const RECT& anchor, std::vector<Md3MenuItem> items, bool dark)
+{
+	if (items.empty() || owner == nullptr || !RegisterMd3MenuClass()) return 0;
+
+	Md3MenuState state;
+	state.owner = owner;
+	state.dark = dark;
+	state.items = std::move(items);
+	state.scale = AuxScale(owner);
+
+	// 量一遍最宽的标签。MeasureString 会带一点内边距，后面再留 10 像素余量。
+	int widest = 0;
+	{
+		Bitmap probe(1, 1, PixelFormat32bppARGB);
+		Graphics measure(&probe);
+		Font* font = ResolveTextFont(kMd3FontSize, FontStyleRegular);
+		for (const Md3MenuItem& item : state.items) {
+			if (item.separator) continue;
+			RectF bounds;
+			if (measure.MeasureString(item.label.c_str(), -1, font, PointF(0, 0), &bounds) == Ok)
+				widest = (std::max)(widest, static_cast<int>(bounds.Width + 0.5f));
+		}
+	}
+	state.widthLogical = (std::max)(190, widest + kMd3MenuPad * 2 + kMd3TextInset * 2 + 10);
+	state.heightLogical = kMd3MenuPad * 2;
+	for (const Md3MenuItem& item : state.items) {
+		state.tops.push_back(state.heightLogical);
+		state.heightLogical += item.separator ? kMd3SeparatorHeight : kMd3ItemHeight;
+	}
+
+	state.widthPhysical = (std::max)(1, static_cast<int>(std::lround(state.widthLogical * state.scale)));
+	state.heightPhysical = (std::max)(1, static_cast<int>(std::lround(state.heightLogical * state.scale)));
+
+	const RECT work = AuxWorkArea(owner);
+	int x = anchor.left;
+	int y = anchor.bottom + 6;
+	if (y + state.heightPhysical > work.bottom - 8) y = anchor.top - state.heightPhysical - 6;
+	if (y < work.top + 8) y = work.top + 8;
+	if (x + state.widthPhysical > work.right - 8) x = work.right - 8 - state.widthPhysical;
+	if (x < work.left + 8) x = work.left + 8;
+	state.origin.x = x;
+	state.origin.y = y;
+
+	BITMAPINFO info{};
+	info.bmiHeader.biSize = sizeof(info.bmiHeader);
+	info.bmiHeader.biWidth = state.widthPhysical;
+	info.bmiHeader.biHeight = -state.heightPhysical;   // 自上而下，和 GDI+ 的行序一致
+	info.bmiHeader.biPlanes = 1;
+	info.bmiHeader.biBitCount = 32;
+	info.bmiHeader.biCompression = BI_RGB;
+	void* bits = nullptr;
+	state.bitmap = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+	if (state.bitmap == nullptr || bits == nullptr) {
+		if (state.bitmap) DeleteObject(state.bitmap);
+		return 0;
+	}
+	state.bits = bits;
+	state.memoryDc = CreateCompatibleDC(nullptr);
+	if (state.memoryDc == nullptr) {
+		DeleteObject(state.bitmap);
+		return 0;
+	}
+	HGDIOBJ previous = SelectObject(state.memoryDc, state.bitmap);
+
+	state.window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, kMd3MenuClass, L"",
+		WS_POPUP, state.origin.x, state.origin.y, state.widthPhysical, state.heightPhysical,
+		owner, nullptr, GetModuleHandleW(nullptr), &state);
+	if (state.window == nullptr) {
+		SelectObject(state.memoryDc, previous);
+		DeleteDC(state.memoryDc);
+		DeleteObject(state.bitmap);
+		return 0;
+	}
+
+	Md3Render(state);
+	ShowWindow(state.window, SW_SHOWNA);
+	SetFocus(state.window);
+	SetCapture(state.window);
+	// 激活这一步会把窗口挪到一个我们没给过的坐标（观察到的 SetWindowPos 带
+	// SWP_NOSIZE|SWP_NOZORDER），菜单就跑到卡片左上角去了。所以在这一步之后
+	// 再摆一次，位置以 state.origin 为准。
+	SetWindowPos(state.window, HWND_TOPMOST, state.origin.x, state.origin.y,
+		state.widthPhysical, state.heightPhysical, SWP_NOACTIVATE);
+
+	// 用 TrackPopupMenu 的时候，这条循环是系统替我们跑的；现在得自己转。
+	MSG message{};
+	while (!state.finished) {
+		const BOOL got = GetMessageW(&message, nullptr, 0, 0);
+		if (got <= 0) {
+			if (got == 0) PostQuitMessage(0);
+			break;
+		}
+		TranslateMessage(&message);
+		DispatchMessageW(&message);
+	}
+
+	if (IsWindow(state.window)) DestroyWindow(state.window);
+	SelectObject(state.memoryDc, previous);
+	DeleteDC(state.memoryDc);
+	DeleteObject(state.bitmap);
+	return state.result;
+}
+
+}  // namespace
+
 void MainWindow::ShowPowerMenu()
 {
-	HMENU menu = CreatePopupMenu();
-	AppendMenuW(menu, MF_STRING, CMD_POWER_SHUTDOWN, L"\u5173\u95ed\u8ba1\u7b97\u673a");
-	AppendMenuW(menu, MF_STRING, CMD_POWER_RESTART, L"\u91cd\u65b0\u542f\u52a8\u8ba1\u7b97\u673a");
-	AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-	AppendMenuW(menu, MF_STRING, CMD_POWER_EXIT, L"\u9000\u51fa Dzjs Trainer");
-	POINT point{};
-	GetCursorPos(&point);
-	TrackPopupMenu(menu, TPM_RIGHTBUTTON, point.x, point.y, 0, _hWnd, nullptr);
-	DestroyMenu(menu);
+	// 和「电子教室操作」用同一套自绘菜单，免得一个圆角卡片风格的界面里跳出
+	// 一个系统方角菜单。
+	std::vector<Md3MenuItem> items;
+	auto addItem = [&items](const wchar_t* label, UINT command, bool danger = false) {
+		Md3MenuItem item;
+		item.label = label;
+		item.command = command;
+		item.danger = danger;
+		items.push_back(std::move(item));
+	};
+	addItem(L"\u5173\u95ed\u8ba1\u7b97\u673a", CMD_POWER_SHUTDOWN);
+	addItem(L"\u91cd\u65b0\u542f\u52a8\u8ba1\u7b97\u673a", CMD_POWER_RESTART);
+	{
+		Md3MenuItem separator;
+		separator.separator = true;
+		items.push_back(std::move(separator));
+	}
+	addItem(L"\u9000\u51fa Dzjs Trainer", CMD_POWER_EXIT, true);
+
+	POINT cursor{};
+	GetCursorPos(&cursor);
+	const RECT anchor{ cursor.x, cursor.y - 8, cursor.x, cursor.y - 8 };
+	SetForegroundWindow(_hWnd);
+	const UINT command = Md3RunMenu(_hWnd, anchor, std::move(items), darkMode);
+	if (command != 0) PostMessageW(_hWnd, WM_COMMAND, MAKEWPARAM(command, 0), 0);
 }
 
 void MainWindow::ShowEduMenu()
@@ -9441,10 +9817,24 @@ void MainWindow::ShowEduMenu()
 
 	// 结束和启动共用一个菜单。分成两个入口的话，用户得先自己判断「它现在算不算
 	// 在跑」才知道该点哪个，而这件事本来就是程序更清楚。
-	HMENU menu = CreatePopupMenu();
+	std::vector<Md3MenuItem> items;
+	auto addItem = [&items](std::wstring label, UINT command, bool danger = false) {
+		Md3MenuItem item;
+		item.label = std::move(label);
+		item.command = command;
+		item.danger = danger;
+		items.push_back(std::move(item));
+	};
+	auto addSeparator = [&items]() {
+		if (items.empty() || items.back().separator) return;
+		Md3MenuItem item;
+		item.separator = true;
+		items.push_back(std::move(item));
+	};
+
 	int running = 0;
 	if (hasJiYu) {
-		AppendMenuW(menu, MF_STRING, CMD_END_JIYU, L"\u6781\u57df\u7535\u5b50\u6559\u5ba4");
+		addItem(L"\u6781\u57df\u7535\u5b50\u6559\u5ba4", CMD_END_JIYU);
 		++running;
 	}
 	for (int i = 0; i < kEduProductCount; ++i) {
@@ -9457,13 +9847,14 @@ void MainWindow::ShowEduMenu()
 		if (!productRunning) continue;
 		std::wstring label = kEduProducts[i].name;
 		if (count > 1) label += L" \u00d7" + std::to_wstring(count);
-		AppendMenuW(menu, MF_STRING, CMD_END_EDU_BASE + i, label.c_str());
+		addItem(label, CMD_END_EDU_BASE + i);
 		++running;
 	}
 	// 只有一款在跑时，下面的「全部结束」和上面那条是同一件事，没必要占一行。
+	// 全部结束是不可逆的那一条，文字用强调色分出来。
 	if (running > 1) {
-		AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-		AppendMenuW(menu, MF_STRING, CMD_END_ALL, L"\u5168\u90e8\u7ed3\u675f");
+		addSeparator();
+		addItem(L"\u5168\u90e8\u7ed3\u675f", CMD_END_ALL, true);
 	}
 
 	// 启动这一半只列「装过、现在没跑」的。极域那一条沿用原来那句话的意思：
@@ -9476,41 +9867,41 @@ void MainWindow::ShowEduMenu()
 				startable.push_back(CMD_START_EDU_BASE + i);
 	}
 	if (!startable.empty()) {
-		AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+		addSeparator();
 		for (int command : startable) {
 			if (command == CMD_START_JIYU)
-				AppendMenuW(menu, MF_STRING, command, L"\u91cd\u542f\u7535\u5b50\u6559\u5ba4");
-			else {
-				std::wstring label = L"\u542f\u52a8";
-				label += kEduProducts[command - CMD_START_EDU_BASE].name;
-				AppendMenuW(menu, MF_STRING, command, label.c_str());
-			}
+				addItem(L"\u91cd\u542f\u7535\u5b50\u6559\u5ba4", command);
+			else
+				addItem(L"\u542f\u52a8" + std::wstring(kEduProducts[command - CMD_START_EDU_BASE].name), command);
 		}
 	}
 
-	if (running == 0 && startable.empty()) {
-		DestroyMenu(menu);
+	if (items.empty()) {
 		ShowFastTip(L"\u6ca1\u6709\u68c0\u6d4b\u5230\u7535\u5b50\u6559\u5ba4");
 		return;
 	}
 
-	POINT point{};
+	// 以快捷卡为锚点。actionRects 存的是逻辑坐标（整帧绘制前 ScaleTransform
+	// 过），ClientToScreen 要的是物理坐标，125% / 150% 下不换算会弹到左上角去。
+	RECT anchor{};
 	if (actionRects[2].right > actionRects[2].left) {
-		// actionRects 存的是逻辑坐标（整帧绘制前 ScaleTransform 过），
-		// ClientToScreen 要的是物理坐标，125% / 150% 下不换算会弹到左上角去。
-		point.x = ToPhysical(actionRects[2].left);
-		point.y = ToPhysical(actionRects[2].bottom) + 4;
-		ClientToScreen(_hWnd, &point);
+		POINT topLeft{ ToPhysical(actionRects[2].left), ToPhysical(actionRects[2].top) };
+		POINT bottomRight{ ToPhysical(actionRects[2].right), ToPhysical(actionRects[2].bottom) };
+		ClientToScreen(_hWnd, &topLeft);
+		ClientToScreen(_hWnd, &bottomRight);
+		anchor = RECT{ topLeft.x, topLeft.y, bottomRight.x, bottomRight.y };
 	}
 	else {
-		GetCursorPos(&point);
+		POINT cursor{};
+		GetCursorPos(&cursor);
+		anchor = RECT{ cursor.x, cursor.y, cursor.x, cursor.y };
 	}
+
 	SetForegroundWindow(_hWnd);
-	// 这一格贴着窗口下沿，菜单条目一多就会顶到任务栏。TPM_WORKAREA 让系统
-	// 把它挪回工作区，而不是让最后几项落在屏幕外面。
-	TrackPopupMenuEx(menu, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON | TPM_WORKAREA,
-		point.x, point.y, _hWnd, nullptr);
-	DestroyMenu(menu);
+	const UINT command = Md3RunMenu(_hWnd, anchor, std::move(items), darkMode);
+	// 菜单自己的消息循环里已经把点击处理完了，命令回到主窗口的消息队列再走，
+	// 免得在菜单销毁的半路上重入界面。
+	if (command != 0) PostMessageW(_hWnd, WM_COMMAND, MAKEWPARAM(command, 0), 0);
 }
 
 void MainWindow::ShowHelp()

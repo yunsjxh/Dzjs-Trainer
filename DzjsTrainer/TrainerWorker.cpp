@@ -1868,25 +1868,11 @@ static bool WaitProcessGone(DWORD pid, DWORD timeoutMs)
 	}
 }
 
-// 停不掉的服务宿主改成挂起。
-//
-// 服务进程被 TerminateProcess 掉，SCM 会当成一次异常退出，按服务的恢复策略把它
-// 重新启动 —— 红蜘蛛就是这样：checkapp2 这个服务停在「标记删除」状态，
-// ControlService 返回 1052，我们退回去杀 checkrs.exe，几秒后 SCM 又把它拉起来，
-// 它再把 REDAgent 拉起来，用户看到的就是「杀了还会重启」。挂起不触发恢复动作。
-// 某个 exe 是不是这款教室的学生端本身（联想传奇的 PsGhost 既是守护也是学生端）。
-static bool IsProductHostExe(const EduProduct& product, const wchar_t* exeName)
-{
-	if (exeName == nullptr) return false;
-	for (int r = 0; r < product.ruleCount; ++r)
-		if (_wcsicmp(product.rules[r].exe, exeName) == 0) return true;
-	return false;
-}
-
 // 按产品表找当前在跑的学生端进程。
 //
-// 必须过一遍路径特征：REDAgent.exe / Student.exe 这类名字不算独特，只按名字
-// 收集会把不相干的程序算成「电子教室在跑」，菜单里就多出一条结束项。
+// 判据和扫描注入用的是同一个 EduCompatMatch：名字不够独特的（REDAgent.exe、
+// Student.exe）要么对上路径特征，要么对上同目录的伴生文件，不然会把不相干的
+// 程序算成「电子教室在跑」，菜单里就多出一条结束项。
 static void CollectProductHostPids(const EduProduct& product, std::vector<DWORD>* out)
 {
 	if (out == nullptr) return;
@@ -1896,7 +1882,8 @@ static void CollectProductHostPids(const EduProduct& product, std::vector<DWORD>
 		for (DWORD pid : pids) {
 			std::wstring path;
 			if (!QueryProcessImagePath(pid, &path)) continue;
-			if (!EduPathContainsNoCase(path.c_str(), product.rules[r].pathHint)) continue;
+			const wchar_t* matched = EduCompatMatch(product.rules[r].exe, path.c_str());
+			if (matched == nullptr || _wcsicmp(matched, product.name) != 0) continue;
 			bool seen = false;
 			for (DWORD existing : *out) if (existing == pid) { seen = true; break; }
 			if (!seen) out->push_back(pid);
@@ -1921,6 +1908,18 @@ static bool AnyProductHostRunning(const EduProduct& product)
 	return !pids.empty();
 }
 
+// 结束一款教室之前先处理它的守护。
+//
+// 服务停了它的进程也就跟着没了。停不掉的那种（绿色安装、服务被删掉，或者服务
+// 停在「标记删除」状态，ControlService 返回 1052）就剩下进程本身。怎么收它看
+// 产品表里的 isHost：
+//
+//   isHost=true  它本身就是学生端（PsGhost），要的是「结束」—— 杀掉。
+//   isHost=false 纯守护（checkrs、Smonitor），挂起比杀更有效。服务进程被
+//                TerminateProcess 掉，SCM 会当成一次异常退出，按恢复策略把它
+//                重新拉起来 —— 红蜘蛛就是这样，杀了 checkrs 几秒后它又起来，
+//                再把 REDAgent 拉起来，用户看到的是「杀了还会重启」。挂起不
+//                触发恢复动作。
 int TrainerWorkerInternal::StopEduGuards(const EduProduct& product)
 {
 	int stopped = 0;
@@ -1938,13 +1937,8 @@ int TrainerWorkerInternal::StopEduGuards(const EduProduct& product)
 		const EduGuardRule& guard = product.guards[i];
 		stopped += StopServicesByImage(guard.exe, guard.service);
 
-		// 服务停下来了它的进程也就跟着没了；还留着的（绿色安装、服务被删掉，或者
-		// 服务本身停在「标记删除」状态压根停不掉）还得处理。
-		//
-		// 处理方式看它是不是学生端本身：PsGhost 这种既是守护又是学生端的，要的是
-		// 「结束」，杀掉；checkrs 这种纯守护，挂起比杀更有效 —— 服务进程被杀的
-		// 后果是 SCM 按恢复策略把它重新启动，等于白杀一次。
-		const bool alsoHost = IsProductHostExe(product, guard.exe);
+		// 服务停下来了它的进程也就跟着没了；还留着的还得按 isHost 收一遍。
+		const bool alsoHost = guard.isHost;
 		std::vector<DWORD> pids;
 		CollectProcessIdsByName(guard.exe, &pids);
 		if (pids.empty()) continue;

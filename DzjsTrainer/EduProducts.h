@@ -17,6 +17,7 @@
 #include <windows.h>
 #include <wchar.h>
 #include <string.h>
+#include <string>
 #include <stdlib.h>   // _countof
 
 // 注入到第三方进程的 hooks 实例，消息中心窗口用这个标题。
@@ -26,8 +27,12 @@
 #define EDZU_CUSTOM_HOST_WINDOW_TITLE L"Dzjs Trainer Custom Host Window"
 
 struct EduProcessRule {
-	const wchar_t* exe;       // 学生端进程名
-	const wchar_t* pathHint;  // 完整路径里必须出现的一段，不区分大小写
+	const wchar_t* exe;        // 学生端进程名
+	const wchar_t* pathHint;   // 完整路径里必须出现的一段，不区分大小写
+	// pathHint 为空时的第二判据：同目录（或上一级）里应该有的文件。
+	// 伽卡他卡这类国内软件装在中目录下，路径特征靠不住，但同目录的两个
+	// 进程是稳定的。两个都为空就只认进程名，留给名字足够独特的那些。
+	const wchar_t* companion;
 };
 
 // 结束一款教室之前要先停掉的上游。
@@ -39,6 +44,9 @@ struct EduProcessRule {
 struct EduGuardRule {
 	const wchar_t* exe;
 	const wchar_t* service;
+	// 它本身是不是学生端。是的话「结束」就是杀掉它；不是的话它只是守护，
+	// 杀掉会触发 SCM 的恢复策略把它拉回来，挂起才管用。
+	bool isHost;
 };
 
 struct EduProduct {
@@ -49,12 +57,24 @@ struct EduProduct {
 	int guardCount;
 };
 
-// 伽卡他卡：学生端 Smonitor.exe（服务 Smsvc），装在 ...\gakataka\Student\ 下。
+// 伽卡他卡：Student.exe 是主程序（窗口、锁屏都是它），Smonitor.exe 是守着它的
+// 那个（服务 Smsvc）。两个装在同一个目录。
+//
+// 这软件在国内基本装在中文目录下（D:\咖卡他卡安装\Student\），"gakataka" 这类
+// 英文特征一个都不命中，之前只登记了 Smonitor.exe + gakataka，等于整款漏掉。
+// 现在两个进程互为伴生：同目录里看见另一个，就认这个。
 static const EduProcessRule kGakatakaRules[] = {
+	{ L"Student.exe",  L"gakataka" },
+	{ L"Student.exe",  L"伽卡他卡" },
+	{ L"Student.exe",  L"咖卡他卡" },
+	{ L"Student.exe",  nullptr, L"Smonitor.exe" },
 	{ L"Smonitor.exe", L"gakataka" },
+	{ L"Smonitor.exe", L"伽卡他卡" },
+	{ L"Smonitor.exe", nullptr, L"Student.exe" },
+	{ L"Smonitor.exe", nullptr, nullptr },   // 这个名字本身够独特
 };
 static const EduGuardRule kGakatakaGuards[] = {
-	{ L"Smonitor.exe", L"Smsvc" },
+	{ L"Smonitor.exe", L"Smsvc", false },
 };
 
 // 红蜘蛛：学生端 REDAgent.exe，安装目录 ...\3000soft\Red Spider\。
@@ -64,7 +84,7 @@ static const EduProcessRule kRedSpiderRules[] = {
 };
 // checkrs.exe 负责拉起学生端，服务名未知，按 exe 反查。
 static const EduGuardRule kRedSpiderGuards[] = {
-	{ L"checkrs.exe", nullptr },
+	{ L"checkrs.exe", nullptr, false },
 };
 
 // 联想传奇：PsGhost 是守护进程，Student 才是学生端，两个都得进。
@@ -76,7 +96,7 @@ static const EduProcessRule kParasagaRules[] = {
 	{ L"Student.exe", L"parasaga" },
 };
 static const EduGuardRule kParasagaGuards[] = {
-	{ L"PsGhost.exe", nullptr },
+	{ L"PsGhost.exe", nullptr, true },
 };
 
 static const EduProduct kEduProducts[] = {
@@ -112,6 +132,28 @@ inline bool EduCompatNameCandidate(const wchar_t* exeName)
 	return false;
 }
 
+// imagePath 所在目录里有没有这个文件（找不到再看一级父目录）。
+// 只看文件属性，不打开文件，扫描时每个候选进程多两次系统调用，可以忽略。
+inline bool EduCompanionPresent(const wchar_t* imagePath, const wchar_t* fileName)
+{
+	if (!imagePath || !fileName || !*fileName) return false;
+	std::wstring folder(imagePath);
+	size_t slash = folder.find_last_of(L"\\/");
+	if (slash == std::wstring::npos || slash < 2) return false;
+	folder.resize(slash);
+	for (int level = 0; level < 2 && folder.size() > 2; ++level)
+	{
+		const std::wstring probe = folder + L"\\" + fileName;
+		const DWORD attributes = GetFileAttributesW(probe.c_str());
+		if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+			return true;
+		slash = folder.find_last_of(L"\\/");
+		if (slash == std::wstring::npos || slash < 2) break;
+		folder.resize(slash);
+	}
+	return false;
+}
+
 // 命中返回产品名，否则 nullptr。
 inline const wchar_t* EduCompatMatch(const wchar_t* exeName, const wchar_t* fullPath)
 {
@@ -123,7 +165,14 @@ inline const wchar_t* EduCompatMatch(const wchar_t* exeName, const wchar_t* full
 		{
 			const EduProcessRule& rule = product.rules[r];
 			if (_wcsicmp(exeName, rule.exe) != 0) continue;
-			if (!EduPathContainsNoCase(fullPath, rule.pathHint)) continue;
+			if (rule.pathHint && *rule.pathHint)
+			{
+				if (!EduPathContainsNoCase(fullPath, rule.pathHint)) continue;
+			}
+			else if (rule.companion && *rule.companion)
+			{
+				if (!EduCompanionPresent(fullPath, rule.companion)) continue;
+			}
 			return product.name;
 		}
 	}
