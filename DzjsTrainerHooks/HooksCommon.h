@@ -108,12 +108,49 @@ extern bool allowMonitor, allowControl, allowGbTop, fakeFull, gbFullManual;
 // 其余行为复用已有开关：allowAllRunOp（远程运行）、ProhibitKillProcess（结束进程/关机）、
 // ProhibitCloseWindow（关闭窗口）、allowControl（远程控制/输入注入）、allowMonitor（查看屏幕）。
 extern bool blockWindowOps, blockDriverAccess;
+// 全屏 / 置顶的现场询问（2026-11-21）。**默认开**，与 BlockWindowOps 分开：
+// 那个开关管的是「静默拦下所有窗口操作」，而这里只是把最扎眼的两种先问一句，
+// 用户点了是就原样放行，不算拦截。ini 里写 AskWindowOps=FALSE 可关。
+extern bool askWindowOps;
 // 关机拦截（2026-11-21）。与 ProhibitKillProcess 分开是刻意的：那个开关默认关，
 // 而且只管「结束进程」。关机/重启/注销单独一根开关，默认**开** —— 学生机上
 // 被教师端关掉一次就得重来，代价比误拦一次大得多。ini 里写 BlockShutdown=FALSE 可关。
 extern bool blockShutdown;
 // 告诉主程序「刚刚挡下了一次关机」。内部会起线程走 WM_COPYDATA，不阻塞调用方。
 void VNotifyShutdownBlocked(const wchar_t* api);
+
+// ===== 全屏 / 置顶的现场询问（2026-11-21）===================================
+// 被注入窗口（jiYuWnds 里的广播/黑屏窗口）要全屏或置顶时，不再静默吞掉，
+// 而是问用户一句：允许就按原参数重放这次调用，拒绝就记住，之后直接挡。
+// 决定按窗口记，窗口销毁时清；还没有消息中心可问时直接放行（不静默干预）。
+//
+// 为什么不在钩子里同步弹框：这些调用发生在极域自己的 UI 线程上，模态框会把
+// 「全屏」那一步卡住直到用户回答，中间的绘制和计时器全部停摆。所以第一次只
+// 拦不问，PostMessage 到消息中心线程弹框，用户答「是」以后再重放。
+enum : int {
+	VOP_SRC_SETWINDOWPOS  = 0,
+	VOP_SRC_MOVEWINDOW    = 1,
+	VOP_SRC_SETWINDOWLONG = 2,
+};
+
+struct WindowOpRequest {
+	int   source;
+	HWND  hwnd;
+	HWND  insertAfter;
+	int   x, y, cx, cy;
+	UINT  flags;
+	int   index;
+	LONG  value;
+	bool  wide;        // SetWindowLong 的 A/W 版本
+};
+
+// 返回 true = 调用方继续执行原操作；false = 已拦下，等用户答复后由 UI 线程重放。
+bool VAllowWindowOp(const WindowOpRequest& req, bool full, bool top);
+// 窗口销毁时清掉决定与待重放请求。
+void VForgetWindowOp(HWND hWnd);
+// 右键菜单「允许全屏和置顶」：改成允许，并把上一次被挡的请求补上。
+void VGrantWindowOps(HWND hWnd);
+
 // 只记录模式下的动作记录：按总量采样，避免热路径刷爆日志文件。
 void VRecordHook(const wchar_t* name, const wchar_t* fmt, ...);
 // 视频流替换是否开启（g_VideoProps 定义在 DzjsTrainerHooks.cpp，guard 模块看不到它）。
