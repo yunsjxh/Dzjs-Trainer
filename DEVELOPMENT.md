@@ -68,6 +68,7 @@ SDK 版本对不上时：用户态工程写的是 `10.0`，自动取本机最新
 - **单工程构建必须显式给 `-p:SolutionDir=<仓库根>\`。** 否则 `$(SolutionDir)` 会解析到 vcxproj 所在目录，资源路径和输出路径全错。
 - **`-p:BuildProjectReferences=false` 不会重建 `DzjsTrainerUI` 静态库。** 只改 UI 时先单独编 UI，再编主程序；判据是新符号真的进了 `Release/DzjsTrainerUI.lib`（`dumpbin /symbols` 或直接 grep），不是构建返回 0。
 - **发版时重建主程序会把压好的 `DzjsTrainerUpdater.exe` 覆盖回未压缩版。** 主工程对它有 ProjectReference，`-t:Rebuild` 会连带重建依赖，`upx -9` 白做，内嵌进主程序的是 275 KB 的胖版。压完只能 `-t:Build -p:BuildProjectReferences=false` 重链；判据是内嵌资源的 size（压缩后约 130 KB），不是"构建成功"。
+- **内存紧张时 `MainWindow.cpp` 会报 `C1060: 编译器的堆空间不足`。** 32 位 cl.exe 的堆先到顶，跟代码无关——本机开着两个 VMware 虚拟机、空闲内存只剩 1 GB 时必现。临时给 `Release|Win32` 的 `AdditionalOptions` 加 `/Zm500` 编一次，编完还原；根治是少开一个虚拟机。`PreferredToolArchitecture=x64` 不行，它会把工具集换成 14.42。
 - **`/t:Build` 会静默跳过它认为「最新」的工程。** 构建成功与否看产物时间戳，不看退出码。
 - **带中文注释的源文件必须是 UTF-8 BOM。** MSVC 在没有 BOM 时按本地代码页读，中文注释会把后面的换行和字符串一起吃掉，报出来的错误位置和真实位置对不上。
 - **Boost 只能外部提供。** `DzjsTrainerUI` 的 `TeacherEndpoint/` 用 asio，仓库不含 Boost 本体，通过 `-p:BoostIncludeDir=` 传入；路径不对会在编译前直接报错，不会编到一半才炸。
