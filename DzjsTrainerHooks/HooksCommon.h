@@ -117,7 +117,9 @@ extern bool blockShutdown;
 // 以为自己是全屏，底下的绘制层照旧铺满，屏幕上只剩一片黑。
 //   WindowedPercent  窗口占工作区的百分比（25..95，默认 70）
 //   BlockTopmost     摘掉 WS_EX_TOPMOST / HWND_TOPMOST（默认开）
-extern bool forceWindowed, blockTopmost;
+//   AskFullScreen    全屏请求先弹框问一次；答「是」放行，答「否」才改成窗口。
+//                    默认开。关掉就是「直接改窗口」，不打扰。
+extern bool forceWindowed, blockTopmost, askFullScreen;
 extern int  windowedPercent;
 // 采样被强制窗口化的窗口，把用户手动拖过的尺寸按窗口类记下来。消息中心定时器调用。
 void VEduSampleTrackedWindows();

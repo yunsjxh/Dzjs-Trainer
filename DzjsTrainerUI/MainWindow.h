@@ -328,6 +328,8 @@ private:
 	// 而不是直接吞掉请求。档位是窗口占工作区的百分比，按 50/60/70/80/90 循环。
 	bool setForceWindowed = true;
 	int  setWindowedPercent = 70;
+	// 全屏请求先问一句：答「是」放行，答「否」才改成窗口。关掉就是直接改窗口。
+	bool setAskFullScreen = true;
 	// Information-stream protection is deliberately session-only.  It is reset
 	// when the program exits and is never written to the normal settings file.
 	bool temporaryVideoProtection = false;
@@ -344,6 +346,8 @@ private:
 	std::array<RECT, 10> toggleRects{};
 	// 「强制窗口化」卡片里那颗百分比胶囊的命中区。点一下换下一档。
 	RECT windowedPctRect{};
+	// 同一张卡片里的「询问 / 直改」胶囊。
+	RECT windowedAskRect{};
 	RECT temporaryVideoEnableRect{};
 	RECT temporaryVideoImageModeRect{};
 	RECT temporaryVideoFileModeRect{};

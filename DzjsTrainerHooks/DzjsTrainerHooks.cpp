@@ -167,7 +167,7 @@ bool blockWindowOps = false, blockDriverAccess = false;
 // 而是「机器别被教师端关掉」这条底线，所以 ini 缺键时按 TRUE 处理。
 bool blockShutdown = true;
 // 强制窗口化默认开：全屏请求一律改成工作区里的窗口，并摘掉置顶。
-bool forceWindowed = true, blockTopmost = true;
+bool forceWindowed = true, blockTopmost = true, askFullScreen = true;
 int  windowedPercent = 70;
 bool whitePreviewOnly = false;
 // 「进程注入」功能：主程序把本 DLL 注入到用户指定的非极域进程时，
@@ -911,6 +911,10 @@ void VInitSettings()
 	windowedPercent = GetPrivateProfileIntW(L"JTSettings", L"WindowedPercent", 70, mainIniPath);
 	if (windowedPercent < 25) windowedPercent = 25;
 	if (windowedPercent > 95) windowedPercent = 95;
+	// 先问再改：默认开，安静模式才写 FALSE。
+	GetPrivateProfileString(L"JTSettings", L"AskFullScreen", L"TRUE", w, 32, mainIniPath);
+	if (StrEqual(w, L"FALSE") || StrEqual(w, L"false") || StrEqual(w, L"0")) askFullScreen = false;
+	else askFullScreen = true;
 	
 	GetPrivateProfileString(L"JTSettings", L"DoNotShowVirusWindow", L"TRUE", w, 32, mainIniPath);
 	if (!StrEqual(w, L"TRUE") && !StrEqual(w, L"true") && !StrEqual(w, L"1")) doNotShowVirusWindow = false;

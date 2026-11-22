@@ -4838,13 +4838,25 @@ void MainWindow::PaintProtection(Graphics& g, int width, int height, int offsetY
 			const float toggleTextY = cardY + toggleRowH / 2.0f - 12.0f;
 			// 最后一项（强制窗口化）右边除了开关，还要塞一个百分比胶囊，文字让出位置。
 			const bool pctCard = (i == kProtectionToggleCount - 1);
-			Text(g, kToggleLabels[i], cardX + 18, toggleTextY, cardW - (pctCard ? 172.0f : 100.0f), 25, 12, FontStyleRegular,
+			Text(g, kToggleLabels[i], cardX + 18, toggleTextY, cardW - (pctCard ? 232.0f : 100.0f), 25, 12, FontStyleRegular,
 				C(darkMode, 40, 46, 43, 220, 229, 225));
 			if (pctCard) {
 				const float pctW = 56.0f;
 				const float pctH = 24.0f;
 				const float pctX = cardX + cardW - 62 - 12 - pctW;
 				const float pctY = cardY + toggleRowH / 2.0f - pctH / 2.0f;
+				// 「询问 / 直改」：全屏请求先问一句，还是直接改成窗口。点一下互换。
+				const float askW = 52.0f;
+				const float askX = pctX - 8 - askW;
+				windowedAskRect = { static_cast<LONG>(askX), static_cast<LONG>(pctY),
+					static_cast<LONG>(askX + askW), static_cast<LONG>(pctY + pctH) };
+				FillRound(g, RectF(askX, pctY, askW, pctH), 12,
+					setAskFullScreen ? C(darkMode, 246, 238, 222, 60, 50, 34)
+						: C(darkMode, 230, 240, 235, 44, 56, 52));
+				Text(g, setAskFullScreen ? L"\u8be2\u95ee" : L"\u76f4\u6539", askX, pctY + 3.0f, askW, 18, 11, FontStyleBold,
+					setAskFullScreen ? C(darkMode, 150, 96, 0, 236, 190, 118)
+						: C(darkMode, 0, 107, 95, 130, 213, 199), StringAlignmentCenter);
+
 				windowedPctRect = { static_cast<LONG>(pctX), static_cast<LONG>(pctY),
 					static_cast<LONG>(pctX + pctW), static_cast<LONG>(pctY + pctH) };
 				FillRound(g, RectF(pctX, pctY, pctW, pctH), 12,
@@ -4870,8 +4882,9 @@ void MainWindow::PaintProtection(Graphics& g, int width, int height, int offsetY
 		for (RECT& rect : toggleRects) rect = {};
 		driverLoadRect = {};
 		saveSettingsRect = {};
-		// 替换画面页没有这颗胶囊，不清掉的话点在原位置仍会命中。
+		// 替换画面页没有这两颗胶囊，不清掉的话点在原位置仍会命中。
 		windowedPctRect = {};
+		windowedAskRect = {};
 	}
 	if (!replacementPage) {
 		const DriverStatusInfo& status = CurrentDriverStatus();
@@ -9359,6 +9372,14 @@ void MainWindow::HandleClick(POINT point)
 			InvalidateRect(_hWnd, nullptr, FALSE);
 			return;
 		}
+		// 询问 / 直改：只在「强制窗口化」打开时可点。
+		if (setForceWindowed && Hit(windowedAskRect, point)) {
+			setAskFullScreen = !setAskFullScreen;
+			SaveSettings();
+			ShowFastTip(setAskFullScreen ? L"全屏请求：先询问" : L"全屏请求：直接改成窗口");
+			InvalidateRect(_hWnd, nullptr, FALSE);
+			return;
+		}
 		// 百分比胶囊：点一下换下一档。只在"强制窗口化"打开时可点，
 		// 关掉之后整块区域不响应，免得用户以为改了尺寸、实际什么都没发生。
 		if (setForceWindowed && Hit(windowedPctRect, point)) {
@@ -11377,6 +11398,7 @@ void MainWindow::LoadSettings()
 	setWindowedPercent = settings->GetSettingInt(L"WindowedPercent", 70);
 	if (setWindowedPercent < 25) setWindowedPercent = 25;
 	if (setWindowedPercent > 95) setWindowedPercent = 95;
+	setAskFullScreen = settings->GetSettingBool(L"AskFullScreen", true);
 	setDoNotShowTrayIcon = settings->GetSettingBool(L"DoNotShowTrayIcon", false);
 	// These keys are written by ApplyTemporaryVideoProtection and are also what the
 	// injected hooks read out of the same ini, so they have to be read back here.
@@ -11424,6 +11446,7 @@ void MainWindow::SaveSettings()
 	settings->SetSettingBool(L"ForceWindowed", setForceWindowed);
 	settings->SetSettingBool(L"BlockTopmost", setForceWindowed);
 	settings->SetSettingInt(L"WindowedPercent", setWindowedPercent);
+	settings->SetSettingBool(L"AskFullScreen", setAskFullScreen);
 	settings->SetSettingBool(L"AllowMonitor", setAllowMonitor);
 	settings->SetSettingBool(L"AllowControl", setAllowControl);
 	if (currentWorker) {

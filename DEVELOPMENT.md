@@ -182,10 +182,11 @@ AES 那半边的拆分明文（partA / partB 异或还原）**硬编码在三处
 
 - 判据在 `VEduRequestCoversMonitor`：尺寸达到监视器（±2px）或工作区（±4px）就算全屏请求，多显示器按窗口所在那块算。
 - 改写后的矩形是工作区的百分比，默认 70%，`[JTSettings] WindowedPercent` 可调（25..95）。界面上是「强制窗口化」那张卡片里的百分比胶囊，点一下 50/60/70/80/90 循环。
-- 同时补 `WS_CAPTION | WS_THICKFRAME | WS_SYSMENU`。广播窗口多半是 `WS_POPUP`，不改样式的话改小了也没法拖，等于把人困在小窗口里。
+- **先问一句还是直接改，是可选的**（`[JTSettings] AskFullScreen`，默认 TRUE，卡片上的「询问 / 直改」胶囊点一下互换）。问的时候弹的是 `MessageBoxW`：答「是」原样放行（也保留置顶），答「否」才改成窗口。答案按窗口记 10 分钟 —— 广播会连着发一串全屏请求，每帧问一次没法用；10 分钟后、或者宿主换了新窗口，会重新问。**框是从调用线程弹的**，宿主正想抢屏幕，停下来等一句话不影响它；框开着的时候窗口钩子一律放行（`g_eduAsking`），否则框自己会被我们摘掉置顶、藏到广播层后面去。30 秒没人答自动关掉，按「否」处理。
+- 同时补 `WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX`，并把 `WS_EX_TOOLWINDOW` 换成 `WS_EX_APPWINDOW`。广播窗口多半是 `WS_POPUP | WS_EX_TOOLWINDOW`：不改样式改小了没法拖；而工具窗口的标题栏是小号的、只有一颗关闭按钮，没有最小化/最大化，任务栏和 Alt+Tab 里也看不见 —— 「最小化去哪了」就是这么来的。
 - **用户拖过的尺寸会按窗口类记住**：`TIMER_WINDOWED_SAMPLE` 每 1.2 秒采样一次被改写过的窗口，尺寸与上次摆的差超过 16px 就换算成工作区百分比存进 `g_eduClassSizes`。宿主每次广播新建窗口时直接沿用，用户不用每节课重调。换算用 `min(宽比, 高比)`，因为拉宽不拉高时窗口偏扁。
 - **置顶一并摘掉**：`SetWindowPos` 的 `HWND_TOPMOST` 换成 `HWND_NOTOPMOST`，`SetWindowLong(GWL_EXSTYLE)` 里带 `WS_EX_TOPMOST` 的直接掩掉，每次 `SetWindowPos` 再顺手检查并清除已有的置顶位（`SetWindowLongPtr` 那条路拦不到样式，靠这一步兜）。`[JTSettings] BlockTopmost` 可以单独关，界面上跟随「强制窗口化」开关。
-- **创建时就铺满的窗口另有巡查**（`VEduSweepFullScreenWindows`，跟着同一个定时器跑）。这类窗口不经过 `SetWindowPos`，钩子看不见。巡查只碰「置顶」或「没有标题栏」的窗口 —— 用户自己最大化的普通窗口有标题栏、不置顶，不该每 1.2 秒被改回来一次。
+- **创建时就铺满的窗口另有巡查**（`VEduSweepFullScreenWindows`，跟着同一个定时器跑）。这类窗口不经过 `SetWindowPos`，钩子看不见。巡查只碰「置顶」或「没有标题栏」的窗口 —— 用户自己最大化的普通窗口有标题栏、不置顶，不该每 1.2 秒被改回来一次。**询问模式下这趟巡查不干活**：它跑在消息中心线程上，从那里弹框会把消息中心卡住。
 - 这条路径**不依赖 `BlockWindowOps`**。那个开关管的是极域那套「吞掉窗口操作」，默认关；强制窗口化是行为策略，默认开，两个开关各管各的。极域的 `fakeFull`（用户主动开假全屏）仍然优先放行。
 
 日志走 `hkb:windowed:<窗口类>:<原尺寸>:<新尺寸>`，主日志里是 `Windowed window class=... 1920x1080 -> 1344x722`。宿主每次广播会连着请求好几次，钩子侧按窗口 2 秒节流，不会刷屏。

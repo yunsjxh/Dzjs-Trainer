@@ -93,12 +93,156 @@ static void VEduTrackWindow(HWND hWnd, int cx, int cy)
 	ReleaseSRWLockExclusive(&g_eduWinLock);
 }
 
+static void VEduResetAnswers();
+
 void VEduResetWindowedState()
 {
 	AcquireSRWLockExclusive(&g_eduWinLock);
 	SecureZeroMemory(g_eduTracked, sizeof(g_eduTracked));
 	SecureZeroMemory(g_eduClassSizes, sizeof(g_eduClassSizes));
 	ReleaseSRWLockExclusive(&g_eduWinLock);
+	VEduResetAnswers();
+}
+
+static bool VEduRequestCoversMonitor(HWND hWnd, int cx, int cy);
+
+// ===== 全屏请求的询问 ========================================================
+// 「先问一句」这条路径按窗口记答案：广播时宿主会连着发一串全屏请求（改尺寸、
+// 再置顶、再改一次），每帧问一次没法用。同一个窗口在 10 分钟内沿用第一次的答案；
+// 窗口标题/用途变了、10 分钟过了会重新问。
+//
+// 框是从**调用线程**弹的，也就是宿主自己的 UI 线程 —— 它本来就是要抢屏幕，
+// 停下来等一句话不影响它。但在框里 pumping 消息会让同一路径重入，所以用
+// g_eduAsking 挡住：正在问的时候别的请求一律放行，免得叠出第二层框。
+struct VEduAnswer {
+	HWND      hwnd;
+	bool      allow;
+	ULONGLONG tick;
+};
+
+static VEduAnswer g_eduAnswers[8] = {};
+static SRWLOCK g_eduAnswerLock = SRWLOCK_INIT;
+static volatile LONG g_eduAsking = 0;
+
+static const ULONGLONG kEduAnswerTtlMs = 10ULL * 60 * 1000;
+static const WCHAR kEduAskTitle[] = L"极宇训练器 - 全屏请求";
+// 框要是没人答，宿主就一直停在那儿。30 秒后自己关掉，按「否」处理。
+static const int kEduAskTimeoutSec = 30;
+
+// 框开着的时候窗口钩子一律放行，这个框也是窗口，摘掉它的置顶就会藏到广播层
+// 后面去 —— 用户看不见框、宿主又在等那句回答，两边一起卡住。
+static DWORD WINAPI VEduAskTimeoutThread(LPVOID param)
+{
+	// 等框真出来再开始计时：CreateWindow 之前的那点时间不算。
+	for (int i = 0; i < 50; ++i) {
+		Sleep(100);
+		if (FindWindowW(L"#32770", kEduAskTitle)) break;
+	}
+	Sleep(static_cast<DWORD>(kEduAskTimeoutSec) * 1000);
+	HWND box = FindWindowW(L"#32770", kEduAskTitle);
+	if (box) PostMessageW(box, WM_CLOSE, 0, 0);
+	return 0;
+}
+
+static void VEduResetAnswers()
+{
+	AcquireSRWLockExclusive(&g_eduAnswerLock);
+	SecureZeroMemory(g_eduAnswers, sizeof(g_eduAnswers));
+	ReleaseSRWLockExclusive(&g_eduAnswerLock);
+}
+
+// 查这个窗口上一次答的是什么。查不到返回 false（该问了）。
+static bool VEduLookupAnswer(HWND hWnd, bool& allow)
+{
+	allow = false;
+	if (!hWnd) return false;
+	const ULONGLONG now = GetTickCount64();
+	bool found = false;
+	AcquireSRWLockShared(&g_eduAnswerLock);
+	for (int i = 0; i < _countof(g_eduAnswers); ++i) {
+		if (g_eduAnswers[i].hwnd != hWnd) continue;
+		if (now - g_eduAnswers[i].tick > kEduAnswerTtlMs) break;
+		allow = g_eduAnswers[i].allow;
+		found = true;
+		break;
+	}
+	ReleaseSRWLockShared(&g_eduAnswerLock);
+	return found;
+}
+
+static void VEduRememberAnswer(HWND hWnd, bool allow)
+{
+	if (!hWnd) return;
+	const ULONGLONG now = GetTickCount64();
+	AcquireSRWLockExclusive(&g_eduAnswerLock);
+	int slot = -1;
+	int oldest = 0;
+	for (int i = 0; i < _countof(g_eduAnswers); ++i) {
+		if (g_eduAnswers[i].hwnd == hWnd) { slot = i; break; }
+		if (!g_eduAnswers[i].hwnd) { slot = i; break; }
+		if (g_eduAnswers[i].tick < g_eduAnswers[oldest].tick) oldest = i;
+	}
+	if (slot < 0) slot = oldest;
+	g_eduAnswers[slot].hwnd = hWnd;
+	g_eduAnswers[slot].allow = allow;
+	g_eduAnswers[slot].tick = now;
+	ReleaseSRWLockExclusive(&g_eduAnswerLock);
+}
+
+// 这个窗口是不是刚被「允许全屏」过。置顶拦截要认它：用户点了允许，再把人家的
+// 置顶摘掉，广播窗口就会缩到别的窗口后面去。
+static bool VEduFullScreenAllowed(HWND hWnd)
+{
+	bool allow = false;
+	if (!askFullScreen) return false;
+	return VEduLookupAnswer(hWnd, allow) && allow;
+}
+
+// 返回值：true = 放行全屏，false = 改成窗口。
+static bool VEduAskFullScreen(HWND hWnd, int cx, int cy)
+{
+	bool allow = false;
+	if (VEduLookupAnswer(hWnd, allow)) return allow;
+	// 看不见的窗口（还在构造、或本来就藏着）别问，宿主自己都没露脸。
+	if (hWnd && !IsWindowVisible(hWnd)) return true;
+	if (InterlockedCompareExchange(&g_eduAsking, 1, 0) != 0) return true;
+
+	WCHAR cls[48] = {};
+	VEduClassNameOf(hWnd, cls, _countof(cls));
+	WCHAR title[128] = {};
+	GetWindowTextW(hWnd, title, _countof(title));
+
+	WCHAR text[768];
+	swprintf_s(text,
+		L"「%s」请求铺满整个屏幕（%d × %d）。\n\n"
+		L"选「是」：照它说的全屏。\n"
+		L"选「否」：改成工作区 %d%% 的可拖动窗口，可以自己拉大小。\n\n"
+		L"同一个窗口 10 分钟内不再询问。",
+		title[0] ? title : (cls[0] ? cls : L"电子教室"), cx, cy, windowedPercent);
+
+	HANDLE timeout = CreateThread(NULL, 0, VEduAskTimeoutThread, NULL, 0, NULL);
+	if (timeout) CloseHandle(timeout);
+
+	// 框要压在置顶窗口上面：MB_TOPMOST 之外再给个前台，宿主的广播层抢不走。
+	const int answer = MessageBoxW(hWnd, text, kEduAskTitle,
+		MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND | MB_DEFBUTTON1);
+	InterlockedExchange(&g_eduAsking, 0);
+
+	allow = (answer == IDYES);
+	VEduRememberAnswer(hWnd, allow);
+	VDebugLog(L"windowed ask hwnd=%p class=%s title=%s %dx%d -> %s",
+		hWnd, cls[0] ? cls : L"-", title[0] ? title : L"-", cx, cy,
+		allow ? L"allow" : L"windowed");
+	return allow;
+}
+
+// 全屏请求的最终裁决：要不要改写成窗口。askFullScreen 打开时先问一句。
+static bool VEduShouldWindow(HWND hWnd, int cx, int cy)
+{
+	if (!loaded || !forceWindowed || !hWnd) return false;
+	if (!VEduRequestCoversMonitor(hWnd, cx, cy)) return false;
+	if (askFullScreen && VEduAskFullScreen(hWnd, cx, cy)) return false;
+	return true;
 }
 
 // 请求里的尺寸是否铺满显示器。90% 那种「快满了」不算 —— 电子教室的广播画面
@@ -156,16 +300,27 @@ static void VEduWindowedRect(HWND hWnd, int& x, int& y, int& cx, int& cy)
 
 // 补上标题栏和可缩放的边框。全屏窗口多半是 WS_POPUP，没有边框的话即使改小了
 // 也没法拖 —— 等于把用户困在一个小窗口里。
+//
+// 扩展样式也得动：广播窗口基本都是 WS_EX_TOOLWINDOW，工具窗口的标题栏是小号的，
+// 只有一颗关闭按钮，没有最小化/最大化、标题栏上也没有图标，任务栏和 Alt+Tab 都
+// 看不见它。换成 WS_EX_APPWINDOW 之后才是一颗能最小化、能右键出系统菜单的普通窗口。
 static void VEduEnsureResizable(HWND hWnd)
 {
 	const LONG style = GetWindowLongW(hWnd, GWL_STYLE);
 	if (style & WS_CHILD) return;
 	const LONG want = style | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
-	if (want == style) return;
-	if (faSetWindowLongW)
-		faSetWindowLongW(hWnd, GWL_STYLE, want);
-	else
-		SetWindowLongW(hWnd, GWL_STYLE, want);
+	const LONG exStyle = GetWindowLongW(hWnd, GWL_EXSTYLE);
+	const LONG exWant = (exStyle & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW;
+	const bool styleChanged = (want != style);
+	const bool exChanged = (exWant != exStyle);
+	if (!styleChanged && !exChanged) return;
+	if (styleChanged) {
+		if (faSetWindowLongW)
+			faSetWindowLongW(hWnd, GWL_STYLE, want);
+		else
+			SetWindowLongW(hWnd, GWL_STYLE, want);
+	}
+	if (exChanged) SetWindowLongW(hWnd, GWL_EXSTYLE, exWant);
 	if (raSetWindowPos) {
 		// WS_THICKFRAME 要配合 SWP_FRAMECHANGED，边框才会立刻长出来。
 		raSetWindowPos(hWnd, NULL, 0, 0, 0, 0,
@@ -292,7 +447,10 @@ static BOOL CALLBACK VEduSweepProc(HWND hWnd, LPARAM lp)
 
 void VEduSweepFullScreenWindows()
 {
-	if (!loaded || !forceWindowed) return;
+	// 询问模式下巡查不干活：这条路径跑在消息中心线程上，从那里弹框会把消息中心
+	// 卡住（上一轮「连原来能用的都用不了了」就是这么来的）。询问只在这几个窗口
+	// 钩子里做，那是宿主自己的线程，停了也只是它自己在等一句话。
+	if (!loaded || !forceWindowed || askFullScreen) return;
 	VEduSweepCtx ctx = {};
 	EnumWindows(VEduSweepProc, reinterpret_cast<LPARAM>(&ctx));
 }
@@ -385,17 +543,21 @@ BOOL WINAPI hkSetWindowPos(HWND hWnd, HWND hWndInsertAfter, int x, int y, int cx
 	VTraceHook(L"hkSetWindowPos");
 	if (loaded)
 	{
+		// 正在弹「全屏请求」的框：这段时间原样放行。框自己也要走 SetWindowPos，
+		// 被摘掉置顶就藏到广播层后面去了。
+		if (g_eduAsking) return raSetWindowPos(hWnd, hWndInsertAfter, x, y, cx, cy, uFlags);
 		const bool fakeAllowed = fakeFull && VIsWindowGbOrHp(hWnd);
 		// 全屏请求：吞掉它只能让宿主以为自己是全屏，底下的绘制层照旧铺满，
 		// 屏幕上就剩一片黑。改成工作区里的窗口再放行，宿主会跟着重排画面。
+		// askFullScreen 打开时先问一句，答「是」就走原样放行的老路。
 		if (!fakeAllowed && windowedMode && (uFlags & SWP_NOSIZE) == 0
-			&& VEduRequestCoversMonitor(hWnd, cx, cy)) {
+			&& VEduShouldWindow(hWnd, cx, cy)) {
 			VEduForceWindowed(hWnd, x, y, cx, cy);
 			// 位置一起重设：请求里可能带 SWP_NOMOVE，那样窗口会卡在旧角落。
 			return raSetWindowPos(hWnd, blockTopmost ? HWND_NOTOPMOST : hWndInsertAfter,
 				x, y, cx, cy, uFlags & ~(SWP_NOSIZE | SWP_NOMOVE));
 		}
-		if (!fakeAllowed && blockTopmost) {
+		if (!fakeAllowed && blockTopmost && !VEduFullScreenAllowed(hWnd)) {
 			if (hWndInsertAfter == HWND_TOPMOST) hWndInsertAfter = HWND_NOTOPMOST;
 			// 样式可能是别处加的（SetWindowLongPtr / 系统还原），顺手摘掉。
 			VEduNormalizeTopmost(hWnd);
@@ -445,14 +607,15 @@ HDWP WINAPI hkDeferWindowPos(HDWP hWinPosInfo, HWND hWnd, HWND hWndInsertAfter, 
 	VTraceHook(L"hkDeferWindowPos");
 	if (loaded)
 	{
+		if (g_eduAsking) return faDeferWindowPos(hWinPosInfo, hWnd, hWndInsertAfter, x, y, cx, cy, uFlags);
 		const bool fakeAllowed = fakeFull && VIsWindowGbOrHp(hWnd);
 		if (!fakeAllowed && windowedMode && (uFlags & SWP_NOSIZE) == 0
-			&& VEduRequestCoversMonitor(hWnd, cx, cy)) {
+			&& VEduShouldWindow(hWnd, cx, cy)) {
 			VEduForceWindowed(hWnd, x, y, cx, cy);
 			return faDeferWindowPos(hWinPosInfo, hWnd, blockTopmost ? HWND_NOTOPMOST : hWndInsertAfter,
 				x, y, cx, cy, uFlags & ~(SWP_NOSIZE | SWP_NOMOVE));
 		}
-		if (!fakeAllowed && blockTopmost) {
+		if (!fakeAllowed && blockTopmost && !VEduFullScreenAllowed(hWnd)) {
 			if (hWndInsertAfter == HWND_TOPMOST) hWndInsertAfter = HWND_NOTOPMOST;
 			VEduNormalizeTopmost(hWnd);
 		}
@@ -499,12 +662,13 @@ BOOL WINAPI hkMoveWindow(HWND hWnd, int x, int y, int cx, int cy, BOOL bRepaint)
 	VTraceHook(L"hkMoveWindow");
 	if (loaded)
 	{
+		if (g_eduAsking) return raMoveWindow(hWnd, x, y, cx, cy, bRepaint);
 		const bool fakeAllowed = fakeFull && VIsWindowGbOrHp(hWnd);
-		if (!fakeAllowed && windowedMode && VEduRequestCoversMonitor(hWnd, cx, cy)) {
+		if (!fakeAllowed && windowedMode && VEduShouldWindow(hWnd, cx, cy)) {
 			VEduForceWindowed(hWnd, x, y, cx, cy);
 			return raMoveWindow(hWnd, x, y, cx, cy, bRepaint);
 		}
-		if (!fakeAllowed && blockTopmost) VEduNormalizeTopmost(hWnd);
+		if (!fakeAllowed && blockTopmost && !VEduFullScreenAllowed(hWnd)) VEduNormalizeTopmost(hWnd);
 
 		if (guardWindowOps && x == 0 && y == 0 && cx == screenWidth && cy == screenHeight) {
 			VSwitchLockState(hWnd, TRUE);
@@ -552,6 +716,8 @@ LONG WINAPI hkSetWindowLongA(HWND hWnd, int nIndex, LONG dwNewLong)
 	}
 	VTraceHook(L"hkSetWindowLongA");
 	if (loaded) {
+		// 弹框期间放行：框要给自己加 WS_EX_TOPMOST。
+		if (g_eduAsking) return faSetWindowLongA(hWnd, nIndex, dwNewLong);
 		const bool fakeAllowed = fakeFull && VIsWindowGbOrHp(hWnd);
 		// 置顶样式在这里就被掩掉：宿主用 SetWindowLong(GWL_EXSTYLE) 加 TOPMOST
 		// 是最常见的写法之一，等下一次 SetWindowPos 再摘就已经晚了一帧。
@@ -577,6 +743,7 @@ LONG WINAPI hkSetWindowLongW(HWND hWnd, int nIndex, LONG dwNewLong)
 	}
 	VTraceHook(L"hkSetWindowLongW");
 	if (loaded) {
+		if (g_eduAsking) return faSetWindowLongW(hWnd, nIndex, dwNewLong);
 		const bool fakeAllowed = fakeFull && VIsWindowGbOrHp(hWnd);
 		if (topGuard && !fakeAllowed && nIndex == GWL_EXSTYLE && (dwNewLong & WS_EX_TOPMOST))
 			dwNewLong &= ~WS_EX_TOPMOST;
@@ -593,11 +760,13 @@ LONG WINAPI hkSetWindowLongW(HWND hWnd, int nIndex, LONG dwNewLong)
 BOOL WINAPI hkShowWindow(HWND hWnd, int nCmdShow)
 {
 	VTraceHook(L"hkShowWindow");
+	if (loaded && g_eduAsking) return faShowWindow(hWnd, nCmdShow);
 	// 宿主用 ShowWindow(SW_MAXIMIZE) 进全屏是另一条路：它不走 SetWindowPos 的
 	// 参数，系统内部直接摆窗口。这里先按窗口化尺寸摆好，再以普通方式显示。
 	const bool fakeAllowed = fakeFull && VIsWindowGbOrHp(hWnd);
 	if (loaded && forceWindowed && !fakeAllowed
-		&& (nCmdShow == SW_MAXIMIZE || nCmdShow == SW_MAX || nCmdShow == SW_SHOWMAXIMIZED)) {
+		&& (nCmdShow == SW_MAXIMIZE || nCmdShow == SW_MAX || nCmdShow == SW_SHOWMAXIMIZED)
+		&& VEduShouldWindow(hWnd, screenWidth, screenHeight)) {
 		int x = 0, y = 0, cx = 0, cy = 0;
 		VEduWindowedRect(hWnd, x, y, cx, cy);
 		VEduEnsureResizable(hWnd);
