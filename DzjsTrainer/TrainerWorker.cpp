@@ -988,6 +988,9 @@ bool TrainerWorkerInternal::InstallVirusForMaster()
 }
 bool TrainerWorkerInternal::InjectDll(DWORD pid, LPCWSTR dllPath)
 {
+	// 目标里已经挂着同名钩子时，LoadLibrary 只会加引用计数，新 DLL 根本不进
+	// 进程。先把旧的清掉，否则「换了 exe 却没变化」会反复出现。
+	if (!ClearStaleHookModule(pid, dllPath)) return FALSE;
 	HANDLE hRemoteProcess;
 	NTSTATUS ntStatus = MOpenProcessNt(pid, &hRemoteProcess);
 	if (!NT_SUCCESS(ntStatus)) {
@@ -1073,6 +1076,100 @@ static void RemoteInvokeVUnloadAll(DWORD pid, LPCWSTR dllPath, LPCWSTR moduleNam
 	const HANDLE thread = CreateRemoteThread(process, nullptr, 0, unloadFn, nullptr, 0, nullptr);
 	if (thread) { WaitForSingleObject(thread, 15000); CloseHandle(thread); }
 	CloseHandle(process);
+}
+
+// ===== 注入前的残留检查 =====
+//
+// LoadLibrary 对「同名模块已加载」的处理是把引用计数加一，返回原来那个句柄 ——
+// 磁盘上的文件换成新版也没用，进程跑的还是内存里那份旧代码。这条陷阱很隐蔽：
+// 日志一路显示「注入成功」，界面也显示已注入，行为却一点没变。
+//
+// 所以注入前先看目标里有没有同名模块，再比对 PE 时间戳：
+//   同构建 → 复用，什么也不用做；
+//   不同构建 → 先远程调 VUnloadAll，再 FreeLibrary；卸不掉就放弃注入并留下
+//   一条明确的日志，让用户重启那个进程 —— 硬塞进去只会继续跑旧代码。
+
+static bool FindRemoteModule(DWORD pid, LPCWSTR moduleName, HMODULE* base)
+{
+	if (base) *base = nullptr;
+	const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+	if (snapshot == INVALID_HANDLE_VALUE) return false;
+	bool found = false;
+	MODULEENTRY32W entry = {};
+	entry.dwSize = sizeof(entry);
+	if (Module32FirstW(snapshot, &entry)) {
+		do {
+			if (_wcsicmp(entry.szModule, moduleName) == 0) {
+				if (base) *base = entry.hModule;
+				found = true;
+				break;
+			}
+		} while (Module32NextW(snapshot, &entry));
+	}
+	CloseHandle(snapshot);
+	return found;
+}
+
+static DWORD RemotePeStamp(HANDLE process, HMODULE base)
+{
+	DWORD e_lfanew = 0;
+	SIZE_T read = 0;
+	if (!ReadProcessMemory(process, reinterpret_cast<BYTE*>(base) + 0x3C,
+		&e_lfanew, sizeof(e_lfanew), &read) || read != sizeof(e_lfanew)) return 0;
+	if (e_lfanew == 0 || e_lfanew > 0x1000) return 0;
+	DWORD stamp = 0;
+	if (!ReadProcessMemory(process, reinterpret_cast<BYTE*>(base) + e_lfanew + 8,
+		&stamp, sizeof(stamp), &read) || read != sizeof(stamp)) return 0;
+	return stamp;
+}
+
+static DWORD LocalPeStamp(LPCWSTR path)
+{
+	if (!path || !*path) return 0;
+	const HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+		OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (file == INVALID_HANDLE_VALUE) return 0;
+	DWORD stamp = 0;
+	IMAGE_DOS_HEADER dos = {};
+	DWORD read = 0;
+	if (ReadFile(file, &dos, sizeof(dos), &read, nullptr) && read == sizeof(dos) &&
+		dos.e_magic == IMAGE_DOS_SIGNATURE && dos.e_lfanew > 0 && dos.e_lfanew < 0x1000) {
+		if (SetFilePointer(file, dos.e_lfanew + 8, nullptr, FILE_BEGIN) != INVALID_SET_FILE_POINTER)
+			ReadFile(file, &stamp, sizeof(stamp), &read, nullptr);
+	}
+	CloseHandle(file);
+	return stamp;
+}
+
+bool TrainerWorkerInternal::ClearStaleHookModule(DWORD pid, LPCWSTR dllPath)
+{
+	if (!pid || !dllPath || !*dllPath) return true;
+	LPCWSTR moduleName = wcsrchr(dllPath, L'\\');
+	moduleName = moduleName ? moduleName + 1 : dllPath;
+
+	HMODULE staleBase = nullptr;
+	if (!FindRemoteModule(pid, moduleName, &staleBase) || !staleBase) return true;
+
+	DWORD remoteStamp = 0;
+	HANDLE process = nullptr;
+	if (NT_SUCCESS(MOpenProcessNt(pid, &process)) && process) {
+		remoteStamp = RemotePeStamp(process, staleBase);
+		CloseHandle(process);
+	}
+	const DWORD diskStamp = LocalPeStamp(dllPath);
+	if (remoteStamp && diskStamp && remoteStamp == diskStamp) {
+		// 同一个构建：LoadLibrary 会直接复用，行为正确，不用折腾。
+		currentLogger->LogInfo(L"宿主里已有同构建钩子，复用 pid=%lu module=%s stamp=0x%08X",
+			pid, moduleName, remoteStamp);
+		return true;
+	}
+
+	// 不同构建：**不能**远程调它的 VUnloadAll。那个函数地址是按新版 DLL 的
+	// 导出表算出来的 RVA，旧版里同一个位置是别的代码，调下去十有八九把宿主
+	// 带崩。只能让用户重启那个进程 —— 新进程里不会再加载旧模块。
+	currentLogger->LogWarn(L"宿主里挂着旧版钩子 pid=%lu module=%s stamp=0x%08X/0x%08X，"
+		L"本次注入跳过；重启该进程后才生效", pid, moduleName, remoteStamp, diskStamp);
+	return false;
 }
 
 static std::wstring TrimCustomTarget(const std::wstring& s)
@@ -1248,6 +1345,13 @@ bool TrainerWorkerInternal::InjectCustomProcess(LPCWSTR target, std::wstring* st
 	if (!dll || GetFileAttributesW(dll) == INVALID_FILE_ATTRIBUTES) {
 		SetCustomInjectStatus(status, is64 ? L"x64 hooks DLL 不存在，请使用包含新资源的主程序"
 			: L"hooks DLL 不存在");
+		return false;
+	}
+	// 宿主里已经挂着同名 hooks 模块时，LoadLibrary 只会把引用计数加一：新 DLL
+	// 不进进程，跑的还是内存里那份旧代码。先清掉再注入。
+	if (is64 && !ClearStaleHookModule(pid, dll)) {
+		SetCustomInjectStatus(status, L"宿主里挂着旧版钩子，请重启该进程后再注入");
+		currentLogger->LogWarn(L"自定义注入跳过 pid=%lu name=%s reason=stale-hooks", pid, name.c_str());
 		return false;
 	}
 	const bool ok = is64 ? RunInjector64(pid, dll, false, status) : InjectDll(pid, dll);

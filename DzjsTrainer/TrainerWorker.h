@@ -302,6 +302,9 @@ private:
 	bool InstallVirusForMaster();
 	bool InjectDll(DWORD pid, LPCWSTR dllPath);
 	bool UnInjectDll(DWORD pid, LPCWSTR moduleName);
+	// 注入前检查目标里已加载的同名钩子模块。LoadLibrary 对同名模块只加引用
+	// 计数，磁盘上的 DLL 换了新版也进不去进程 —— 见实现处的说明。
+	bool ClearStaleHookModule(DWORD pid, LPCWSTR dllPath);
 	bool UnLoadAllVirus();
 	bool UnLoadNetFilterDriver();
 	bool UnLoadJiYuProtectDriver();
