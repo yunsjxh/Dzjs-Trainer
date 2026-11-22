@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 #include <set>
+#include <stdarg.h>
 #include <time.h>
 #include <stdio.h>
 #include <Shlwapi.h>
@@ -673,7 +674,7 @@ void VRunMain() {
 		mainIniPath, allowMonitor, whitePreviewOnly, allowAllRunOp, g_VideoProps.m_EnableModifyVideoStream);
 	// 构建标记：日志里有这一行才说明跑的是本次构建的 DLL。
 	// 排查"改了没生效"时先看它，省得在部署问题上兜圈子。
-	VDebugLog(L"hooks build=20261122-1145-ask");
+	VDebugLog(L"hooks build=20261122-1205-ctl");
 	// 走 minimal 还是全量集，由上面两个标志决定；全量集会接管极域的窗口/进程/网络接口，
 	// 把它记下来，出问题时一眼能看出走的是哪条分支。
 	VDebugLog(L"hooks mode=%s", (whitePreviewOnly || g_VideoProps.m_EnableModifyVideoStream) ? L"minimal" : L"full");
@@ -1465,47 +1466,50 @@ void VNotifyShutdownBlocked(const wchar_t* api)
 // 和关机拦截同一套路：钩子里不能同步发 WM_COPYDATA（宿主线程可能正等着
 // 主程序回消息），起一个短线程发完就退。VSendMessageBack 在通用宿主下会被
 // 丢弃，所以这里直接用 FindControlWindow + SendMessageTimeout。
-struct WindowedNotice
+//
+// 消息统一按 hkb:<事件>:<字段...> 拼好再发，主程序按 ':' 切。下面两个通知
+// 只是拼串，别在这里各自再写一遍线程与 COPYDATA。
+static DWORD WINAPI VNotifyLineThread(LPVOID param)
 {
-	HWND hwnd;
-	WCHAR cls[48];
-	int fromW, fromH, toW, toH;
-};
-
-static DWORD WINAPI VWindowedNoticeThread(LPVOID param)
-{
-	WindowedNotice* notice = static_cast<WindowedNotice*>(param);
-	if (!notice) return 0;
+	WCHAR* line = static_cast<WCHAR*>(param);
+	if (!line) return 0;
 	HWND receiver = FindControlWindow();
 	if (receiver) {
-		WCHAR message[256];
-		swprintf_s(message, L"hkb:windowed:%s:%dx%d:%dx%d",
-			notice->cls[0] ? notice->cls : L"-",
-			notice->fromW, notice->fromH, notice->toW, notice->toH);
 		COPYDATASTRUCT copyData = { 0 };
-		copyData.lpData = message;
-		copyData.cbData = static_cast<DWORD>(sizeof(WCHAR) * (wcslen(message) + 1));
+		copyData.lpData = line;
+		copyData.cbData = static_cast<DWORD>(sizeof(WCHAR) * (wcslen(line) + 1));
 		DWORD_PTR response = 0;
 		SendMessageTimeoutW(receiver, WM_COPYDATA, 0,
 			reinterpret_cast<LPARAM>(&copyData), SMTO_ABORTIFHUNG | SMTO_BLOCK, 500, &response);
 	}
-	delete notice;
+	free(line);
 	return 0;
+}
+
+static void VNotifyLine(const WCHAR* format, ...)
+{
+	WCHAR* line = static_cast<WCHAR*>(malloc(sizeof(WCHAR) * 256));
+	if (!line) return;
+	va_list args;
+	va_start(args, format);
+	_vsnwprintf_s(line, 256, _TRUNCATE, format, args);
+	va_end(args);
+	HANDLE thread = CreateThread(NULL, 0, VNotifyLineThread, line, 0, NULL);
+	if (thread) CloseHandle(thread);
+	else free(line);
 }
 
 void VNotifyWindowed(HWND hWnd, const WCHAR* cls, int fromW, int fromH, int toW, int toH)
 {
-	WindowedNotice* notice = new (std::nothrow) WindowedNotice();
-	if (!notice) return;
-	notice->hwnd = hWnd;
-	wcscpy_s(notice->cls, cls ? cls : L"");
-	notice->fromW = fromW;
-	notice->fromH = fromH;
-	notice->toW = toW;
-	notice->toH = toH;
-	HANDLE thread = CreateThread(NULL, 0, VWindowedNoticeThread, notice, 0, NULL);
-	if (thread) CloseHandle(thread);
-	else delete notice;
+	UNREFERENCED_PARAMETER(hWnd);
+	VNotifyLine(L"hkb:windowed:%s:%dx%d:%dx%d",
+		(cls && cls[0]) ? cls : L"-", fromW, fromH, toW, toH);
+}
+
+void VNotifyFullScreenAsk(const WCHAR* cls, bool allow, int cx, int cy)
+{
+	VNotifyLine(L"hkb:ask:%s:%s:%dx%d", allow ? L"allow" : L"windowed",
+		(cls && cls[0]) ? cls : L"-", cx, cy);
 }
 
 void VManualQuit()

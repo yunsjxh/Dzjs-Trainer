@@ -210,6 +210,14 @@ void TrainerWorkerInternal::HandleMessageFromVirus(LPCWSTR buf)
 					arr.size() >= 4 ? arr[3].c_str() : L"?",
 					arr.size() >= 5 ? arr[4].c_str() : L"?");
 			}
+			// 全屏请求问过之后的结论。答「是」= 照旧全屏；答「否」= 紧接着会有一条
+			// windowed。这一行是给「全屏还是铺满」这类反馈用的：先看问没问、答案是什么。
+			else if (arr[1] == L"ask") {
+				currentLogger->LogInfo(L"Full screen request %s class=%s %s",
+					arr.size() >= 3 ? arr[2].c_str() : L"?",
+					arr.size() >= 4 ? arr[3].c_str() : L"?",
+					arr.size() >= 5 ? arr[4].c_str() : L"?");
+			}
 			else if (arr[1] == L"wtf") {
 				//插入了错误的目标，现在重置状态
 				DWORD pid = _wtol(arr[2].c_str());

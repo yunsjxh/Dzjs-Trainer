@@ -71,6 +71,20 @@ static void VEduRememberPercent(const WCHAR* cls, int percent)
 	ReleaseSRWLockExclusive(&g_eduWinLock);
 }
 
+// 这个窗口是不是被我们改过。巡查要靠它认人：改过之后窗口有了标题栏，
+// 「有标题栏就不碰」这条规则会把宿主后来又撑开的窗口一直放过。
+static bool VEduIsTracked(HWND hWnd)
+{
+	if (!hWnd) return false;
+	bool found = false;
+	AcquireSRWLockShared(&g_eduWinLock);
+	for (int i = 0; i < _countof(g_eduTracked); ++i) {
+		if (g_eduTracked[i].hwnd == hWnd) { found = true; break; }
+	}
+	ReleaseSRWLockShared(&g_eduWinLock);
+	return found;
+}
+
 static void VEduTrackWindow(HWND hWnd, int cx, int cy)
 {
 	if (!hWnd) return;
@@ -104,7 +118,7 @@ void VEduResetWindowedState()
 	VEduResetAnswers();
 }
 
-static bool VEduRequestCoversMonitor(HWND hWnd, int cx, int cy);
+static bool VEduCoversMonitor(HWND hWnd, int cx, int cy);
 
 // ===== 全屏请求的询问 ========================================================
 // 「先问一句」这条路径按窗口记答案：广播时宿主会连着发一串全屏请求（改尺寸、
@@ -203,8 +217,6 @@ static bool VEduAskFullScreen(HWND hWnd, int cx, int cy)
 {
 	bool allow = false;
 	if (VEduLookupAnswer(hWnd, allow)) return allow;
-	// 看不见的窗口（还在构造、或本来就藏着）别问，宿主自己都没露脸。
-	if (hWnd && !IsWindowVisible(hWnd)) return true;
 	if (InterlockedCompareExchange(&g_eduAsking, 1, 0) != 0) return true;
 
 	WCHAR cls[48] = {};
@@ -233,6 +245,9 @@ static bool VEduAskFullScreen(HWND hWnd, int cx, int cy)
 	VDebugLog(L"windowed ask hwnd=%p class=%s title=%s %dx%d -> %s",
 		hWnd, cls[0] ? cls : L"-", title[0] ? title : L"-", cx, cy,
 		allow ? L"allow" : L"windowed");
+	// 也送一份到主日志：「到底问没问、答的是什么」是用户反馈里最先要确认的事，
+	// 钩子自己的 debug 日志在宿主目录里，用户不一定会翻。
+	VNotifyFullScreenAsk(cls, allow, cx, cy);
 	return allow;
 }
 
@@ -240,14 +255,19 @@ static bool VEduAskFullScreen(HWND hWnd, int cx, int cy)
 static bool VEduShouldWindow(HWND hWnd, int cx, int cy)
 {
 	if (!loaded || !forceWindowed || !hWnd) return false;
-	if (!VEduRequestCoversMonitor(hWnd, cx, cy)) return false;
+	if (!VEduCoversMonitor(hWnd, cx, cy)) return false;
+	// 还没显示出来的窗口没法问，也没人看得见回答：直接按窗口摆好，等它 show
+	// 出来已经是小窗了。以前这里直接放行，广播画面刚好是在隐藏状态下摆尺寸的，
+	// 于是屏幕上照样铺满一整块 —— 钩子「拦了」，只是拦成了放行。
+	if (!IsWindowVisible(hWnd)) return true;
 	if (askFullScreen && VEduAskFullScreen(hWnd, cx, cy)) return false;
 	return true;
 }
 
-// 请求里的尺寸是否铺满显示器。90% 那种「快满了」不算 —— 电子教室的广播画面
-// 用的是整块屏，而普通最大化窗口只到工作区（任务栏之外），这两个都要认。
-static bool VEduRequestCoversMonitor(HWND hWnd, int cx, int cy)
+// 请求里的尺寸是否铺满整块显示器。工作区（扣除任务栏）不算：那是最大化的尺寸，
+// 用户自己要的，拦下来就成了「无法自己放大」。电子教室的广播画面用的是整块屏，
+// 高度连任务栏那块也一起占了。
+static bool VEduCoversMonitor(HWND hWnd, int cx, int cy)
 {
 	if (cx <= 0 || cy <= 0) return false;
 	MONITORINFO mi = { sizeof(mi) };
@@ -257,10 +277,7 @@ static bool VEduRequestCoversMonitor(HWND hWnd, int cx, int cy)
 	}
 	const int mw = mi.rcMonitor.right - mi.rcMonitor.left;
 	const int mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
-	if (cx >= mw - 2 && cy >= mh - 2) return true;
-	const int ww = mi.rcWork.right - mi.rcWork.left;
-	const int wh = mi.rcWork.bottom - mi.rcWork.top;
-	return cx >= ww - 4 && cy >= wh - 4;
+	return cx >= mw - 2 && cy >= mh - 2;
 }
 
 // 算一块窗口化后的矩形：工作区的百分比，居中。类名有记忆就用记忆里的比例。
@@ -308,7 +325,10 @@ static void VEduEnsureResizable(HWND hWnd)
 {
 	const LONG style = GetWindowLongW(hWnd, GWL_STYLE);
 	if (style & WS_CHILD) return;
-	const LONG want = style | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
+	// WS_MAXIMIZE 一并摘掉：窗口原来要是最大化的，改小之后标题栏会一直显示
+	// 「还原」按钮，状态对不上 —— 点一下还会跳回一个奇怪的尺寸。
+	const LONG want = (style | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)
+		& ~WS_MAXIMIZE;
 	const LONG exStyle = GetWindowLongW(hWnd, GWL_EXSTYLE);
 	const LONG exWant = (exStyle & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW;
 	const bool styleChanged = (want != style);
@@ -394,10 +414,55 @@ static bool VEduNormalizeTopmost(HWND hWnd)
 	return true;
 }
 
+// 把一个「已经铺满整屏」的窗口改小。show 和巡查两条路共用 —— 钩子那条路是在
+// SetWindowPos 里直接改写参数，不走这里。
+//
+// allowAsk：要不要弹框问。ShowWindow 走的是宿主自己的线程，问是安全的；
+// 巡查跑在消息中心线程上，绝对不能问（上一轮卡死就是这么来的）。
+static bool VEduShrinkFullScreenWindow(HWND hWnd, bool allowAsk)
+{
+	if (!loaded || !forceWindowed || !hWnd) return false;
+	const LONG style = GetWindowLongW(hWnd, GWL_STYLE);
+	if (style & WS_CHILD) return false;
+
+	RECT rc = {};
+	if (!GetWindowRect(hWnd, &rc)) return false;
+	const int fromW = static_cast<int>(rc.right - rc.left);
+	const int fromH = static_cast<int>(rc.bottom - rc.top);
+	if (!VEduCoversMonitor(hWnd, fromW, fromH)) return false;
+	if (allowAsk && askFullScreen && IsWindowVisible(hWnd)
+		&& VEduAskFullScreen(hWnd, fromW, fromH)) return false;
+
+	int x = 0, y = 0, cx = 0, cy = 0;
+	VEduWindowedRect(hWnd, x, y, cx, cy);
+	VEduEnsureResizable(hWnd);
+	if (blockTopmost) VEduDropTopmost(hWnd);
+	if (raSetWindowPos)
+		raSetWindowPos(hWnd, blockTopmost ? HWND_NOTOPMOST : NULL, x, y, cx, cy,
+			SWP_NOZORDER | SWP_NOACTIVATE);
+	VEduTrackWindow(hWnd, cx, cy);
+
+	if (VEduShouldLogWindowed(hWnd)) {
+		WCHAR cls[48];
+		VEduClassNameOf(hWnd, cls, _countof(cls));
+		VDebugLog(L"windowed (%s) hwnd=%p class=%s %dx%d -> %dx%d",
+			allowAsk ? L"show" : L"sweep", hWnd, cls[0] ? cls : L"-", fromW, fromH, cx, cy);
+		VNotifyWindowed(hWnd, cls, fromW, fromH, cx, cy);
+	}
+	return true;
+}
+
+void VEduWindowIfFullScreen(HWND hWnd)
+{
+	VEduShrinkFullScreenWindow(hWnd, true);
+}
+
 // 巡查「创建时就铺满」的窗口。有些产品不走 SetWindowPos，而是直接
-// CreateWindowEx(WS_POPUP, 0, 0, 屏宽, 屏高) —— 钩子看不见这种请求，只能
-// 定时枚举一遍本进程的顶层窗口补刀。只碰「置顶」或「没有标题栏」的窗口：
-// 用户自己最大化的普通窗口有标题栏、不置顶，不该每秒钟被改回来。
+// CreateWindowEx(WS_POPUP, 0, 0, 屏宽, 屏高)，或者用 SetWindowPlacement —— 钩子
+// 看不见这种请求，只能定时枚举一遍本进程的顶层窗口补刀。
+//
+// 认人规则：我们自己改过的窗口必须继续管（改过之后它有标题栏了，「有标题栏就不碰」
+// 会把宿主后来又撑开的窗口一直放过）；用户自己的普通窗口、自己最大化的窗口不碰。
 struct VEduSweepCtx {
 	int fixedCount;
 };
@@ -414,43 +479,22 @@ static BOOL CALLBACK VEduSweepProc(HWND hWnd, LPARAM lp)
 	if (style & WS_CHILD) return TRUE;
 	if (!IsWindowVisible(hWnd) || IsIconic(hWnd)) return TRUE;
 
-	RECT rc = {};
-	if (!GetWindowRect(hWnd, &rc)) return TRUE;
-	if (!VEduRequestCoversMonitor(hWnd, static_cast<int>(rc.right - rc.left),
-		static_cast<int>(rc.bottom - rc.top))) return TRUE;
-
 	const bool topmost = (GetWindowLongW(hWnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
 	const bool captioned = (style & WS_CAPTION) == WS_CAPTION;
-	if (!topmost && captioned) return TRUE;
+	const bool managed = VEduIsTracked(hWnd);
+	if (!managed && !topmost && captioned) return TRUE;
+	// 用户刚刚在框里答应了「照它说的全屏」：巡查别马上又给改回去。
+	if (VEduFullScreenAllowed(hWnd)) return TRUE;
 
-	int x = 0, y = 0, cx = 0, cy = 0;
-	VEduWindowedRect(hWnd, x, y, cx, cy);
-	VEduEnsureResizable(hWnd);
-	if (blockTopmost) VEduDropTopmost(hWnd);
-	if (raSetWindowPos)
-		raSetWindowPos(hWnd, blockTopmost ? HWND_NOTOPMOST : NULL, x, y, cx, cy,
-			SWP_NOZORDER | SWP_NOACTIVATE);
-	VEduTrackWindow(hWnd, cx, cy);
-	++ctx->fixedCount;
-
-	if (VEduShouldLogWindowed(hWnd)) {
-		WCHAR cls[48];
-		VEduClassNameOf(hWnd, cls, _countof(cls));
-		VDebugLog(L"windowed (sweep) hwnd=%p class=%s %ldx%ld -> %dx%d topmost=%d captioned=%d",
-			hWnd, cls[0] ? cls : L"-", rc.right - rc.left, rc.bottom - rc.top, cx, cy,
-			topmost ? 1 : 0, captioned ? 1 : 0);
-		VNotifyWindowed(hWnd, cls, static_cast<int>(rc.right - rc.left),
-			static_cast<int>(rc.bottom - rc.top), cx, cy);
-	}
+	if (VEduShrinkFullScreenWindow(hWnd, false)) ++ctx->fixedCount;
 	return TRUE;
 }
 
 void VEduSweepFullScreenWindows()
 {
-	// 询问模式下巡查不干活：这条路径跑在消息中心线程上，从那里弹框会把消息中心
-	// 卡住（上一轮「连原来能用的都用不了了」就是这么来的）。询问只在这几个窗口
-	// 钩子里做，那是宿主自己的线程，停了也只是它自己在等一句话。
-	if (!loaded || !forceWindowed || askFullScreen) return;
+	// 询问模式下也照查，只是不弹框：这条路径跑在消息中心线程上，从那里弹框会把
+	// 消息中心卡住。也就是说「创建即全屏」的窗口在询问模式下不问，直接按窗口摆好。
+	if (!loaded || !forceWindowed) return;
 	VEduSweepCtx ctx = {};
 	EnumWindows(VEduSweepProc, reinterpret_cast<LPARAM>(&ctx));
 }
@@ -484,6 +528,8 @@ void VEduSampleTrackedWindows()
 			continue;
 		}
 		if (!IsWindowVisible(hWnd)) continue;
+		// 用户自己最大化的别记：工作区尺寸会算成 95% 以上，下次广播就铺得更大。
+		if (IsZoomed(hWnd)) continue;
 
 		RECT rc = {};
 		if (!GetWindowRect(hWnd, &rc)) continue;
@@ -491,7 +537,7 @@ void VEduSampleTrackedWindows()
 		const int h = static_cast<int>(rc.bottom - rc.top);
 		if (w <= 0 || h <= 0) continue;
 		// 又被宿主撑回全屏了：钩子会处理，这里不记。
-		if (VEduRequestCoversMonitor(hWnd, w, h)) continue;
+		if (VEduCoversMonitor(hWnd, w, h)) continue;
 		// 跟上次摆的尺寸差不多，说明用户没动过。
 		if (abs(w - snaps[i].cx) <= 16 && abs(h - snaps[i].cy) <= 16) continue;
 
@@ -503,6 +549,9 @@ void VEduSampleTrackedWindows()
 			wh = static_cast<int>(mi.rcWork.bottom - mi.rcWork.top);
 		}
 		if (ww <= 0 || wh <= 0) { ww = screenWidth; wh = screenHeight; }
+		// 铺满工作区 = 用户按了最大化（或者拖到顶上吸附），不代表他喜欢这个尺寸：
+		// 记成 95% 的话，下一次广播就会铺到 95% 那么大。
+		if (w >= ww - 4 && h >= wh - 4) continue;
 		int pctW = static_cast<int>(static_cast<long long>(w) * 100 / ww);
 		int pctH = static_cast<int>(static_cast<long long>(h) * 100 / wh);
 		int pct = (pctW < pctH) ? pctW : pctH;
@@ -797,6 +846,11 @@ BOOL WINAPI hkShowWindow(HWND hWnd, int nCmdShow)
 			VSwitchLockState(hWnd, FALSE);
 		}
 	}
+	// 窗口本来就是整屏尺寸，宿主这会儿才让它出现：先摆好再 show，不然屏幕上会先
+	// 铺满一整块，等巡查（1.2 秒）才改小 —— 用户看到的就是「全屏照样铺满」。
+	if (loaded && forceWindowed && !fakeAllowed
+		&& nCmdShow != SW_HIDE && nCmdShow != SW_MINIMIZE && nCmdShow != SW_SHOWMINIMIZED)
+		VEduWindowIfFullScreen(hWnd);
 	return faShowWindow(hWnd, nCmdShow);
 }
 

@@ -126,10 +126,15 @@ void VEduSampleTrackedWindows();
 // 巡查：本进程里「创建时就铺满整屏」的窗口不经过 SetWindowPos，钩子看不见，
 // 只能靠这一趟枚举把它们也改成窗口。判据见 GuardWindow.cpp。
 void VEduSweepFullScreenWindows();
+// 窗口已经是整屏尺寸、这会儿才让它出现（ShowWindow）时，同一套判据同步补一刀，
+// 免得屏幕上先铺满一整块、等 1.2 秒后的巡查才改小。
+void VEduWindowIfFullScreen(HWND hWnd);
 // 卸载时清掉跟踪表，避免把旧 hwnd 带到下一次注入。
 void VEduResetWindowedState();
 // 把「窗口被改成窗口化」这件事告诉主程序，进主日志。异步，不阻塞钩子。
 void VNotifyWindowed(HWND hWnd, const WCHAR* cls, int fromW, int fromH, int toW, int toH);
+// 全屏请求问过之后的结论也进主日志：用户反馈「全屏还是铺满」时，先看有没有这一行。
+void VNotifyFullScreenAsk(const WCHAR* cls, bool allow, int cx, int cy);
 // 告诉主程序「刚刚挡下了一次关机」。内部会起线程走 WM_COPYDATA，不阻塞调用方。
 void VNotifyShutdownBlocked(const wchar_t* api);
 // 只记录模式下的动作记录：按总量采样，避免热路径刷爆日志文件。
