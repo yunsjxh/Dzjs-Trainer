@@ -673,7 +673,7 @@ void VRunMain() {
 		mainIniPath, allowMonitor, whitePreviewOnly, allowAllRunOp, g_VideoProps.m_EnableModifyVideoStream);
 	// 构建标记：日志里有这一行才说明跑的是本次构建的 DLL。
 	// 排查"改了没生效"时先看它，省得在部署问题上兜圈子。
-	VDebugLog(L"hooks build=20261122-windowed");
+	VDebugLog(L"hooks build=20261122-1145-ask");
 	// 走 minimal 还是全量集，由上面两个标志决定；全量集会接管极域的窗口/进程/网络接口，
 	// 把它记下来，出问题时一眼能看出走的是哪条分支。
 	VDebugLog(L"hooks mode=%s", (whitePreviewOnly || g_VideoProps.m_EnableModifyVideoStream) ? L"minimal" : L"full");
