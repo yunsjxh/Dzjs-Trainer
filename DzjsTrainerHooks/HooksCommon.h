@@ -112,6 +112,22 @@ extern bool blockWindowOps, blockDriverAccess;
 // 而且只管「结束进程」。关机/重启/注销单独一根开关，默认**开** —— 学生机上
 // 被教师端关掉一次就得重来，代价比误拦一次大得多。ini 里写 BlockShutdown=FALSE 可关。
 extern bool blockShutdown;
+// 强制窗口化（2026-11-22）。默认开，不依赖 BlockWindowOps：电子教室把窗口摆成
+// 整屏时，把请求改写成工作区内的一块窗口再放行，而不是吞掉 —— 吞掉会让宿主
+// 以为自己是全屏，底下的绘制层照旧铺满，屏幕上只剩一片黑。
+//   WindowedPercent  窗口占工作区的百分比（25..95，默认 70）
+//   BlockTopmost     摘掉 WS_EX_TOPMOST / HWND_TOPMOST（默认开）
+extern bool forceWindowed, blockTopmost;
+extern int  windowedPercent;
+// 采样被强制窗口化的窗口，把用户手动拖过的尺寸按窗口类记下来。消息中心定时器调用。
+void VEduSampleTrackedWindows();
+// 巡查：本进程里「创建时就铺满整屏」的窗口不经过 SetWindowPos，钩子看不见，
+// 只能靠这一趟枚举把它们也改成窗口。判据见 GuardWindow.cpp。
+void VEduSweepFullScreenWindows();
+// 卸载时清掉跟踪表，避免把旧 hwnd 带到下一次注入。
+void VEduResetWindowedState();
+// 把「窗口被改成窗口化」这件事告诉主程序，进主日志。异步，不阻塞钩子。
+void VNotifyWindowed(HWND hWnd, const WCHAR* cls, int fromW, int fromH, int toW, int toH);
 // 告诉主程序「刚刚挡下了一次关机」。内部会起线程走 WM_COPYDATA，不阻塞调用方。
 void VNotifyShutdownBlocked(const wchar_t* api);
 // 只记录模式下的动作记录：按总量采样，避免热路径刷爆日志文件。

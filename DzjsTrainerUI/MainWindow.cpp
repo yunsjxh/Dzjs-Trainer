@@ -1003,10 +1003,12 @@ const wchar_t* kToggleLabels[] = {
 	L"\u62e6\u622a\u8fdc\u7a0b\u8fd0\u884c\u7a0b\u5e8f", L"\u76f4\u63a5\u62d2\u7edd\u8fdc\u7a0b\u547d\u4ee4", L"\u5141\u8bb8\u5e7f\u64ad\u7a97\u53e3\u7f6e\u9876", L"\u963b\u6b62\u8fdc\u7a0b\u7ed3\u675f\u8fdb\u7a0b",
 	L"\u5141\u8bb8\u6559\u5e08\u67e5\u770b\u5c4f\u5e55", L"\u963b\u6b62\u8fdc\u7a0b\u5173\u95ed\u7a97\u53e3", L"\u5141\u8bb8\u6559\u5e08\u63a7\u5236\u7535\u8111",
 	L"\u62e6\u622a\u8fdc\u7a0b\u7a97\u53e3\u64cd\u4f5c", L"\u62e6\u622a\u6781\u57df\u9a71\u52a8\u8bbf\u95ee",
+	// 强制窗口化：全屏请求改成工作区里的窗口，右边那颗胶囊是窗口大小档位。
+	L"\u5f3a\u5236\u7a97\u53e3\u5316",
 	L"\u89c6\u9891\u6d41\u4fdd\u62a4"
 };
-// 防护策略页的开关数量（第 9 项「视频流保护」不在这张表里，它走下面的媒体面板）。
-constexpr int kProtectionToggleCount = 9;
+// 防护策略页的开关数量（第 11 项「视频流保护」不在这张表里，它走下面的媒体面板）。
+constexpr int kProtectionToggleCount = 10;
 
 Color C(bool dark, BYTE r, BYTE g, BYTE b, BYTE dr, BYTE dg, BYTE db, BYTE a = 255) {
 	return Color(a, dark ? dr : r, dark ? dg : g, dark ? db : b);
@@ -4791,13 +4793,13 @@ void MainWindow::PaintProtection(Graphics& g, int width, int height, int offsetY
 	const float y = 94.0f + offsetY;
 	const float w = static_cast<float>(width - 276);
 	const bool replacementPage = page == Page::Replacement;
-	// 防护策略页这里只有标题 + 4 行开关（内容到 y+378），卡片按内容收缩；
+	// 防护策略页这里是标题 + 5 行开关（内容到 y+470），卡片按内容收缩；
 	// 替换画面页下方还有整块预览面板，需要撑满可用高度。
 	// 固定 68px 行距时卡片只占 384px，窗口剩下的 250px 全是空白画布，
-	// 页面看着像没画完。改成按可用高度把四行开关均匀铺开。
+	// 页面看着像没画完。改成按可用高度把五行开关均匀铺开。
 	const float fillHeight = (std::max)(320.0f, static_cast<float>(height) - y - 20.0f);
 	const float protectionCardH = replacementPage ? fillHeight : (std::min)(fillHeight, 560.0f);
-	// 标题区 88 + 底部留白 24，剩下按 4 个槽位平分。
+	// 标题区 88 + 底部留白 24，剩下按 5 个槽位平分。
 	const float toggleSlot = replacementPage ? 68.0f
 		: (std::max)(68.0f, (protectionCardH - 112.0f) / 5.0f);
 	// 行卡片在槽位里居中，槽位够大时最多长到 80，避免细长条看着像空行。
@@ -4821,21 +4823,37 @@ void MainWindow::PaintProtection(Graphics& g, int width, int height, int offsetY
 		Text(g, L"\u9ed8\u8ba4\u53ea\u8bb0\u5f55\u4e0d\u62e6\u622a\uff1b\u6253\u5f00\u54ea\u4e00\u9879\uff0c\u5bf9\u5e94\u7684\u62e6\u622a\u624d\u4f1a\u751f\u6548",
 			x + 24, y + 50, (std::max)(220.0f, headingRight - (x + 24.0f)), 20, 11, FontStyleRegular,
 			C(darkMode, 91, 99, 95, 166, 177, 171));
-		bool values[] = { !setAllowAllRunOp, setBandAllRunOp, setAllowGbTop, setProhibitKillProcess, setAllowMonitor, setProhibitCloseWindow, setAllowControl, setBlockWindowOps, setBlockDriverAccess };
+		bool values[] = { !setAllowAllRunOp, setBandAllRunOp, setAllowGbTop, setProhibitKillProcess, setAllowMonitor, setProhibitCloseWindow, setAllowControl, setBlockWindowOps, setBlockDriverAccess, setForceWindowed };
 		const float cardW = (w - 62) / 2.0f;
 		for (int i = 0; i < kProtectionToggleCount; ++i) {
 			const int col = i % 2;
 			const int row = i / 2;
 			const float cardX = x + 24 + col * (cardW + 14);
-			// 最后一行只有一个开关，仍按槽位对齐，不要让它自己居中跑偏。
+			// 十个开关正好铺满五排两列，最后一行也按槽位对齐。
 			const float cardY = y + 88 + row * toggleSlot + (toggleSlot - toggleRowH) / 2.0f;
 			toggleRects[i] = { static_cast<LONG>(cardX), static_cast<LONG>(cardY),
 				static_cast<LONG>(cardX + cardW), static_cast<LONG>(cardY + toggleRowH) };
 			FillRound(g, RectF(cardX, cardY, cardW, toggleRowH), 12 ,
 				Blend(C(darkMode, 248, 251, 249, 31, 37, 35), C(darkMode, 223, 238, 232, 48, 60, 56), hoverProgress[20 + i]));
 			const float toggleTextY = cardY + toggleRowH / 2.0f - 12.0f;
-			Text(g, kToggleLabels[i], cardX + 18, toggleTextY, cardW - 100, 25, 12, FontStyleRegular,
+			// 最后一项（强制窗口化）右边除了开关，还要塞一个百分比胶囊，文字让出位置。
+			const bool pctCard = (i == kProtectionToggleCount - 1);
+			Text(g, kToggleLabels[i], cardX + 18, toggleTextY, cardW - (pctCard ? 172.0f : 100.0f), 25, 12, FontStyleRegular,
 				C(darkMode, 40, 46, 43, 220, 229, 225));
+			if (pctCard) {
+				const float pctW = 56.0f;
+				const float pctH = 24.0f;
+				const float pctX = cardX + cardW - 62 - 12 - pctW;
+				const float pctY = cardY + toggleRowH / 2.0f - pctH / 2.0f;
+				windowedPctRect = { static_cast<LONG>(pctX), static_cast<LONG>(pctY),
+					static_cast<LONG>(pctX + pctW), static_cast<LONG>(pctY + pctH) };
+				FillRound(g, RectF(pctX, pctY, pctW, pctH), 12,
+					C(darkMode, 230, 240, 235, 44, 56, 52));
+				WCHAR pctText[8];
+				swprintf_s(pctText, L"%d%%", setWindowedPercent);
+				Text(g, pctText, pctX, pctY + 3.0f, pctW, 18, 11, FontStyleBold,
+					C(darkMode, 0, 107, 95, 130, 213, 199), StringAlignmentCenter);
+			}
 			const float switchY = cardY + toggleRowH / 2.0f - 13.0f;
 			// 滑块按插值走，不是瞬间跳；轨道颜色跟着一起过渡。
 			const float motion = AnimateToggle(i, values[i]);
@@ -4852,6 +4870,8 @@ void MainWindow::PaintProtection(Graphics& g, int width, int height, int offsetY
 		for (RECT& rect : toggleRects) rect = {};
 		driverLoadRect = {};
 		saveSettingsRect = {};
+		// 替换画面页没有这颗胶囊，不清掉的话点在原位置仍会命中。
+		windowedPctRect = {};
 	}
 	if (!replacementPage) {
 		const DriverStatusInfo& status = CurrentDriverStatus();
@@ -9339,6 +9359,22 @@ void MainWindow::HandleClick(POINT point)
 			InvalidateRect(_hWnd, nullptr, FALSE);
 			return;
 		}
+		// 百分比胶囊：点一下换下一档。只在"强制窗口化"打开时可点，
+		// 关掉之后整块区域不响应，免得用户以为改了尺寸、实际什么都没发生。
+		if (setForceWindowed && Hit(windowedPctRect, point)) {
+			static const int kPcts[] = { 50, 60, 70, 80, 90 };
+			int next = kPcts[0];
+			for (int i = 0; i < _countof(kPcts); ++i) {
+				if (kPcts[i] == setWindowedPercent) {
+					next = kPcts[(i + 1) % _countof(kPcts)];
+					break;
+				}
+			}
+			setWindowedPercent = next;
+			SaveSettings();
+			InvalidateRect(_hWnd, nullptr, FALSE);
+			return;
+		}
 		for (int i = 0; i < kProtectionToggleCount; ++i) if (Hit(toggleRects[i], point)) {
 			switch (i) {
 			case 0: setAllowAllRunOp = !setAllowAllRunOp; break;
@@ -9350,6 +9386,7 @@ void MainWindow::HandleClick(POINT point)
 			case 6: setAllowControl = !setAllowControl; break;
 			case 7: setBlockWindowOps = !setBlockWindowOps; break;
 			case 8: setBlockDriverAccess = !setBlockDriverAccess; break;
+			case 9: setForceWindowed = !setForceWindowed; break;
 			}
 			SaveSettings();
 			InvalidateRect(_hWnd, nullptr, FALSE);
@@ -11335,6 +11372,11 @@ void MainWindow::LoadSettings()
 	setBandAllRunOp = settings->GetSettingBool(L"BandAllRunOp", false);
 	setBlockWindowOps = settings->GetSettingBool(L"BlockWindowOps", false);
 	setBlockDriverAccess = settings->GetSettingBool(L"BlockDriverAccess", false);
+	// 强制窗口化默认开，和注入端 VInitSettings 的默认值保持一致。
+	setForceWindowed = settings->GetSettingBool(L"ForceWindowed", true);
+	setWindowedPercent = settings->GetSettingInt(L"WindowedPercent", 70);
+	if (setWindowedPercent < 25) setWindowedPercent = 25;
+	if (setWindowedPercent > 95) setWindowedPercent = 95;
 	setDoNotShowTrayIcon = settings->GetSettingBool(L"DoNotShowTrayIcon", false);
 	// These keys are written by ApplyTemporaryVideoProtection and are also what the
 	// injected hooks read out of the same ini, so they have to be read back here.
@@ -11379,6 +11421,9 @@ void MainWindow::SaveSettings()
 	settings->SetSettingBool(L"ProhibitCloseWindow", setProhibitCloseWindow);
 	settings->SetSettingBool(L"BlockWindowOps", setBlockWindowOps);
 	settings->SetSettingBool(L"BlockDriverAccess", setBlockDriverAccess);
+	settings->SetSettingBool(L"ForceWindowed", setForceWindowed);
+	settings->SetSettingBool(L"BlockTopmost", setForceWindowed);
+	settings->SetSettingInt(L"WindowedPercent", setWindowedPercent);
 	settings->SetSettingBool(L"AllowMonitor", setAllowMonitor);
 	settings->SetSettingBool(L"AllowControl", setAllowControl);
 	if (currentWorker) {

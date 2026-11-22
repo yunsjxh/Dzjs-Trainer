@@ -202,6 +202,14 @@ void TrainerWorkerInternal::HandleMessageFromVirus(LPCWSTR buf)
 				currentLogger->LogWarn(L"Blocked a shutdown request in the host process api=%s", api);
 				if (_Callback) _Callback->OnShutdownBlocked(api);
 			}
+			// 宿主请求全屏时被钩子改成了窗口。带上窗口类和前后尺寸，用户
+			// 上机反馈「还有没有全屏」时，看这一行就知道改没改、改到多大。
+			else if (arr[1] == L"windowed") {
+				currentLogger->LogInfo(L"Windowed window class=%s %s -> %s",
+					arr.size() >= 3 ? arr[2].c_str() : L"?",
+					arr.size() >= 4 ? arr[3].c_str() : L"?",
+					arr.size() >= 5 ? arr[4].c_str() : L"?");
+			}
 			else if (arr[1] == L"wtf") {
 				//插入了错误的目标，现在重置状态
 				DWORD pid = _wtol(arr[2].c_str());

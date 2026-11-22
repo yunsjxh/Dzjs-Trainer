@@ -5,6 +5,368 @@
 // ===== GuardWindow ============================================================
 // 从 DzjsTrainerHooks.cpp 机械迁出，函数体逐字节保持原样。
 
+// ===== 强制窗口化 ============================================================
+// 电子教室的「全屏」无非是 SetWindowPos(0, 0, 屏宽, 屏高) 加一个 TOPMOST。以前的
+// 做法是把整个请求吞掉 —— 宿主那边还以为自己已经铺满了，底下的绘制层照旧按全屏
+// 画，屏幕上就只剩一片黑。这里改成「把请求改小再放行」：宿主知道自己是窗口，画面
+// 跟着缩，用户还能自己拖边框调整。用户调过的尺寸按窗口类记下来，下次同类窗口直接
+// 用那个比例，不用每次重调。
+
+struct VEduClassSize {
+	WCHAR cls[48];
+	int   percent;
+	ULONGLONG tick;
+};
+
+struct VEduTrackedWindow {
+	HWND  hwnd;
+	WCHAR cls[48];
+	int   cx, cy;          // 上次由我们摆成的尺寸，用来判断用户有没有动过
+	ULONGLONG tick;
+};
+
+static SRWLOCK g_eduWinLock = SRWLOCK_INIT;
+static VEduClassSize g_eduClassSizes[8] = {};
+static VEduTrackedWindow g_eduTracked[12] = {};
+
+static void VEduClassNameOf(HWND hWnd, WCHAR* out, int cch)
+{
+	if (!out || cch <= 0) return;
+	out[0] = 0;
+	if (hWnd) GetClassNameW(hWnd, out, cch);
+}
+
+static int VEduRememberedPercent(const WCHAR* cls)
+{
+	if (!cls || !cls[0]) return 0;
+	int result = 0;
+	AcquireSRWLockShared(&g_eduWinLock);
+	for (int i = 0; i < _countof(g_eduClassSizes); ++i) {
+		if (g_eduClassSizes[i].percent > 0 && wcscmp(g_eduClassSizes[i].cls, cls) == 0) {
+			result = g_eduClassSizes[i].percent;
+			break;
+		}
+	}
+	ReleaseSRWLockShared(&g_eduWinLock);
+	return result;
+}
+
+static void VEduRememberPercent(const WCHAR* cls, int percent)
+{
+	if (!cls || !cls[0] || percent <= 0) return;
+	if (percent < 25) percent = 25;
+	if (percent > 95) percent = 95;
+	AcquireSRWLockExclusive(&g_eduWinLock);
+	int slot = -1;
+	int oldest = 0;
+	for (int i = 0; i < _countof(g_eduClassSizes); ++i) {
+		if (g_eduClassSizes[i].percent > 0 && wcscmp(g_eduClassSizes[i].cls, cls) == 0) { slot = i; break; }
+		if (g_eduClassSizes[i].percent <= 0) { slot = i; break; }
+		if (g_eduClassSizes[i].tick < g_eduClassSizes[oldest].tick) oldest = i;
+	}
+	if (slot < 0) slot = oldest;
+	wcscpy_s(g_eduClassSizes[slot].cls, cls);
+	g_eduClassSizes[slot].percent = percent;
+	g_eduClassSizes[slot].tick = GetTickCount64();
+	ReleaseSRWLockExclusive(&g_eduWinLock);
+}
+
+static void VEduTrackWindow(HWND hWnd, int cx, int cy)
+{
+	if (!hWnd) return;
+	WCHAR cls[48];
+	VEduClassNameOf(hWnd, cls, _countof(cls));
+	AcquireSRWLockExclusive(&g_eduWinLock);
+	int slot = -1;
+	int oldest = 0;
+	for (int i = 0; i < _countof(g_eduTracked); ++i) {
+		if (g_eduTracked[i].hwnd == hWnd) { slot = i; break; }
+		if (!g_eduTracked[i].hwnd) { slot = i; break; }
+		if (g_eduTracked[i].tick < g_eduTracked[oldest].tick) oldest = i;
+	}
+	if (slot < 0) slot = oldest;
+	g_eduTracked[slot].hwnd = hWnd;
+	wcscpy_s(g_eduTracked[slot].cls, cls);
+	g_eduTracked[slot].cx = cx;
+	g_eduTracked[slot].cy = cy;
+	g_eduTracked[slot].tick = GetTickCount64();
+	ReleaseSRWLockExclusive(&g_eduWinLock);
+}
+
+void VEduResetWindowedState()
+{
+	AcquireSRWLockExclusive(&g_eduWinLock);
+	SecureZeroMemory(g_eduTracked, sizeof(g_eduTracked));
+	SecureZeroMemory(g_eduClassSizes, sizeof(g_eduClassSizes));
+	ReleaseSRWLockExclusive(&g_eduWinLock);
+}
+
+// 请求里的尺寸是否铺满显示器。90% 那种「快满了」不算 —— 电子教室的广播画面
+// 用的是整块屏，而普通最大化窗口只到工作区（任务栏之外），这两个都要认。
+static bool VEduRequestCoversMonitor(HWND hWnd, int cx, int cy)
+{
+	if (cx <= 0 || cy <= 0) return false;
+	MONITORINFO mi = { sizeof(mi) };
+	HMONITOR mon = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST);
+	if (!mon || !GetMonitorInfoW(mon, &mi)) {
+		return cx >= screenWidth - 2 && cy >= screenHeight - 2;
+	}
+	const int mw = mi.rcMonitor.right - mi.rcMonitor.left;
+	const int mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
+	if (cx >= mw - 2 && cy >= mh - 2) return true;
+	const int ww = mi.rcWork.right - mi.rcWork.left;
+	const int wh = mi.rcWork.bottom - mi.rcWork.top;
+	return cx >= ww - 4 && cy >= wh - 4;
+}
+
+// 算一块窗口化后的矩形：工作区的百分比，居中。类名有记忆就用记忆里的比例。
+static void VEduWindowedRect(HWND hWnd, int& x, int& y, int& cx, int& cy)
+{
+	MONITORINFO mi = { sizeof(mi) };
+	HMONITOR mon = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST);
+	if (!mon || !GetMonitorInfoW(mon, &mi)) {
+		mi.rcWork.left = 0;
+		mi.rcWork.top = 0;
+		mi.rcWork.right = screenWidth;
+		mi.rcWork.bottom = screenHeight;
+	}
+	int ww = static_cast<int>(mi.rcWork.right - mi.rcWork.left);
+	int wh = static_cast<int>(mi.rcWork.bottom - mi.rcWork.top);
+	if (ww < 320) ww = 320;
+	if (wh < 240) wh = 240;
+
+	WCHAR cls[48];
+	VEduClassNameOf(hWnd, cls, _countof(cls));
+	int percent = VEduRememberedPercent(cls);
+	if (percent <= 0) percent = windowedPercent;
+	if (percent < 25) percent = 25;
+	if (percent > 95) percent = 95;
+
+	int nw = ww * percent / 100;
+	int nh = wh * percent / 100;
+	// 太小的窗口没法看广播，给个下限；工作区本身比它还小时按工作区。
+	if (nw < 400) nw = (ww < 400) ? ww : 400;
+	if (nh < 300) nh = (wh < 300) ? wh : 300;
+
+	x = mi.rcWork.left + (ww - nw) / 2;
+	y = mi.rcWork.top + (wh - nh) / 2;
+	cx = nw;
+	cy = nh;
+}
+
+// 补上标题栏和可缩放的边框。全屏窗口多半是 WS_POPUP，没有边框的话即使改小了
+// 也没法拖 —— 等于把用户困在一个小窗口里。
+static void VEduEnsureResizable(HWND hWnd)
+{
+	const LONG style = GetWindowLongW(hWnd, GWL_STYLE);
+	if (style & WS_CHILD) return;
+	const LONG want = style | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
+	if (want == style) return;
+	if (faSetWindowLongW)
+		faSetWindowLongW(hWnd, GWL_STYLE, want);
+	else
+		SetWindowLongW(hWnd, GWL_STYLE, want);
+	if (raSetWindowPos) {
+		// WS_THICKFRAME 要配合 SWP_FRAMECHANGED，边框才会立刻长出来。
+		raSetWindowPos(hWnd, NULL, 0, 0, 0, 0,
+			SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+	}
+}
+
+static void VEduDropTopmost(HWND hWnd)
+{
+	if ((GetWindowLongW(hWnd, GWL_EXSTYLE) & WS_EX_TOPMOST) == 0) return;
+	if (raSetWindowPos)
+		raSetWindowPos(hWnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+// 窗口化日志节流：同一窗口 2 秒内只报一次，广播时宿主会连着请求好几次。
+static bool VEduShouldLogWindowed(HWND hWnd)
+{
+	struct Slot { HWND hwnd; ULONGLONG tick; };
+	static Slot slots[8] = {};
+	static SRWLOCK lock = SRWLOCK_INIT;
+	const ULONGLONG now = GetTickCount64();
+	bool allow = false;
+	AcquireSRWLockExclusive(&lock);
+	int slot = -1;
+	int oldest = 0;
+	for (int i = 0; i < _countof(slots); ++i) {
+		if (slots[i].hwnd == hWnd) { slot = i; break; }
+		if (!slots[i].hwnd) { slot = i; break; }
+		if (slots[i].tick < slots[oldest].tick) oldest = i;
+	}
+	if (slot < 0) slot = oldest;
+	if (slots[slot].hwnd != hWnd || now - slots[slot].tick > 2000) {
+		slots[slot].hwnd = hWnd;
+		slots[slot].tick = now;
+		allow = true;
+	}
+	ReleaseSRWLockExclusive(&lock);
+	return allow;
+}
+
+// 把一次全屏请求改写成窗口化请求。返回 true 表示已改写，调用方直接把新参数
+// 交给原函数即可。fakeFull（用户主动开的「假全屏」）由调用方先行放行。
+static bool VEduForceWindowed(HWND hWnd, int& x, int& y, int& cx, int& cy)
+{
+	if (!forceWindowed || !hWnd) return false;
+	const int fromW = cx;
+	const int fromH = cy;
+	VEduEnsureResizable(hWnd);
+	if (blockTopmost) VEduDropTopmost(hWnd);
+	VEduWindowedRect(hWnd, x, y, cx, cy);
+	VEduTrackWindow(hWnd, cx, cy);
+
+	if (VEduShouldLogWindowed(hWnd)) {
+		WCHAR cls[48];
+		VEduClassNameOf(hWnd, cls, _countof(cls));
+		VDebugLog(L"windowed hwnd=%p class=%s %dx%d -> %dx%d (+caption/thickframe, topmost=%d)",
+			hWnd, cls[0] ? cls : L"-", fromW, fromH, cx, cy, blockTopmost ? 0 : 1);
+		VNotifyWindowed(hWnd, cls, fromW, fromH, cx, cy);
+	}
+	return true;
+}
+
+// 把「加边框 + 置顶」这条规则也用在没有尺寸变化的请求上：宿主可能先把窗口
+// 置顶、隔一会儿再改尺寸，只拦后一步的话中间那段时间窗口已经盖上去了。
+static bool VEduNormalizeTopmost(HWND hWnd)
+{
+	if (!blockTopmost || !hWnd) return false;
+	const LONG ex = GetWindowLongW(hWnd, GWL_EXSTYLE);
+	if ((ex & WS_EX_TOPMOST) == 0) return false;
+	VEduDropTopmost(hWnd);
+	return true;
+}
+
+// 巡查「创建时就铺满」的窗口。有些产品不走 SetWindowPos，而是直接
+// CreateWindowEx(WS_POPUP, 0, 0, 屏宽, 屏高) —— 钩子看不见这种请求，只能
+// 定时枚举一遍本进程的顶层窗口补刀。只碰「置顶」或「没有标题栏」的窗口：
+// 用户自己最大化的普通窗口有标题栏、不置顶，不该每秒钟被改回来。
+struct VEduSweepCtx {
+	int fixedCount;
+};
+
+static BOOL CALLBACK VEduSweepProc(HWND hWnd, LPARAM lp)
+{
+	VEduSweepCtx* ctx = reinterpret_cast<VEduSweepCtx*>(lp);
+	DWORD pid = 0;
+	GetWindowThreadProcessId(hWnd, &pid);
+	if (pid != GetCurrentProcessId()) return TRUE;
+	if (hWnd == hWndMsgCenter || hWnd == fakeDesktopWindow) return TRUE;
+	if (GetAncestor(hWnd, GA_ROOT) != hWnd) return TRUE;
+	const LONG style = GetWindowLongW(hWnd, GWL_STYLE);
+	if (style & WS_CHILD) return TRUE;
+	if (!IsWindowVisible(hWnd) || IsIconic(hWnd)) return TRUE;
+
+	RECT rc = {};
+	if (!GetWindowRect(hWnd, &rc)) return TRUE;
+	if (!VEduRequestCoversMonitor(hWnd, static_cast<int>(rc.right - rc.left),
+		static_cast<int>(rc.bottom - rc.top))) return TRUE;
+
+	const bool topmost = (GetWindowLongW(hWnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+	const bool captioned = (style & WS_CAPTION) == WS_CAPTION;
+	if (!topmost && captioned) return TRUE;
+
+	int x = 0, y = 0, cx = 0, cy = 0;
+	VEduWindowedRect(hWnd, x, y, cx, cy);
+	VEduEnsureResizable(hWnd);
+	if (blockTopmost) VEduDropTopmost(hWnd);
+	if (raSetWindowPos)
+		raSetWindowPos(hWnd, blockTopmost ? HWND_NOTOPMOST : NULL, x, y, cx, cy,
+			SWP_NOZORDER | SWP_NOACTIVATE);
+	VEduTrackWindow(hWnd, cx, cy);
+	++ctx->fixedCount;
+
+	if (VEduShouldLogWindowed(hWnd)) {
+		WCHAR cls[48];
+		VEduClassNameOf(hWnd, cls, _countof(cls));
+		VDebugLog(L"windowed (sweep) hwnd=%p class=%s %ldx%ld -> %dx%d topmost=%d captioned=%d",
+			hWnd, cls[0] ? cls : L"-", rc.right - rc.left, rc.bottom - rc.top, cx, cy,
+			topmost ? 1 : 0, captioned ? 1 : 0);
+		VNotifyWindowed(hWnd, cls, static_cast<int>(rc.right - rc.left),
+			static_cast<int>(rc.bottom - rc.top), cx, cy);
+	}
+	return TRUE;
+}
+
+void VEduSweepFullScreenWindows()
+{
+	if (!loaded || !forceWindowed) return;
+	VEduSweepCtx ctx = {};
+	EnumWindows(VEduSweepProc, reinterpret_cast<LPARAM>(&ctx));
+}
+
+void VEduSampleTrackedWindows()
+{
+	if (!loaded) return;
+	struct Snap { HWND hwnd; WCHAR cls[48]; int cx, cy; };
+	Snap snaps[_countof(g_eduTracked)] = {};
+	int count = 0;
+	AcquireSRWLockShared(&g_eduWinLock);
+	for (int i = 0; i < _countof(g_eduTracked); ++i) {
+		if (!g_eduTracked[i].hwnd) continue;
+		snaps[count].hwnd = g_eduTracked[i].hwnd;
+		wcscpy_s(snaps[count].cls, g_eduTracked[i].cls);
+		snaps[count].cx = g_eduTracked[i].cx;
+		snaps[count].cy = g_eduTracked[i].cy;
+		++count;
+	}
+	ReleaseSRWLockShared(&g_eduWinLock);
+	if (count == 0) return;
+
+	for (int i = 0; i < count; ++i) {
+		HWND hWnd = snaps[i].hwnd;
+		// 窗口没了就把它从跟踪表里去掉，别让槽位被死 hwnd 占着。
+		if (!IsWindow(hWnd) || IsIconic(hWnd)) {
+			AcquireSRWLockExclusive(&g_eduWinLock);
+			for (int k = 0; k < _countof(g_eduTracked); ++k)
+				if (g_eduTracked[k].hwnd == hWnd) SecureZeroMemory(&g_eduTracked[k], sizeof(g_eduTracked[k]));
+			ReleaseSRWLockExclusive(&g_eduWinLock);
+			continue;
+		}
+		if (!IsWindowVisible(hWnd)) continue;
+
+		RECT rc = {};
+		if (!GetWindowRect(hWnd, &rc)) continue;
+		const int w = static_cast<int>(rc.right - rc.left);
+		const int h = static_cast<int>(rc.bottom - rc.top);
+		if (w <= 0 || h <= 0) continue;
+		// 又被宿主撑回全屏了：钩子会处理，这里不记。
+		if (VEduRequestCoversMonitor(hWnd, w, h)) continue;
+		// 跟上次摆的尺寸差不多，说明用户没动过。
+		if (abs(w - snaps[i].cx) <= 16 && abs(h - snaps[i].cy) <= 16) continue;
+
+		MONITORINFO mi = { sizeof(mi) };
+		HMONITOR mon = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST);
+		int ww = 0, wh = 0;
+		if (mon && GetMonitorInfoW(mon, &mi)) {
+			ww = static_cast<int>(mi.rcWork.right - mi.rcWork.left);
+			wh = static_cast<int>(mi.rcWork.bottom - mi.rcWork.top);
+		}
+		if (ww <= 0 || wh <= 0) { ww = screenWidth; wh = screenHeight; }
+		int pctW = static_cast<int>(static_cast<long long>(w) * 100 / ww);
+		int pctH = static_cast<int>(static_cast<long long>(h) * 100 / wh);
+		int pct = (pctW < pctH) ? pctW : pctH;
+		if (pct < 25) pct = 25;
+		if (pct > 95) pct = 95;
+		VEduRememberPercent(snaps[i].cls, pct);
+		// 更新跟踪值，避免每隔一秒重复记同一件事。
+		AcquireSRWLockExclusive(&g_eduWinLock);
+		for (int k = 0; k < _countof(g_eduTracked); ++k) {
+			if (g_eduTracked[k].hwnd == hWnd) {
+				g_eduTracked[k].cx = w;
+				g_eduTracked[k].cy = h;
+				g_eduTracked[k].tick = GetTickCount64();
+				break;
+			}
+		}
+		ReleaseSRWLockExclusive(&g_eduWinLock);
+		VDebugLog(L"windowed size remembered class=%s %dx%d pct=%d (work=%dx%d)",
+			snaps[i].cls[0] ? snaps[i].cls : L"-", w, h, pct, ww, wh);
+	}
+}
+
 BOOL WINAPI hkSetForegroundWindow(HWND hWnd)
 {
 	VTraceHook(L"hkSetForegroundWindow");
@@ -13,15 +375,33 @@ BOOL WINAPI hkSetForegroundWindow(HWND hWnd)
 
 BOOL WINAPI hkSetWindowPos(HWND hWnd, HWND hWndInsertAfter, int x, int y, int cx, int cy, UINT uFlags)
 {
-	// 只记录：没打开「拦截远程窗口操作」时原样放行，只在日志里留一条。
-	if (!(loaded && blockWindowOps)) {
+	// 只记录：既没开「拦截远程窗口操作」，也没开强制窗口化时原样放行。
+	const bool guardWindowOps = loaded && blockWindowOps;
+	const bool windowedMode = loaded && forceWindowed;
+	if (!guardWindowOps && !windowedMode) {
 		VRecordHook(L"SetWindowPos", L"hwnd=%p x=%d y=%d cx=%d cy=%d flags=0x%X", hWnd, x, y, cx, cy, uFlags);
 		return raSetWindowPos(hWnd, hWndInsertAfter, x, y, cx, cy, uFlags);
 	}
 	VTraceHook(L"hkSetWindowPos");
 	if (loaded)
 	{
-		if ((uFlags & SWP_NOSIZE) == 0)
+		const bool fakeAllowed = fakeFull && VIsWindowGbOrHp(hWnd);
+		// 全屏请求：吞掉它只能让宿主以为自己是全屏，底下的绘制层照旧铺满，
+		// 屏幕上就剩一片黑。改成工作区里的窗口再放行，宿主会跟着重排画面。
+		if (!fakeAllowed && windowedMode && (uFlags & SWP_NOSIZE) == 0
+			&& VEduRequestCoversMonitor(hWnd, cx, cy)) {
+			VEduForceWindowed(hWnd, x, y, cx, cy);
+			// 位置一起重设：请求里可能带 SWP_NOMOVE，那样窗口会卡在旧角落。
+			return raSetWindowPos(hWnd, blockTopmost ? HWND_NOTOPMOST : hWndInsertAfter,
+				x, y, cx, cy, uFlags & ~(SWP_NOSIZE | SWP_NOMOVE));
+		}
+		if (!fakeAllowed && blockTopmost) {
+			if (hWndInsertAfter == HWND_TOPMOST) hWndInsertAfter = HWND_NOTOPMOST;
+			// 样式可能是别处加的（SetWindowLongPtr / 系统还原），顺手摘掉。
+			VEduNormalizeTopmost(hWnd);
+		}
+
+		if (guardWindowOps && (uFlags & SWP_NOSIZE) == 0)
 		{
 			if ((x == 0 && y == 0 && cx == screenWidth && cy == screenHeight))
 			{
@@ -48,7 +428,7 @@ BOOL WINAPI hkSetWindowPos(HWND hWnd, HWND hWndInsertAfter, int x, int y, int cx
 			}
 		}
 
-		if (VIsInIllegalWindows(hWnd)) 
+		if (guardWindowOps && VIsInIllegalWindows(hWnd)) 
 			return TRUE;
 	}
 	return raSetWindowPos(hWnd, hWndInsertAfter, x, y, cx, cy, uFlags);
@@ -56,14 +436,28 @@ BOOL WINAPI hkSetWindowPos(HWND hWnd, HWND hWndInsertAfter, int x, int y, int cx
 
 HDWP WINAPI hkDeferWindowPos(HDWP hWinPosInfo, HWND hWnd, HWND hWndInsertAfter, int x, int y, int cx, int cy, UINT uFlags)
 {
-	if (!(loaded && blockWindowOps)) {
+	const bool guardWindowOps = loaded && blockWindowOps;
+	const bool windowedMode = loaded && forceWindowed;
+	if (!guardWindowOps && !windowedMode) {
 		VRecordHook(L"DeferWindowPos", L"hwnd=%p x=%d y=%d cx=%d cy=%d flags=0x%X", hWnd, x, y, cx, cy, uFlags);
 		return faDeferWindowPos(hWinPosInfo, hWnd, hWndInsertAfter, x, y, cx, cy, uFlags);
 	}
 	VTraceHook(L"hkDeferWindowPos");
 	if (loaded)
 	{
-		if ((uFlags & SWP_NOSIZE) == 0)
+		const bool fakeAllowed = fakeFull && VIsWindowGbOrHp(hWnd);
+		if (!fakeAllowed && windowedMode && (uFlags & SWP_NOSIZE) == 0
+			&& VEduRequestCoversMonitor(hWnd, cx, cy)) {
+			VEduForceWindowed(hWnd, x, y, cx, cy);
+			return faDeferWindowPos(hWinPosInfo, hWnd, blockTopmost ? HWND_NOTOPMOST : hWndInsertAfter,
+				x, y, cx, cy, uFlags & ~(SWP_NOSIZE | SWP_NOMOVE));
+		}
+		if (!fakeAllowed && blockTopmost) {
+			if (hWndInsertAfter == HWND_TOPMOST) hWndInsertAfter = HWND_NOTOPMOST;
+			VEduNormalizeTopmost(hWnd);
+		}
+
+		if (guardWindowOps && (uFlags & SWP_NOSIZE) == 0)
 		{
 			if (x == 0 && y == 0 && cx == screenWidth && cy == screenHeight) {
 				VSwitchLockState(hWnd, TRUE);
@@ -88,7 +482,7 @@ HDWP WINAPI hkDeferWindowPos(HDWP hWinPosInfo, HWND hWnd, HWND hWndInsertAfter, 
 			}
 		}
 
-		if (VIsInIllegalWindows(hWnd))
+		if (guardWindowOps && VIsInIllegalWindows(hWnd))
 			return NULL;
 	}
 	return faDeferWindowPos(hWinPosInfo, hWnd, hWndInsertAfter, x, y, cx, cy, uFlags);
@@ -96,14 +490,23 @@ HDWP WINAPI hkDeferWindowPos(HDWP hWinPosInfo, HWND hWnd, HWND hWndInsertAfter, 
 
 BOOL WINAPI hkMoveWindow(HWND hWnd, int x, int y, int cx, int cy, BOOL bRepaint)
 {
-	if (!(loaded && blockWindowOps)) {
+	const bool guardWindowOps = loaded && blockWindowOps;
+	const bool windowedMode = loaded && forceWindowed;
+	if (!guardWindowOps && !windowedMode) {
 		VRecordHook(L"MoveWindow", L"hwnd=%p x=%d y=%d cx=%d cy=%d", hWnd, x, y, cx, cy);
 		return raMoveWindow(hWnd, x, y, cx, cy, bRepaint);
 	}
 	VTraceHook(L"hkMoveWindow");
 	if (loaded)
 	{
-		if (x == 0 && y == 0 && cx == screenWidth && cy == screenHeight) {
+		const bool fakeAllowed = fakeFull && VIsWindowGbOrHp(hWnd);
+		if (!fakeAllowed && windowedMode && VEduRequestCoversMonitor(hWnd, cx, cy)) {
+			VEduForceWindowed(hWnd, x, y, cx, cy);
+			return raMoveWindow(hWnd, x, y, cx, cy, bRepaint);
+		}
+		if (!fakeAllowed && blockTopmost) VEduNormalizeTopmost(hWnd);
+
+		if (guardWindowOps && x == 0 && y == 0 && cx == screenWidth && cy == screenHeight) {
 			VSwitchLockState(hWnd, TRUE);
 			if (fakeFull && VIsWindowGbOrHp(hWnd))
 				return raMoveWindow(hWnd, x, y, cx, cy, bRepaint);
@@ -118,7 +521,7 @@ BOOL WINAPI hkMoveWindow(HWND hWnd, int x, int y, int cx, int cy, BOOL bRepaint)
 			if (fakeFull) 
 				return raMoveWindow(hWnd, x, y, cx, cy, bRepaint);
 		}
-		if (VIsInIllegalWindows(hWnd))
+		if (guardWindowOps && VIsInIllegalWindows(hWnd))
 			return TRUE;
 	} 
 	return raMoveWindow(hWnd, x, y, cx, cy, bRepaint);
@@ -141,32 +544,48 @@ BOOL WINAPI hkBringWindowToTop(HWND hWnd)
 
 LONG WINAPI hkSetWindowLongA(HWND hWnd, int nIndex, LONG dwNewLong)
 {
-	if (!(loaded && blockWindowOps)) {
+	const bool guardWindowOps = loaded && blockWindowOps;
+	const bool topGuard = loaded && blockTopmost;
+	if (!guardWindowOps && !topGuard) {
 		VRecordHook(L"SetWindowLongA", L"hwnd=%p index=%d value=0x%X", hWnd, nIndex, dwNewLong);
 		return faSetWindowLongA(hWnd, nIndex, dwNewLong);
 	}
 	VTraceHook(L"hkSetWindowLongA");
 	if (loaded) {
-		if (fakeFull && VIsWindowGbOrHp(hWnd))
-			return faSetWindowLongA(hWnd, nIndex, dwNewLong);
-		if (VIsInIllegalWindows(hWnd))
-			return GetWindowLongA(hWnd, nIndex);
+		const bool fakeAllowed = fakeFull && VIsWindowGbOrHp(hWnd);
+		// 置顶样式在这里就被掩掉：宿主用 SetWindowLong(GWL_EXSTYLE) 加 TOPMOST
+		// 是最常见的写法之一，等下一次 SetWindowPos 再摘就已经晚了一帧。
+		if (topGuard && !fakeAllowed && nIndex == GWL_EXSTYLE && (dwNewLong & WS_EX_TOPMOST))
+			dwNewLong &= ~WS_EX_TOPMOST;
+		if (guardWindowOps) {
+			if (fakeAllowed)
+				return faSetWindowLongA(hWnd, nIndex, dwNewLong);
+			if (VIsInIllegalWindows(hWnd))
+				return GetWindowLongA(hWnd, nIndex);
+		}
 	}
 	return faSetWindowLongA(hWnd, nIndex, dwNewLong);
 }
 
 LONG WINAPI hkSetWindowLongW(HWND hWnd, int nIndex, LONG dwNewLong)
 {
-	if (!(loaded && blockWindowOps)) {
+	const bool guardWindowOps = loaded && blockWindowOps;
+	const bool topGuard = loaded && blockTopmost;
+	if (!guardWindowOps && !topGuard) {
 		VRecordHook(L"SetWindowLongW", L"hwnd=%p index=%d value=0x%X", hWnd, nIndex, dwNewLong);
 		return faSetWindowLongW(hWnd, nIndex, dwNewLong);
 	}
 	VTraceHook(L"hkSetWindowLongW");
 	if (loaded) {
-		if(fakeFull && VIsWindowGbOrHp(hWnd))
-			return faSetWindowLongW(hWnd, nIndex, dwNewLong);
-		if (VIsInIllegalWindows(hWnd))
-			return GetWindowLongW(hWnd, nIndex);
+		const bool fakeAllowed = fakeFull && VIsWindowGbOrHp(hWnd);
+		if (topGuard && !fakeAllowed && nIndex == GWL_EXSTYLE && (dwNewLong & WS_EX_TOPMOST))
+			dwNewLong &= ~WS_EX_TOPMOST;
+		if (guardWindowOps) {
+			if (fakeAllowed)
+				return faSetWindowLongW(hWnd, nIndex, dwNewLong);
+			if (VIsInIllegalWindows(hWnd))
+				return GetWindowLongW(hWnd, nIndex);
+		}
 	}
 	return faSetWindowLongW(hWnd, nIndex, dwNewLong);
 }
@@ -174,6 +593,22 @@ LONG WINAPI hkSetWindowLongW(HWND hWnd, int nIndex, LONG dwNewLong)
 BOOL WINAPI hkShowWindow(HWND hWnd, int nCmdShow)
 {
 	VTraceHook(L"hkShowWindow");
+	// 宿主用 ShowWindow(SW_MAXIMIZE) 进全屏是另一条路：它不走 SetWindowPos 的
+	// 参数，系统内部直接摆窗口。这里先按窗口化尺寸摆好，再以普通方式显示。
+	const bool fakeAllowed = fakeFull && VIsWindowGbOrHp(hWnd);
+	if (loaded && forceWindowed && !fakeAllowed
+		&& (nCmdShow == SW_MAXIMIZE || nCmdShow == SW_MAX || nCmdShow == SW_SHOWMAXIMIZED)) {
+		int x = 0, y = 0, cx = 0, cy = 0;
+		VEduWindowedRect(hWnd, x, y, cx, cy);
+		VEduEnsureResizable(hWnd);
+		if (blockTopmost) VEduDropTopmost(hWnd);
+		VEduTrackWindow(hWnd, cx, cy);
+		if (raSetWindowPos)
+			raSetWindowPos(hWnd, blockTopmost ? HWND_NOTOPMOST : NULL, x, y, cx, cy,
+				SWP_NOZORDER | SWP_NOACTIVATE);
+		if (faShowWindow) return faShowWindow(hWnd, SW_SHOWNORMAL);
+		return ShowWindow(hWnd, SW_SHOWNORMAL);
+	}
 	if (VIsWindowGbOrHp(hWnd)) 
 	{
 		if (nCmdShow == SW_SHOW || nCmdShow == SW_SHOWNORMAL  || nCmdShow == SW_MAXIMIZE || nCmdShow == SW_MAX || nCmdShow == SW_SHOWNA

@@ -324,6 +324,10 @@ private:
 	// 新增的两个拦截项：窗口操作 / 极域驱动访问。
 	bool setBlockWindowOps = false;
 	bool setBlockDriverAccess = false;
+	// 强制窗口化：电子教室请求全屏时，把窗口改成工作区里的一块（可拖动缩放），
+	// 而不是直接吞掉请求。档位是窗口占工作区的百分比，按 50/60/70/80/90 循环。
+	bool setForceWindowed = true;
+	int  setWindowedPercent = 70;
 	// Information-stream protection is deliberately session-only.  It is reset
 	// when the program exits and is never written to the normal settings file.
 	bool temporaryVideoProtection = false;
@@ -337,7 +341,9 @@ private:
 
 	std::array<RECT, 10> navRects{};
 	std::array<RECT, 5> actionRects{};
-	std::array<RECT, 9> toggleRects{};
+	std::array<RECT, 10> toggleRects{};
+	// 「强制窗口化」卡片里那颗百分比胶囊的命中区。点一下换下一档。
+	RECT windowedPctRect{};
 	RECT temporaryVideoEnableRect{};
 	RECT temporaryVideoImageModeRect{};
 	RECT temporaryVideoFileModeRect{};

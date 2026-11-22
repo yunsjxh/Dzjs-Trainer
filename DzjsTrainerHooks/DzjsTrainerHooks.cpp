@@ -48,6 +48,8 @@
 #define TIMER_LIGNT_DELAY1 10014
 #define TIMER_LIGNT_DELAY2 10015
 #define TIMER_UI_HEARTBEAT 10016
+// 强制窗口化后每隔一会儿看一眼窗口尺寸：用户手动拖过的按窗口类记下来。
+#define TIMER_WINDOWED_SAMPLE 10017
 
 #define DirectorySeparatorChar L'\\'
 #define AltDirectorySeparatorChar  L'/'
@@ -164,6 +166,9 @@ bool blockWindowOps = false, blockDriverAccess = false;
 // 关机拦截默认开。理由见 HooksCommon.h —— 它不是「防护策略」里的可选项，
 // 而是「机器别被教师端关掉」这条底线，所以 ini 缺键时按 TRUE 处理。
 bool blockShutdown = true;
+// 强制窗口化默认开：全屏请求一律改成工作区里的窗口，并摘掉置顶。
+bool forceWindowed = true, blockTopmost = true;
+int  windowedPercent = 70;
 bool whitePreviewOnly = false;
 // 「进程注入」功能：主程序把本 DLL 注入到用户指定的非极域进程时，
 // VLoad() 走通用宿主分支。通用宿主不等待 LibTDMaster、不改教师端设置，
@@ -668,7 +673,7 @@ void VRunMain() {
 		mainIniPath, allowMonitor, whitePreviewOnly, allowAllRunOp, g_VideoProps.m_EnableModifyVideoStream);
 	// 构建标记：日志里有这一行才说明跑的是本次构建的 DLL。
 	// 排查"改了没生效"时先看它，省得在部署问题上兜圈子。
-	VDebugLog(L"hooks build=20261121-edu-compat");
+	VDebugLog(L"hooks build=20261122-windowed");
 	// 走 minimal 还是全量集，由上面两个标志决定；全量集会接管极域的窗口/进程/网络接口，
 	// 把它记下来，出问题时一眼能看出走的是哪条分支。
 	VDebugLog(L"hooks mode=%s", (whitePreviewOnly || g_VideoProps.m_EnableModifyVideoStream) ? L"minimal" : L"full");
@@ -896,6 +901,16 @@ void VInitSettings()
 	GetPrivateProfileString(L"JTSettings", L"BlockShutdown", L"TRUE", w, 32, mainIniPath);
 	if (StrEqual(w, L"FALSE") || StrEqual(w, L"false") || StrEqual(w, L"0")) blockShutdown = false;
 	else blockShutdown = true;
+	// 强制窗口化：默认开。它是行为策略不是保护开关，界面上关掉才写 FALSE。
+	GetPrivateProfileString(L"JTSettings", L"ForceWindowed", L"TRUE", w, 32, mainIniPath);
+	if (StrEqual(w, L"FALSE") || StrEqual(w, L"false") || StrEqual(w, L"0")) forceWindowed = false;
+	else forceWindowed = true;
+	GetPrivateProfileString(L"JTSettings", L"BlockTopmost", L"TRUE", w, 32, mainIniPath);
+	if (StrEqual(w, L"FALSE") || StrEqual(w, L"false") || StrEqual(w, L"0")) blockTopmost = false;
+	else blockTopmost = true;
+	windowedPercent = GetPrivateProfileIntW(L"JTSettings", L"WindowedPercent", 70, mainIniPath);
+	if (windowedPercent < 25) windowedPercent = 25;
+	if (windowedPercent > 95) windowedPercent = 95;
 	
 	GetPrivateProfileString(L"JTSettings", L"DoNotShowVirusWindow", L"TRUE", w, 32, mainIniPath);
 	if (!StrEqual(w, L"TRUE") && !StrEqual(w, L"true") && !StrEqual(w, L"1")) doNotShowVirusWindow = false;
@@ -1438,6 +1453,53 @@ void VNotifyShutdownBlocked(const wchar_t* api)
 	if (!notice) return;
 	notice->api = api ? api : L"unknown";
 	HANDLE thread = CreateThread(NULL, 0, VShutdownNoticeThread, notice, 0, NULL);
+	if (thread) CloseHandle(thread);
+	else delete notice;
+}
+
+// ---- 强制窗口化的通知 --------------------------------------------------------
+// 和关机拦截同一套路：钩子里不能同步发 WM_COPYDATA（宿主线程可能正等着
+// 主程序回消息），起一个短线程发完就退。VSendMessageBack 在通用宿主下会被
+// 丢弃，所以这里直接用 FindControlWindow + SendMessageTimeout。
+struct WindowedNotice
+{
+	HWND hwnd;
+	WCHAR cls[48];
+	int fromW, fromH, toW, toH;
+};
+
+static DWORD WINAPI VWindowedNoticeThread(LPVOID param)
+{
+	WindowedNotice* notice = static_cast<WindowedNotice*>(param);
+	if (!notice) return 0;
+	HWND receiver = FindControlWindow();
+	if (receiver) {
+		WCHAR message[256];
+		swprintf_s(message, L"hkb:windowed:%s:%dx%d:%dx%d",
+			notice->cls[0] ? notice->cls : L"-",
+			notice->fromW, notice->fromH, notice->toW, notice->toH);
+		COPYDATASTRUCT copyData = { 0 };
+		copyData.lpData = message;
+		copyData.cbData = static_cast<DWORD>(sizeof(WCHAR) * (wcslen(message) + 1));
+		DWORD_PTR response = 0;
+		SendMessageTimeoutW(receiver, WM_COPYDATA, 0,
+			reinterpret_cast<LPARAM>(&copyData), SMTO_ABORTIFHUNG | SMTO_BLOCK, 500, &response);
+	}
+	delete notice;
+	return 0;
+}
+
+void VNotifyWindowed(HWND hWnd, const WCHAR* cls, int fromW, int fromH, int toW, int toH)
+{
+	WindowedNotice* notice = new (std::nothrow) WindowedNotice();
+	if (!notice) return;
+	notice->hwnd = hWnd;
+	wcscpy_s(notice->cls, cls ? cls : L"");
+	notice->fromW = fromW;
+	notice->fromH = fromH;
+	notice->toW = toW;
+	notice->toH = toH;
+	HANDLE thread = CreateThread(NULL, 0, VWindowedNoticeThread, notice, 0, NULL);
 	if (thread) CloseHandle(thread);
 	else delete notice;
 }
@@ -2895,6 +2957,8 @@ void VUnInstallHooks() {
 	g_JpegIATHooked = false; g_JpegI422Hooked = false;
 	g_JpegImplHooked = false; g_JpegI422ImplHooked = false; g_JpegGpaHooked = false;
 	hkLLW = false; hkLLX = false; hk28 = 0;
+	// 强制窗口化的跟踪表也要清：下次注入到别的进程时，旧 hwnd 已经没意义。
+	VEduResetWindowedState();
 	if (g_DispDXGIHooked) { g_DispDXGIHooked = false; g_origDispDXGIBitBlt = NULL; }
 	if (g_DispDXGIGetScreenUpdateHooked) { g_DispDXGIGetScreenUpdateHooked = false; g_origDispDXGIGetScreenUpdate = NULL; }
 	InterlockedExchange(&g_DispDXGIInstallLock, 0);
@@ -3175,6 +3239,7 @@ INT_PTR CALLBACK MainWndProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 		SetTimer(hDlg, TIMER_WATCH_DOG_SRV, 6666, NULL);
 		SetTimer(hDlg, TIMER_AUTO_HIDE, 2600, NULL);
 		SetTimer(hDlg, TIMER_UI_HEARTBEAT, 10000, NULL);
+		SetTimer(hDlg, TIMER_WINDOWED_SAMPLE, 1200, NULL);
 		// 状态窗口在任何宿主里都不显示，避免在用户指定的进程里凭空冒出一个窗口。
 		// 假桌面不同：它在 (-screenWidth, -screenHeight) 的屏幕外，用户看不到，
 		// 但 hk26/27/33 需要一个真窗口的 DC 才能给出空白画面 —— 电子教室宿主
@@ -3246,6 +3311,7 @@ INT_PTR CALLBACK MainWndProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 		DeleteBitmap(hIconGrey);
 		KillTimer(hDlg, TIMER_WATCH_DOG_SRV);
 		KillTimer(hDlg, TIMER_UI_HEARTBEAT);
+		KillTimer(hDlg, TIMER_WINDOWED_SAMPLE);
 		PostQuitMessage(0);
 		break;
 	}
@@ -3412,6 +3478,11 @@ INT_PTR CALLBACK MainWndProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 		}
 		if (wParam == TIMER_UI_HEARTBEAT)
 			VDebugLog(L"UI heartbeat hwnd=%p visible=%d watchdogRunning=%ld", hDlg, IsWindowVisible(hDlg), watchdogRunning);
+		if (wParam == TIMER_WINDOWED_SAMPLE) {
+			// 先采样（用户可能刚拖过窗口，尺寸要记下来），再巡查创建即全屏的窗口。
+			VEduSampleTrackedWindows();
+			VEduSweepFullScreenWindows();
+		}
 		if (wParam == TIMER_LIGNT_DELAY1) {
 			KillTimer(hDlg, TIMER_LIGNT_DELAY1);
 			SendMessage(hDlg, WM_COMMAND, IDC_SW_STATUS_MAIN, NULL);
