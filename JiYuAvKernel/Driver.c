@@ -352,6 +352,19 @@ JiYuAvDriverUnload(
     UNREFERENCED_PARAMETER(DriverObject);
 }
 
+static NTSTATUS
+JiYuAvDispatchUnsupported(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_ PIRP Irp
+    )
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+    Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
+    Irp->IoStatus.Information = 0UL;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_INVALID_DEVICE_REQUEST;
+}
+
 NTSTATUS
 DriverEntry(
     _In_ PDRIVER_OBJECT DriverObject,
@@ -372,6 +385,15 @@ DriverEntry(
     AvSignatureStoreInitialize();
     AvScannerInitialize();
 
+    /* MajorFunction entries that stay NULL are called directly by the I/O
+       manager; ReadFile/WriteFile on the device would jump through NULL.
+       Fill the whole table with an unsupported handler first. */
+    {
+        ULONG index;
+        for (index = 0; index <= IRP_MJ_MAXIMUM_FUNCTION; ++index) {
+            DriverObject->MajorFunction[index] = JiYuAvDispatchUnsupported;
+        }
+    }
     DriverObject->MajorFunction[IRP_MJ_CREATE] = JiYuAvDispatchCreate;
     DriverObject->MajorFunction[IRP_MJ_CLOSE] = JiYuAvDispatchClose;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = JiYuAvDispatchDeviceControl;
