@@ -642,7 +642,10 @@ bool TrainerWorkerInternal::ReadTopDomanPassword(BOOL forceKnock)
 		if (StrEqual(Data, L"Passwd[123456]")) goto READ_EX; //6.0以后读取不了了，都显示Passwd[123456]，用新的方法读取
 		else {
 			_TopDomainPassword = Data;
-			_TopDomainPassword = _TopDomainPassword.substr(6, _TopDomainPassword.size() - 6);
+			// 值短于 6 个字符时 size() - 6 下溢，substr 会抛 std::out_of_range，
+			// 异常穿过窗口过程表现为进程崩溃。
+			if (_TopDomainPassword.size() > 6)
+				_TopDomainPassword = _TopDomainPassword.substr(6);
 			return true;
 		}
 
