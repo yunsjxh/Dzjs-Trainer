@@ -56,6 +56,8 @@ INT_PTR CALLBACK BugReportDlgFunc(HWND hDlg, UINT message, WPARAM wParam, LPARAM
 		switch (wParam)
 		{
 		case IDOK: {
+			// EndDialog 之后 IsDlgButtonChecked 恒为 0：必须在关闭前读。
+			const bool reboot = IsDlgButtonChecked(hDlg, IDC_REBOOT) == BST_CHECKED;
 			if (JUpdater_CheckInternet()) {
 				Sleep(2000);
 				MessageBox(hDlg, L"您的错误报告已成功提交，感谢您的支持！", L"Dzjs Trainer", MB_ICONINFORMATION);
@@ -64,7 +66,7 @@ INT_PTR CALLBACK BugReportDlgFunc(HWND hDlg, UINT message, WPARAM wParam, LPARAM
 			else {
 				MessageBox(hDlg, L"无法提交错误报告，可能是网络未连接？", L"Dzjs Trainer", MB_ICONEXCLAMATION);
 			}
-			if (IsDlgButtonChecked(hDlg, IDC_REBOOT))
+			if (reboot)
 				SysHlp::RunApplication(currentApp->GetFullPath(), L"-r3");
 			return TRUE;
 		}
