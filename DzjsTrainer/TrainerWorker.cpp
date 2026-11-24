@@ -826,7 +826,9 @@ void TrainerWorkerInternal::ClearFilterdPid()
 {
 	if (current_system_process)
 	{
-		for (auto it = incorrectStudentMainPids.begin(); it != incorrectStudentMainPids.end(); it++) {
+		// erase 返回的已经是下一个元素，循环头再 ++it 会跳过一个，
+		// 删除末尾元素时自增还会越过 end()。
+		for (auto it = incorrectStudentMainPids.begin(); it != incorrectStudentMainPids.end(); ) {
 			auto pid = (*it).pid;
 			bool founded = false;
 			bool done = false;
@@ -838,8 +840,10 @@ void TrainerWorkerInternal::ClearFilterdPid()
 				}
 				done = p->NextEntryOffset == 0;
 			}
-			if (!founded) 
+			if (!founded)
 				it = incorrectStudentMainPids.erase(it);
+			else
+				++it;
 		}
 	}
 }
