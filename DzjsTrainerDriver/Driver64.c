@@ -100,18 +100,24 @@ JdrvHeartbeat(
         return STATUS_INVALID_PARAMETER;
     }
 
-    RtlZeroMemory(Response, sizeof(*Response));
-    Response->size = sizeof(*Response);
-    Response->version = JDRV_PROTOCOL_VERSION;
-    Response->processId = callerProcessId;
-    Response->protocolVersion = JDRV_PROTOCOL_VERSION;
-    Response->sequence = Request->sequence;
-    if (Request->version != JDRV_PROTOCOL_VERSION) {
-        Response->accepted = 0UL;
-        *Information = sizeof(*Response);
-        return STATUS_REVISION_MISMATCH;
+    /* METHOD_BUFFERED: Request and Response are the same system buffer.
+       Zeroing the response before reading the request erased version and
+       sequence, so every heartbeat ended in STATUS_REVISION_MISMATCH. */
+    {
+        const ULONG requestVersion = Request->version;
+        const ULONG64 requestSequence = Request->sequence;
+        RtlZeroMemory(Response, sizeof(*Response));
+        Response->size = sizeof(*Response);
+        Response->version = JDRV_PROTOCOL_VERSION;
+        Response->processId = callerProcessId;
+        Response->protocolVersion = JDRV_PROTOCOL_VERSION;
+        Response->sequence = requestSequence;
+        if (requestVersion != JDRV_PROTOCOL_VERSION) {
+            Response->accepted = 0UL;
+            *Information = sizeof(*Response);
+            return STATUS_REVISION_MISMATCH;
+        }
     }
-
     interruptTime = KeQueryInterruptTime();
     currentTime = interruptTime;
     KeAcquireSpinLock(&g_JdrvHeartbeatLock, &oldIrql);
@@ -125,8 +131,8 @@ JdrvHeartbeat(
         return STATUS_DEVICE_BUSY;
     }
     g_JdrvHeartbeatProcessId = callerProcessId;
-    g_JdrvHeartbeatProtocolVersion = Request->version;
-    g_JdrvHeartbeatSequence = Request->sequence;
+    g_JdrvHeartbeatProtocolVersion = Response->version;
+    g_JdrvHeartbeatSequence = Response->sequence;
     g_JdrvHeartbeatTime = interruptTime;
     KeReleaseSpinLock(&g_JdrvHeartbeatLock, oldIrql);
     Response->accepted = 1UL;
