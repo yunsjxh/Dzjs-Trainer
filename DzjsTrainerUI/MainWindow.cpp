@@ -8605,11 +8605,16 @@ void MainWindow::StopAvProcessScan()
 {
 	if (avScanCancelEvent) SetEvent(avScanCancelEvent);
 	if (avScanThread) {
-		WaitForSingleObject(avScanThread, INFINITE);
-		CloseHandle(avScanThread);
-		avScanThread = nullptr;
+		// 取消只是 SetEvent，真正的返回靠驱动 IOCTL 协作。用 INFINITE 等，
+		// 驱动侧卡住时退出流程就永远停在 WM_DESTROY；超时后也不能关句柄，
+		// 因为线程可能还在用，句柄值会被后续 CreateThread/CreateEvent 复用。
+		const DWORD waitResult = WaitForSingleObject(avScanThread, 5000);
+		if (waitResult == WAIT_OBJECT_0) {
+			CloseHandle(avScanThread);
+			avScanThread = nullptr;
+		}
 	}
-	if (avScanCancelEvent) {
+	if (avScanThread == nullptr && avScanCancelEvent) {
 		CloseHandle(avScanCancelEvent);
 		avScanCancelEvent = nullptr;
 	}
