@@ -59,13 +59,16 @@ BOOL MRegReadKeyString64And32(HKEY hRootKey, LPCWSTR path32, LPCWSTR path64, LPC
 	if (lastError == ERROR_SUCCESS) {
 		DWORD dwType = REG_SZ;
 		WCHAR * Data = new WCHAR[count];
-		DWORD cbData = count;
+		// RegQueryValueEx 要的是字节数，count 是 WCHAR 个数。
+		DWORD cbData = static_cast<DWORD>(count * sizeof(WCHAR));
 		lastError = RegQueryValueEx(hKey, keyName, 0, &dwType, (LPBYTE)Data, &cbData);		
 		if (lastError == ERROR_SUCCESS) {
+			// 值正好填满缓冲区时 RegQueryValueEx 不保证有终止符。
+			if (count != 0) Data[count - 1] = L'\0';
 			wcscpy_s(buffer, count, Data);
 			rs = TRUE;
 		}
-		delete Data;
+		delete[] Data;
 		RegCloseKey(hKey);
 	}
 	SetLastError(lastError);
@@ -78,13 +81,16 @@ BOOL MRegReadKeyString(HKEY hRootKey, LPCWSTR path, LPCWSTR keyName, LPWSTR buff
 	if (lastError == ERROR_SUCCESS) {
 		DWORD dwType = REG_SZ;
 		WCHAR * Data = new WCHAR[count];
-		DWORD cbData = count;
+		// RegQueryValueEx 要的是字节数，count 是 WCHAR 个数。
+		DWORD cbData = static_cast<DWORD>(count * sizeof(WCHAR));
 		lastError = RegQueryValueEx(hKey, keyName, 0, &dwType, (LPBYTE)Data, &cbData);
 		if (lastError == ERROR_SUCCESS) {
+			// 值正好填满缓冲区时 RegQueryValueEx 不保证有终止符。
+			if (count != 0) Data[count - 1] = L'\0';
 			wcscpy_s(buffer, count, Data);
 			rs = TRUE;
 		}
-		delete Data;
+		delete[] Data;
 		RegCloseKey(hKey);
 	}
 	SetLastError(lastError);

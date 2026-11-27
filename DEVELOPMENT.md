@@ -91,6 +91,10 @@ SDK 版本对不上时：用户态工程写的是 `10.0`，自动取本机最新
 
 IOCTL 号是 `0x800`–`0x80D` 连续一段，全部 `METHOD_BUFFERED`，定义在 `DzjsTrainerDriver/IoCtl.h`，主程序侧走 `KernelUtils.cpp`。加新功能就在这段后面续号，不要重排——用户态和驱动可能不是同一版编译出来的。
 
+`METHOD_BUFFERED` 的请求和响应共用同一块 `SystemBuffer`。处理函数里如果要先 `RtlZeroMemory` 响应，**必须先把请求字段取到局部变量**。心跳踩过这个坑：清零把 `Request->version` / `sequence` 一并抹掉，每次心跳都返回 `STATUS_REVISION_MISMATCH`，客户端 5 秒后停掉心跳，看门狗也跟着关了。
+
+`JiYuAvKernel` 的 `MajorFunction` 要整表填兜底处理函数，再覆盖已实现的三个。I/O 管理器不检查空槽位，`ReadFile` / `WriteFile` 打过来就是空指针调用，直接 bugcheck；主驱动用 `JdrvDispatchUnsupported` 兜底，AV 驱动别漏。
+
 ### 加载与校验
 
 - 发布者按**证书 CN** 判定，白名单在 `DriverPublisherAllowlist.h`；`DriverSignerPin.h` 是构建期生成的名字 pin。**换签名证书必须重新生成 `DriverSignerPin.h`**，否则新证书签的驱动会被自己拦下。
